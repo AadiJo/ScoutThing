@@ -1,0 +1,8 @@
+# Run outputs, fetched model weights and local environments never go in git.
+runs/
+assets/
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
