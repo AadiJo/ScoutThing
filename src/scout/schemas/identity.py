@@ -13,6 +13,19 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from scout.schemas.common import VIEW_NAMES, StageFile, TableSpec
 
+LabelSource = Literal["digits", "digits_extended", "no_reads", "below_rule", "conflict"]
+"""What decided a segment.
+
+- `digits`: between the first and last of at least three agreeing named bumper reads on the
+  track, with no named read of another team in between.
+- `digits_extended`: the same label carried past those reads toward the track's ends, until
+  the unnamed reads turn against the team or a time limit.
+- `no_reads` (team null): no bumper read joins this stretch of track.
+- `below_rule` (team null): reads join it, but not enough agreeing named reads.
+- `conflict` (team null): the track holds named reads of two teams around this stretch, or
+  another track claimed the same team at the same time.
+"""
+
 
 class LabelSegment(BaseModel):
     """Track `track_id` is `team` (or unknown) from `t_start` to `t_end` inclusive."""
@@ -26,15 +39,34 @@ class LabelSegment(BaseModel):
     t_end: float
     team: int | None
     confidence: float = Field(ge=0.0, le=1.0)
-    source: str
-    """What decided the label, for example "digits", "embedder", "elimination", "answer"."""
+    """Median probability of `team` over the reads joined to this segment (0 when it has none,
+    or when `team` is null). Low on a `digits_extended` segment means weak support."""
+    source: LabelSource
+    n_reads: int = Field(ge=0)
+    """Agreeing named reads behind the label (0 when `team` is null)."""
+
+
+class ClaimConflict(BaseModel):
+    """Two tracks labelled the same team at the same time, before resolution. A team is in one
+    place at a time, so each of these means some label was wrong."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    team: int
+    track_ids: tuple[int, int]
+    t_start: float
+    t_end: float
+    kept: int | None
+    """The track that kept the label over the overlap (read-backed against extended), or None
+    when both lost it."""
 
 
 class Identity(StageFile):
-    """Label segments for every track."""
+    """Label segments covering every track sample, and the same-team conflicts resolved."""
 
     schema_version: Literal[1] = 1
     segments: list[LabelSegment]
+    conflicts: list[ClaimConflict]
 
 
 READER_NAME = "s1_digits"
@@ -67,7 +99,8 @@ READS = TableSpec(
 """One row per detector box in detections.parquet (same frame, view and box), read
 against the match roster.
 
-- `track_id`: null until the labelling half joins reads to tracks.
+- `track_id`: the track whose measured box covers at least 80% of this main-view box in
+  the same frame (the best one if several); null for corner views and unmatched boxes.
 - `text`, `text_p`: the free (unconstrained) read and its sequence probability; `text` may
   be any digit string, or empty.
 - `roster`: the teams scored, in match.json roster order; `probs[k]` is the probability of
