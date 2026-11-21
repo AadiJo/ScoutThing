@@ -63,6 +63,25 @@ BUMPS: tuple[Rect, ...] = (
 )
 BUMP_HEIGHT_M = 0.1654  # web/field/overlay_geometry.py, BUMP_HEIGHT_M
 
+# Trenches: the strip between each outer bump and the guardrail, at the bumps' depth.
+# Derived from BUMPS and the field width, not taken from the reference code; the real
+# trench arm may be a little deeper or shallower than the bumps.
+TRENCHES: tuple[Rect, ...] = (
+    Rect(4.0615, 0.0, 5.1895, 1.5772),
+    Rect(4.0615, 6.4920, 5.1895, FIELD_WIDTH_M),
+    Rect(11.3515, 0.0, 12.4795, 1.5772),
+    Rect(11.3515, 6.4920, 12.4795, FIELD_WIDTH_M),
+)
+
+# Field x range of each alliance's line of bumps, hub and trenches: what a robot crosses
+# between that alliance's zone and the neutral zone. Same x extent as BUMPS.
+BARRIER_X: dict[Alliance, tuple[float, float]] = {
+    "blue": (4.0615, 5.1895),
+    "red": (11.3515, 12.4795),
+}
+
+CENTER_LINE_X_M = FIELD_LENGTH_M / 2  # the field is point-symmetric about its centre
+
 # Alliance zone depth: own wall to the near face of the own hub cabinet. The neutral
 # zone is everything between the two alliance zones (hubs, bumps and trenches included).
 # web/scouting/field_rules.py AutoRules.alliance_zone_x.
