@@ -37,6 +37,9 @@ class Identity(StageFile):
     segments: list[LabelSegment]
 
 
+READER_NAME = "s1_digits"
+"""`reader` value for the PARSeq bumper number reader (asset "digits")."""
+
 READS = TableSpec(
     "reads",
     {
@@ -49,12 +52,34 @@ READS = TableSpec(
         "x2": pl.Float32(),
         "y2": pl.Float32(),
         "text": pl.String(),
-        "team": pl.Int32(),
+        "text_p": pl.Float32(),
+        "roster": pl.List(pl.Int32()),
+        "probs": pl.List(pl.Float32()),
+        "roster_mass": pl.Float32(),
         "conf": pl.Float32(),
+        "best": pl.Int32(),
+        "static": pl.Boolean(),
+        "abstain": pl.Boolean(),
+        "team": pl.Int32(),
         "reader": pl.String(),
     },
 )
-"""One row per number read. `track_id` and `team` are null when unmatched."""
+"""One row per detector box in detections.parquet (same frame, view and box), read
+against the match roster.
+
+- `track_id`: null until the labelling half joins reads to tracks.
+- `text`, `text_p`: the free (unconstrained) read and its sequence probability; `text` may
+  be any digit string, or empty.
+- `roster`: the teams scored, in match.json roster order; `probs[k]` is the probability of
+  `roster[k]`, a temperature-1 softmax over the roster teams' sequence log-likelihoods.
+- `roster_mass`: the summed sequence probability of the roster numbers, near 0 when the
+  crop reads as no roster number. `log(probs[k] * roster_mass)` is team k's raw
+  log-likelihood, so any other temperature or rule can be applied downstream.
+- `conf`, `best`: the top probability and its team, always set.
+- `static`: the box sits at a fixed spot in many frames (a display, banner or timer).
+- `abstain`, `team`: the stage's own conservative verdict; `team` is `best` when the reader
+  names it, null when it abstains.
+"""
 
 read_reads = READS.read
 write_reads = READS.write
