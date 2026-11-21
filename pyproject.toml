@@ -1,0 +1,97 @@
+[project]
+name = "scout"
+version = "0.1.0"
+description = "One FRC match video in, robot tracks, an overlay video and a driving grade out."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=2.1",
+    "scipy>=1.14",
+    "opencv-python-headless>=4.10",
+    "polars>=1.20",
+    "pydantic>=2.9",
+    "typer>=0.15",
+    "ultralytics>=8.3",
+    "timm>=1.0",
+    "pupil-apriltags>=1.0.4",
+    "rapidocr-onnxruntime>=1.4",
+]
+
+[project.scripts]
+scout = "scout.cli:app"
+
+# Exactly one torch build is installed. The cu128 group is a default group, so plain
+# `uv sync` / `uv run` give the CUDA 12.8 build (torch 2.11.0+cu128, which matches
+# the local uv cache). CI installs the CPU build with
+# `uv sync --no-default-groups --group dev --group cpu`.
+[dependency-groups]
+dev = ["basedpyright>=1.29", "ruff>=0.9", "import-linter>=2.1"]
+cu128 = ["torch==2.11.0", "torchvision==0.26.0"]
+cpu = ["torch==2.11.0", "torchvision==0.26.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+default-groups = ["dev", "cu128"]
+conflicts = [[{ group = "cpu" }, { group = "cu128" }]]
+# ultralytics and rapidocr require opencv-python, which writes the same cv2
+# package as opencv-python-headless. This marker never matches, so only the
+# headless build is installed.
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", group = "cpu" },
+    { index = "pytorch-cu128", group = "cu128" },
+]
+torchvision = [
+    { index = "pytorch-cpu", group = "cpu" },
+    { index = "pytorch-cu128", group = "cu128" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "PTH", "TID"]
+
+[tool.basedpyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+# torch (torch.from_numpy and friends) and ultralytics (YOLO.predict, Results.boxes)
+# return partially unknown types, so strict mode flags every use of them. These three
+# rules are the ones those calls trip; every other strict rule stays on.
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+
+# Stage modules must not import each other or the code that wires them
+# together. They may import scout.schemas, scout.run, scout.video,
+# scout.assets and scout.games.
+[tool.importlinter]
+root_package = "scout"
+
+[[tool.importlinter.contracts]]
+name = "stages do not import each other"
+type = "independence"
+modules = ["scout.stages.*"]
+
+[[tool.importlinter.contracts]]
+name = "stages do not import the pipeline or the CLI"
+type = "forbidden"
+source_modules = ["scout.stages"]
+forbidden_modules = ["scout.pipeline", "scout.cli"]

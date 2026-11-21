@@ -1,0 +1,60 @@
+{
+  "repo": "Paradox2102/frc-vision-scorer",
+  "commit": "dfe74cae7881d026f06f6bb8bc60fbceed165b5d",
+  "files": {
+    "digits": {
+      "path": "data/teacher/models/s1_digits.pt",
+      "sha256": "9edc40fb5600a7e75b8c9d72b6d721d6a315361894f2b074c4b765dcb4973c62",
+      "size": 47590155,
+      "lfs": true
+    },
+    "embedder": {
+      "path": "data/teacher/models/s4_embedder.pt",
+      "sha256": "bab68abb23df9dc42e7ced41dd3a40f824915f4f215a0034dfd90d5ae48542fb",
+      "size": 43754399,
+      "lfs": true
+    },
+    "bumpers": {
+      "path": "runs/train/frc_bumpers_2026cur_v3/weights/best.pt",
+      "sha256": "b5b5d03c3006800322bc25e77ee3c48c4cf7837f448198353f0b5a3c53ca70c5",
+      "size": 52032594,
+      "lfs": true
+    },
+    "bumpers_offpalette": {
+      "path": "runs/train/frc_bumpers_offpalette_v1/weights/best.pt",
+      "sha256": "b0581fb25d0e79769243e64feab0fab168e488af347cedcf0d0d4da4bfe4b27b",
+      "size": 52017682,
+      "lfs": true
+    },
+    "hub_zone": {
+      "path": "runs/train/hub_zone_yolo26s_2026cur_v2/weights/best.pt",
+      "sha256": "fcfd4c1984294fb70a49acabaf08603415dc95f3a1b61f6ead8c281a74e415bb",
+      "size": 20281413,
+      "lfs": true
+    },
+    "field_tags": {
+      "path": "data/field/2026-rebuilt-welded.json",
+      "sha256": "315f71b1cfd7291a656f99fb4a8762d4fe4a31019a9784ec674119c0ea727f5a",
+      "size": 10956,
+      "lfs": false
+    },
+    "field_wireframe": {
+      "path": "data/field/wireframes/2026-rebuilt-welded.json",
+      "sha256": "92fe66ae4050449472dd833d8c1583d4ca87a4f15f0a47d18f189d4989199791",
+      "size": 142813,
+      "lfs": false
+    },
+    "field2d_image": {
+      "path": "data/field/advantagescope/2026_field2d.jpg",
+      "sha256": "d9bdd6d0c6ecbbbfc46c2feae4f96c144c6d79c373aa6404d1ec2b762a01505c",
+      "size": 128111,
+      "lfs": false
+    },
+    "field2d_meta": {
+      "path": "data/field/advantagescope/2026_field2d.json",
+      "sha256": "f0c8800f2ed0c7a3707ccb39b89b724768eb241a89000cc6e1cace6c8b67298f",
+      "size": 512,
+      "lfs": false
+    }
+  }
+}

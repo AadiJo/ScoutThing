@@ -1,0 +1,23 @@
+name: checks
+
+on:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      # CPU torch: the default cu128 group is swapped for the cpu group.
+      - run: uv sync --locked --no-default-groups --group dev --group cpu
+      # --no-sync keeps `uv run` from reinstalling the default (CUDA) groups.
+      - name: ruff
+        run: uv run --no-sync ruff format --check src && uv run --no-sync ruff check src
+      - name: basedpyright (strict)
+        run: uv run --no-sync basedpyright
+      - name: stage import rule
+        run: uv run --no-sync lint-imports
