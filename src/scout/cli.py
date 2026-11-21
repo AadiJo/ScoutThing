@@ -31,12 +31,15 @@ def run(
     force: Annotated[
         list[str] | None, typer.Option(help="Rerun this stage even if fresh. Repeatable.")
     ] = None,
+    grader_model: Annotated[
+        str, typer.Option(help="Model for the grade stage's Claude Code agent.")
+    ] = "opus",
 ) -> None:
     """Run the whole pipeline into runs/<video-stem>/."""
     unknown = sorted(set(force or ()) - set(BY_NAME))
     if unknown:
         raise typer.BadParameter(f"unknown stage(s) {unknown}; one of {', '.join(BY_NAME)}")
-    rd = prepare_run(video, team)
+    rd = prepare_run(video, team, grader_model)
     print(f"run folder: {rd.path}")
     raise typer.Exit(run_pipeline(rd, STAGES, force or ()))
 

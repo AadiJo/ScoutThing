@@ -120,7 +120,7 @@ class Stage:
     fn: Callable[[RunDir], None]
 
 
-def prepare_run(video: Path, team: int) -> RunDir:
+def prepare_run(video: Path, team: int, grader_model: str = "opus") -> RunDir:
     """Create or reuse `runs/<video-stem>/`: link the source video and save settings.
 
     settings.json is rewritten only when it changes, so stages that list it as an input
@@ -137,7 +137,7 @@ def prepare_run(video: Path, team: int) -> RunDir:
         raise ValueError(f"{run.path} belongs to {existing[0].resolve()}, not {video}")
     if not existing:
         link.symlink_to(video)
-    settings = Settings(team=team)
+    settings = Settings(team=team, grader_model=grader_model)
     if not run.settings_json.exists() or run.settings() != settings:
         settings.save(run.settings_json)
     return run

@@ -20,6 +20,8 @@ class Settings(StageFile):
 
     schema_version: Literal[1] = 1
     team: int
+    grader_model: str = "opus"
+    """Model the grade stage asks Claude Code for (`claude --model`)."""
 
 
 class Answers(RootModel[dict[str, str]]):
