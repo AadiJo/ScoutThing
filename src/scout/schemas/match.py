@@ -22,7 +22,8 @@ class TeamSlot(BaseModel):
 
 
 class PhaseSpan(BaseModel):
-    """One match phase in video seconds. `active_hubs` is None when unknown (auto tie)."""
+    """One match phase in video seconds. `active_hubs` is None in a shift when the
+    auto winner is unknown."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -30,6 +31,24 @@ class PhaseSpan(BaseModel):
     t_start: float
     t_end: float
     active_hubs: list[Alliance] | None
+
+
+class ClockFit(BaseModel):
+    """Line `t = start_t + slope * elapsed` fitted to the clock's tick moments in one period.
+
+    A tick to displayed value v happens `elapsed = period_length - v` seconds into the
+    period (the clock shows remaining time rounded up). `ticks` were used, `dropped` were
+    rejected as misreads; residuals are over the used ticks.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    start_t: float
+    slope: float
+    ticks: int
+    dropped: int
+    rms_s: float
+    max_abs_s: float
 
 
 class MatchInfo(StageFile):
@@ -47,5 +66,9 @@ class MatchInfo(StageFile):
     teleop_start_t: float
     teleop_end_t: float
     auto_winner: Alliance | None
-    """Alliance that scored more fuel in auto; None on a tie or when unread."""
+    """Alliance whose hub the FMS made inactive in shifts 1 and 3 (more fuel in auto, or the
+    FMS tie-break), read from the overlay's active-hub arrows and checked against the fuel
+    counters. None when the arrows are unclear or disagree with the counters."""
     phases: list[PhaseSpan]
+    clock_fits: dict[Literal["auto", "teleop"], ClockFit]
+    """How the auto and teleop times were measured, with fit residuals."""
