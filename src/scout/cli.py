@@ -8,12 +8,17 @@ from typing import Annotated
 
 import typer
 
-from scout.assets import fetch_assets
+from scout.annotate.server import serve
+from scout.assets import ROOT, fetch_assets
+from scout.bench import BenchRefusedError, run_bench
 from scout.pipeline import BY_NAME, STAGES
 from scout.run import RunDir, prepare_run, print_validation, run_pipeline, run_stage, stage_state
 from scout.schemas.manifest import Manifest
+from scout.schemas.video import VideoInfo
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
+
+TRUTH_DIR = ROOT / "truth"
 
 RunPath = Annotated[Path, typer.Argument(help="Run folder, e.g. runs/Qualification_16.")]
 
@@ -90,6 +95,43 @@ def answer(
 def validate_cmd(run_dir: RunPath) -> None:
     """Check every stage file in a run folder against its schema."""
     raise typer.Exit(1 if print_validation(_run_dir(run_dir)) else 0)
+
+
+@app.command()
+def annotate(
+    run_dir: RunPath,
+    truth: Annotated[
+        Path | None,
+        typer.Option(help="Truth file to edit. Default: truth/<video-stem>.json in the repo."),
+    ] = None,
+    port: Annotated[int, typer.Option(help="Port to listen on.")] = 8765,
+    host: Annotated[str, typer.Option(help="Address to bind; 0.0.0.0 serves the LAN too.")] = (
+        "0.0.0.0"
+    ),
+) -> None:
+    """Serve a page for following robots by hand and saving the truth file."""
+    rd = _run_dir(run_dir)
+    missing = [
+        p.name for p in (rd.video_json, rd.match_json, rd.calibration_json) if not p.exists()
+    ]
+    if missing:
+        raise typer.BadParameter(f"{run_dir} is missing {', '.join(missing)}; run scout first")
+    stem = Path(VideoInfo.load(rd.video_json).source_path).stem
+    serve(rd, truth or TRUTH_DIR / f"{stem}.json", host, port)
+
+
+@app.command()
+def bench(
+    run_dir: RunPath,
+    truth: Annotated[Path, typer.Argument(help="Truth file, e.g. truth/Qualification_16.json.")],
+) -> None:
+    """Score a run's tracks and labels against a truth file; writes bench.json and bench.md."""
+    try:
+        report = run_bench(_run_dir(run_dir), truth)
+    except BenchRefusedError as e:
+        print(f"scout: {e}")
+        raise typer.Exit(1) from e
+    print(report)
 
 
 @app.command(name="fetch-assets")
