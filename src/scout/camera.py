@@ -64,6 +64,17 @@ def fold_radius(dist: ArrayLike) -> float:
     return float("inf") if len(bad) == 0 else float(r[bad[0]])
 
 
+def reach_radius(dist: ArrayLike) -> float:
+    """Largest distorted normalised radius the lens reaches before it folds (inf if it never
+    folds). A pixel farther than this from the principal point maps to no ray."""
+    k1, k2, _, _, k3 = dist5(dist)
+    r = fold_radius(dist)
+    if not np.isfinite(r):
+        return float("inf")
+    r2 = r * r
+    return float(r * (1 + k1 * r2 + k2 * r2**2 + k3 * r2**3))
+
+
 @dataclass(frozen=True)
 class Camera:
     """One calibrated view. Build it with `Camera.load` or `Camera.from_calibration`."""
