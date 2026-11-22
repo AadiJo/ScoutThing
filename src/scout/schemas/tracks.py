@@ -14,6 +14,9 @@ is a consequence of the tracking, not a guarantee.
 - `view`, `x1`..`y2` (full-frame pixels) and `conf` are the measured sample's source box,
   for cropping and weighting; null on interpolated rows. When duplicate boxes on one robot
   were merged, the box is their union and `conf` their maximum.
+- `kind` is what that source box frames: `bumper`, or `robot` when only a whole-robot box saw
+  the robot in that frame (its colour does not count toward the track's `color`; a track
+  seen only that way has colour `unknown`); null on interpolated rows.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from __future__ import annotations
 import polars as pl
 
 from scout.schemas.common import ALLIANCES, VIEW_NAMES, TableSpec
+from scout.schemas.detections import KIND
 
 COLOR = pl.Enum([*ALLIANCES, "unknown"])
 STATE = pl.Enum(["measured", "interpolated"])
@@ -42,6 +46,7 @@ TRACKS = TableSpec(
         "x2": pl.Float32(),
         "y2": pl.Float32(),
         "conf": pl.Float32(),
+        "kind": KIND,
     },
 )
 

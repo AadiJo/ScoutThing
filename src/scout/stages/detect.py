@@ -1,14 +1,26 @@
 """detect: reads video, video.json, match.json.
 
-Writes detections.parquet: raw bumper boxes per sampled frame per view in full-frame
-pixels, unfiltered apart from a low confidence floor. Also writes
+Writes detections.parquet: raw boxes per sampled frame per view in full-frame pixels,
+unfiltered apart from a low confidence floor. Also writes
 `detections_check.jpg`, a contact sheet of 12 frames across the match with every box
 drawn, for a human to count against.
 
 One ffmpeg decode pass at `SAMPLE_HZ` feeds a reader thread that hands over batches of
 full frames. Each batch goes to the GPU once; the three camera panels are cut, resized
-and padded there and run through the bumper detector in half precision, one batched
-call per view.
+and padded there and run through each of the view's detectors in half precision, one
+batched call per view and detector.
+
+Detectors, compared on the hand-tracked robots of three Championship-season matches and two
+offseason clips (share of visible robot points inside a box at conf >= 0.25):
+- `bumpers_offpalette` (bumper boxes) on every view: 57% Curie, 65% Hopper, 84% San Diego.
+  The older `bumpers` model scored 55%, 62%, 81% and adds 0.4 points on top of the pair
+  below, so it is not run.
+- `hub_zone` (whole robots, `robot` class only) on the main view: 73%, 83%, 89% alone and
+  78%, 87%, 94% together with the bumper boxes; on Qualification 16 it sees the near-black
+  bumpered robot (6800) in 60% of hand marks against 27%. Its boxes that cover no hand-
+  tracked robot were 0.1 per frame against 0.9 for the bumper model; most of both are real
+  robots off the hand-tracked point, and the rest are low-confidence people, field
+  equipment, piles of fuel and hub sides, which the track stage filters by size.
 """
 
 from __future__ import annotations
@@ -33,25 +45,38 @@ from ultralytics.nn.tasks import DetectionModel
 
 from scout.assets import AssetName, asset
 from scout.run import RunDir, Stage
-from scout.schemas.common import Alliance, PixelRect, ViewName
-from scout.schemas.detections import COLOR, SAMPLE_HZ, VIEW, write_detections
+from scout.schemas.common import ALLIANCES, Alliance, PixelRect, ViewName
+from scout.schemas.detections import COLOR, KIND, SAMPLE_HZ, VIEW, Kind, write_detections
 from scout.schemas.match import MatchInfo
 from scout.schemas.video import VideoInfo
 from scout.video import frames
 
-DETECTOR: AssetName = "bumpers_offpalette"
+DETECTORS: dict[ViewName, tuple[AssetName, ...]] = {
+    "main": ("bumpers_offpalette", "hub_zone"),
+    "corner_left": ("bumpers_offpalette",),
+    "corner_right": ("bumpers_offpalette",),
+}
+"""Detectors run on each view. Only the main view is tracked, so the whole-robot model runs
+there alone; corner boxes only feed the number reader, which reads bumpers."""
+KIND_OF: dict[AssetName, Kind] = {"bumpers_offpalette": "bumper", "hub_zone": "robot"}
+ROBOT_CLASS = "robot"
+"""The one class kept from a whole-robot detector (`hub_zone` also boxes fuel and hub
+openings)."""
 CONF_FLOOR = 0.10
 NMS_IOU = 0.5
 """Per-class NMS overlap, the Ultralytics predict default."""
 VIEW_SCALE: dict[ViewName, float] = {"main": 0.5, "corner_left": 1.0, "corner_right": 1.0}
-"""Panel resize before inference. The main panel (1920x480) runs at 960x240, which found
-more robots and fewer static false positives than 640, 1280 or 1920 wide on Qualification
-16; corners run at native size, which beat 1024 and 1344."""
+"""Panel resize before inference, shared by every detector on the view. The main panel runs
+at half size (960 wide): on the hand-tracked matches both models covered more robots at 0.4
+to 0.6 than at 0.33, 0.75 or 1.0 (bumpers 84% at 0.5 against 74% at 0.75 and 54% at 1.0 on
+San Diego; 0.4 and 0.5 were within a point of each other everywhere). Corners run at native
+size, which beat 1024 and 1344 wide on Qualification 16."""
 BATCH = 32
 CHECK_FRAMES = 12
 STRIDE = 32
 PAD_VALUE = 114 / 255
 CPU_THREADS = 8
+COLOR_NAMES = (*ALLIANCES, "unknown")
 
 
 @dataclass
@@ -73,7 +98,19 @@ class _Rows:
     frame: list[NDArray[np.int64]] = field(default_factory=list[NDArray[np.int64]])
     view: list[NDArray[np.int8]] = field(default_factory=list[NDArray[np.int8]])
     box: list[NDArray[np.float32]] = field(default_factory=list[NDArray[np.float32]])
-    cls: list[NDArray[np.int64]] = field(default_factory=list[NDArray[np.int64]])
+    color: list[NDArray[np.int8]] = field(default_factory=list[NDArray[np.int8]])
+    detector: list[NDArray[np.int8]] = field(default_factory=list[NDArray[np.int8]])
+
+
+@dataclass(frozen=True)
+class _Detector:
+    """One loaded model: its network, what its boxes frame, and per class the index into
+    COLOR_NAMES of the box colour, or -1 for classes whose boxes are dropped."""
+
+    name: AssetName
+    kind: Kind
+    net: DetectionModel
+    class_color: torch.Tensor
 
 
 class _Batch:
@@ -152,15 +189,26 @@ def _panel_tensor(rgb: torch.Tensor, rect: PixelRect, scale: float) -> torch.Ten
     return F.pad(p, (0, -w % STRIDE, 0, -h % STRIDE), value=PAD_VALUE)
 
 
-def _load_net(device: torch.device, half: bool) -> DetectionModel:
-    """The bumper detector's network, fused and in eval mode on `device`, for direct
-    batched calls. Skipping `YOLO.predict` drops its per-call CPU work, which left the GPU
-    idle more than half the time."""
-    net = YOLO(str(asset(DETECTOR))).model
+def _load(name: AssetName, device: torch.device, half: bool) -> _Detector:
+    """A detector's network, fused and in eval mode on `device`, for direct batched calls.
+    Skipping `YOLO.predict` drops its per-call CPU work, which left the GPU idle more than
+    half the time. Bumper classes keep their alliance colour; a whole-robot detector keeps
+    only ROBOT_CLASS, as `unknown`."""
+    net = YOLO(str(asset(name))).model
     if not isinstance(net, DetectionModel):
-        raise TypeError(f"{DETECTOR} is not a detection model")
+        raise TypeError(f"{name} is not a detection model")
     net = net.fuse(verbose=False).to(device).eval()
-    return net.half() if half else net
+    names: dict[int, str] = {int(k): str(v) for k, v in net.names.items()}
+    kind = KIND_OF[name]
+    if kind == "bumper":
+        codes = [COLOR_NAMES.index(_color_of(names[k]) or "unknown") for k in sorted(names)]
+    else:
+        codes = [
+            COLOR_NAMES.index("unknown") if names[k] == ROBOT_CLASS else -1 for k in sorted(names)
+        ]
+    if max(codes) < 0:
+        raise ValueError(f"{name} has no {ROBOT_CLASS} class")
+    return _Detector(name, kind, net.half() if half else net, torch.tensor(codes, device=device))
 
 
 def _nms(raw: object) -> tuple[torch.Tensor, torch.Tensor]:
@@ -226,9 +274,8 @@ def detect(run: RunDir) -> None:
     cuda = torch.cuda.is_available()
     device = torch.device("cuda" if cuda else "cpu")
     dtype = torch.float16 if cuda else torch.float32
-    net = _load_net(device, half=cuda)
-    names: dict[int, str] = {int(k): str(v) for k, v in net.names.items()}
-    colors = [_color_of(names[k]) or "unknown" for k in sorted(names)]
+    names: list[AssetName] = [d for d in KIND_OF if any(d in DETECTORS[n] for n, _ in views)]
+    dets = [_load(n, device, half=cuda) for n in names]
 
     step = max(1, round(info.fps / SAMPLE_HZ))
     targets = _check_targets(match, range(0, info.frame_count, step), info)
@@ -255,20 +302,27 @@ def detect(run: RunDir) -> None:
             if cuda:
                 torch.cuda.synchronize()
             mark = timer.add("gpu preprocess", mark)
-            with torch.inference_mode():
-                raw = net(x)
-                if cuda:
-                    torch.cuda.synchronize()
-                mark = timer.add("inference", mark)
-                img, data = _nms(raw)
-            mark = timer.add("nms", mark)
             offset = torch.tensor([rect.x, rect.y, rect.x, rect.y], device=device)
-            box = torch.cat([data[:, :4] / scale + offset, data[:, 4:5]], 1)
-            rows.frame.append(frame_ids[img].cpu().numpy())
-            rows.view.append(np.full(len(data), code, np.int8))
-            rows.box.append(box.cpu().numpy().astype(np.float32))
-            rows.cls.append(data[:, 5].long().cpu().numpy())
-            mark = timer.add("collect", mark)
+            for d_code, det in enumerate(dets):
+                if det.name not in DETECTORS[name]:
+                    continue
+                with torch.inference_mode():
+                    raw = det.net(x)
+                    if cuda:
+                        torch.cuda.synchronize()
+                    mark = timer.add("inference", mark)
+                    img, data = _nms(raw)
+                    color = det.class_color[data[:, 5].long()]
+                    keep = color >= 0
+                    img, data, color = img[keep], data[keep], color[keep]
+                mark = timer.add("nms", mark)
+                box = torch.cat([data[:, :4] / scale + offset, data[:, 4:5]], 1)
+                rows.frame.append(frame_ids[img].cpu().numpy())
+                rows.view.append(np.full(len(data), code, np.int8))
+                rows.box.append(box.cpu().numpy().astype(np.float32))
+                rows.color.append(color.cpu().numpy().astype(np.int8))
+                rows.detector.append(np.full(len(data), d_code, np.int8))
+                mark = timer.add("collect", mark)
         del rgb
     if n_frames != len(range(0, info.frame_count, step)):
         raise RuntimeError(f"decoded {n_frames} sampled frames, expected every {step}th")
@@ -290,12 +344,19 @@ def detect(run: RunDir) -> None:
             "y2": box[:, 3],
             "conf": box[:, 4],
             "color": pl.Series(
-                [colors[c] for c in np.concatenate(rows.cls)] if rows.cls else [],
+                [COLOR_NAMES[c] for c in np.concatenate(rows.color)] if rows.color else [],
+                dtype=COLOR,
+            ),
+            "kind": pl.Series(
+                [dets[c].kind for c in np.concatenate(rows.detector)] if rows.detector else [],
+                dtype=KIND,
+            ),
+            "detector": pl.Series(
+                [names[c] for c in np.concatenate(rows.detector)] if rows.detector else [],
                 dtype=pl.String,
             ),
-            "detector": pl.Series([DETECTOR] * len(box), dtype=pl.String),
         }
-    ).with_columns(pl.col("view").cast(VIEW), pl.col("color").cast(COLOR))
+    ).with_columns(pl.col("view").cast(VIEW))
     df = df.sort("frame", "view", "conf", descending=[False, False, True])
     write_detections(run.detections, df)
     mark = timer.add("write parquet", mark)
@@ -303,7 +364,10 @@ def detect(run: RunDir) -> None:
     timer.add("contact sheet", mark)
 
     total = time.perf_counter() - start
-    print(f"detect: {len(df)} boxes over {n_frames} sampled frames x {len(views)} views")
+    per = ", ".join(
+        f"{n} {k}" for k, n in df.group_by("detector").len().sort("detector").iter_rows()
+    )
+    print(f"detect: {len(df)} boxes ({per}) over {n_frames} sampled frames x {len(views)} views")
     print("  " + "  ".join(f"{k} {v:.1f}s" for k, v in timer.s.items()) + f"  total {total:.1f}s")
     gpu = torch.cuda.max_memory_allocated() / 2**30 if cuda else 0.0
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
