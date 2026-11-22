@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from scout.games.first_overlay_2026 import LayoutName
 from scout.games.rebuilt2026 import PhaseName
 from scout.schemas.common import Alliance, PixelRect, StageFile, ViewName
 
@@ -38,7 +39,13 @@ class ClockFit(BaseModel):
 
     A tick to displayed value v happens `elapsed = period_length - v` seconds into the
     period (the clock shows remaining time rounded up). `ticks` were used, `dropped` were
-    rejected as misreads; residuals are over the used ticks.
+    rejected as misreads; residuals are over the used ticks. `slope` is the period's mean
+    clock rate in video seconds per clock second.
+
+    The line is only the summary: on some broadcasts the clock's rate wanders by a few
+    percent, so the match times and phases come from a local line through the nearest
+    ticks instead. `timeline_max_abs_s` is the largest tick residual from that timeline
+    (None in files written before it existed).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -49,15 +56,21 @@ class ClockFit(BaseModel):
     dropped: int
     rms_s: float
     max_abs_s: float
+    timeline_max_abs_s: float | None = None
 
 
 class MatchInfo(StageFile):
     """Overlay layout, roster and timeline for the match in the video."""
 
     schema_version: Literal[1] = 1
+    layout: LayoutName | None = None
+    """Overlay layout the stage found (`scout.games.first_overlay_2026`). None in files
+    written before it was recorded."""
     scoreboard: PixelRect
+    """The scoreboard's rectangle. On the official layout it covers the top of `main`."""
     views: dict[ViewName, PixelRect]
-    """Panel rectangles of the camera views in full-frame pixels."""
+    """Panel rectangles of the camera views in full-frame pixels. They may overlap
+    `scoreboard`: the overlay is drawn on top of the camera picture."""
     roster: list[TeamSlot]
     target_team: int
     target_alliance: Alliance
@@ -72,3 +85,8 @@ class MatchInfo(StageFile):
     phases: list[PhaseSpan]
     clock_fits: dict[Literal["auto", "teleop"], ClockFit]
     """How the auto and teleop times were measured, with fit residuals."""
+    clock_rate: float | None = None
+    """Video seconds per game-clock second over the whole match (one slope fitted to both
+    periods). The FMS clock runs in real time, so a speed measured per video second times
+    this is per real second; official broadcasts measure 1.01 to 1.02. None in files
+    written before it was recorded."""
