@@ -1,0 +1,57 @@
+team,at,x,y,state,note
+2468,f3780,290,593,visible,read 2?68 on near bumper (zoom); only 2468 fits; other reds 2687 and 5572 read elsewhere same frame; low black box green lights fuel hopper
+2468,f3840,362,570,visible,read 2468 near bumper
+2468,f3900,458,558,visible,read 2468 near bumper
+2468,f3960,460,560,visible,read 2468 near bumper
+2468,f4020,463,558,visible,read 2468 near bumper
+2468,f4080,463,560,visible,read 2468 near bumper
+2468,f4140,470,560,visible,read 2468 near bumper
+2468,f4200,475,560,visible,read 2468 near bumper
+2468,f4260,478,560,visible,read 2468 near bumper
+2468,f4320,375,595,visible,followed every 0.5 s from read at 71; backing out left behind referee area
+2468,f4380,418,640,visible,followed; partly behind referee and near wall
+2468,f4440,665,640,visible,followed; passes just below 9506 (read at 750 565) at 74.25
+2468,f4500,948,622,visible,followed under 9506 (9506 number read at its own spot 74.5-75); number blurred; re-read 2468 at 76
+2468,f4560,1100,545,visible,read 2468 near and side bumper; green lights
+2468,f4620,1050,485,visible,read 2468 near bumper; 9506 parked just left of it
+2468,f4680,1045,505,visible,followed; 9506 behind left; 2468 digits partly visible
+2468,f4740,928,595,visible,front robot read 2468 at 78.5 and 78.75; green lights; 9506 just behind right of it
+2468,f4800,735,638,visible,left of two box robots along near wall; 9506 (blue trim) on its right; followed back from read at 82 with no crossing; bumper behind wall
+2468,f4860,465,635,visible,partly behind red ramp; followed back from read at 82; 9506 at 680 630 to its right
+2468,f4920,440,585,visible,read 2468 near bumper (zoom)
+2468,f4980,490,558,visible,read 2468 near bumper (zoom)
+2468,f5040,490,555,visible,read 2468 near bumper
+2468,f5100,460,553,visible,read 2468 near bumper
+2468,f5160,350,620,visible,followed alone; partly behind referee; 2468 digits visible
+2468,f5220,240,632,visible,followed alone along left near wall
+2468,f5280,212,625,visible,read 2468 near bumper; green lights
+2468,f5340,322,560,visible,read 2468 near bumper
+2468,f5400,400,565,visible,read 2468 near bumper
+2468,f5460,448,558,visible,read 2468 near bumper
+2468,f5520,452,558,visible,read 2468 near bumper
+2468,f5580,450,558,visible,read 2468 near bumper
+2468,f5640,338,620,visible,followed alone every 0.5 s; partly behind referee
+2468,f5700,570,640,visible,followed alone; partly behind red ramp along near wall
+2468,f5760,778,585,visible,read 2468 near bumper; green lights
+2468,f5820,810,475,visible,read 2468 near bumper
+2468,f5880,828,435,visible,followed every 0.5 s; 2468 digits seen 97.5 and 98.5; 5572 stays to its left
+2468,f5940,870,440,visible,read 2468 near bumper (low res); 5572 at 740 460
+2468,f6000,918,483,visible,followed every 0.5 s; 5572 at 720 490 far left
+2468,f6060,1072,520,visible,followed; touching a plain-blue-bumper robot behind it; re-read 2468 at 102
+2468,f6120,935,548,visible,read 2468 near bumper (zoom)
+2468,f6180,750,558,visible,read 2468 at 102.5 and 103.5; followed every 0.5 s
+2468,f6240,725,560,visible,read 2468 near bumper (zoom); 9506 read at 1040 510 same frame
+2468,f6300,718,558,visible,read 2468 near bumper (zoom)
+2468,f6360,860,560,visible,read 2468 near bumper (zoom)
+2468,f6420,1100,530,visible,read 2468 near bumper (zoom); 9506 touching on its right
+2468,f6480,1095,505,visible,read 2468 near bumper; green lights; 9506 read 1506 at 1180 575 below right
+2468,f6540,1100,495,visible,read 2468 near bumper; green lights; 9506 read 1506 at 1170 545 below right
+2468,f6600,1040,492,visible,read 2468 near bumper (zoom)
+2468,f6660,880,492,visible,followed every 0.5 s; 2468 read at 110.5 and 111.5; no robot near
+2468,f6720,730,545,visible,read 2468 near bumper (zoom)
+2468,f6780,740,645,visible,read 2468 near bumper (zoom); at near wall
+2468,f6840,458,645,visible,followed every 0.5 s along near wall; partly behind red ramp and wall; 2468 read again 114.5
+2468,f6900,385,578,visible,read 2468 side bumper at 114.5 and 115; green lights
+2468,f6960,225,612,visible,read 2468 near bumper (zoom, faint)
+2468,f7020,170,635,visible,followed between reads at 116 and 118; no robot near; partly behind near wall
+2468,f7080,235,615,visible,read 2468 near bumper (zoom)

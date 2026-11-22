@@ -1,0 +1,57 @@
+team,at,x,y,state,note
+2468,f7020,172,628,visible,read 2468 on near bumper (check-sheet zoom); seen through near wall at lower left; black open-top box with fuel and green lights
+2468,f7080,272,605,visible,read 2468 on near bumper (1x)
+2468,f7140,478,570,visible,followed from 118 at 0.5s steps; partial read 24.. ; no lookalike nearby
+2468,f7200,480,568,visible,followed; partial read 24..; parked by red hub ramp; second box robot (red/blue bumper, number not read, likely 9506) entering at bottom right near wall (870,650)
+2468,f7260,478,568,visible,followed at 0.5s; other box robot passing along near wall below at 430,660, ~90px below, no overlap
+2468,f7320,472,558,visible,followed at 0.5s; other box robot now at lower left; 2468 read at 122.5
+2468,f7380,440,528,visible,read 2468 on side bumper; green lights; other box robot (red/blue bumper) at lower left near wall
+2468,f7440,452,528,visible,read 2468; other box robot at (310,590) same moment
+2468,f7500,505,478,visible,read 2468; other box robot at (230,615)
+2468,f7560,510,452,visible,read 2468; far side behind red hub line; other box robot at lower left (200,650)
+2468,f7620,490,478,visible,followed from 126 read; green lights; other box robot along near wall at (460,635)
+2468,f7680,470,550,visible,read 2468; other box robot at (790,650)
+2468,f7740,462,563,visible,read 2468 on near bumper; other box robot at (760,575) same moment
+2468,f7800,450,548,visible,read 2468
+2468,f7860,342,552,visible,read 2468
+2468,f7920,328,548,visible,read 2468; green lights
+2468,f7980,322,568,visible,read 2468
+2468,f8040,475,553,visible,read 2468
+2468,f8100,462,556,visible,read 2468
+2468,f8160,390,590,visible,followed from 135 read (1s, 75px move); rotated, white sticker on side visible; no box robot nearby
+2468,f8220,450,642,visible,followed from 135 read (136 rotated, 60px move); seen through near wall behind referee edge; read again at 138
+2468,f8280,737,630,visible,read 24?8 on right side bumper plus white side sticker
+2468,f8340,990,572,visible,read 2G68 on near bumper
+2468,f8400,1115,503,visible,read 2468 on near bumper; beside blue hub left side; a dark robot partly behind blue hub top-left at ~1100,440
+2468,f8460,985,487,visible,read 2468 on side bumper
+2468,f8520,888,535,visible,followed from 141 read; white side sticker; no box robot nearby
+2468,f8580,830,595,visible,followed from 141 read; white side sticker; no box robot nearby 
+2468,f8640,615,635,visible,followed; seen through near wall by red ramp; no other robot nearby
+2468,f8700,415,630,visible,followed; partly behind referee at near wall; read again at 146
+2468,f8760,468,555,visible,read 2468 on near bumper
+2468,f8820,488,553,visible,read 2468
+2468,f8880,478,550,visible,read 2468
+2468,f8940,485,556,visible,read 2468 on near bumper
+2468,f9000,448,565,visible,read 2468; white side sticker
+2468,f9060,414,634,visible,followed from 150 read; partly behind referee at near wall
+2468,f9120,630,655,visible,followed; seen through near wall by red ramp; no other robot nearby
+2468,f9180,935,655,visible,followed; seen through near wall at centre line; read again at 154
+2468,f9240,1097,568,visible,read 2468 on near bumper; green lights
+2468,f9300,1028,498,visible,read 2468 on near bumper
+2468,f9360,838,492,visible,read 2468 (24?8) on side bumper
+2468,f9420,755,538,visible,followed from 156 read; white side sticker; 5572 seen separately left of red hub
+2468,f9480,945,588,visible,read 2468 on near bumper
+2468,f9540,1146,562,visible,read 2468; green lights
+2468,f9600,1114,512,visible,read 2468; beside blue hub
+2468,f9660,1022,490,visible,read 2468 on near bumper
+2468,f9720,858,512,visible,read 2468 (24?8) on side bumper
+2468,f9780,680,540,visible,read 2468 on near bumper; at red hub ramp
+2468,f9840,588,538,visible,followed from 163 read; at base of red hub, near bumper partly hidden by ramp; read again at 165
+2468,f9900,505,548,visible,read 2468
+2468,f9960,500,550,visible,read 2468
+2468,f10020,480,550,visible,read 2468
+2468,f10080,467,552,visible,read 2468
+2468,f10140,458,548,visible,read 2468 on near bumper
+2468,f10200,392,562,visible,read 2468 on near bumper
+2468,f10260,478,550,visible,read 2468
+2468,f10320,472,553,visible,read 2468; 5572 parked behind at (360,500)

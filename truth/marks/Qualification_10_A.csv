@@ -1,0 +1,56 @@
+team,at,x,y,state,note
+2468,f600,790,425,visible,emerged from behind red hub at 10.0 (2583 and 8515 in view elsewhere); followed at 0.2-0.6 s steps to read 2468 on near bumper at 12.6 and 13.2 (zoom); low black open-top box; stayed left of blue box robot side by side 10.8-12.0 no swap
+2468,f660,885,440,visible,followed back from read at 12.6; beside blue robot (blue bumper) on its left
+2468,f720,849,467,visible,followed; read 2468 at 12.6
+2468,f780,763,462,visible,read 2468 on near bumper at 13.2 (zoom); beside red hub right side
+2468,f840,,,skip,behind red hub (went in on hub right side at 13.3); not elsewhere in whole main view or corner_left; position along hub unknown
+2468,f900,,,skip,behind red hub; position along hub unknown (whole view and corner_left searched)
+2468,f960,605,455,estimated,behind red hub; corner of black box with fuel peeks out at hub left edge 16.0-18.5; no other robot entered
+2468,f1020,605,455,estimated,behind red hub; box corner visible at hub left edge
+2468,f1080,605,455,estimated,behind red hub; box corner visible at hub left edge
+2468,f1140,,,skip,behind red hub moving from left side (18.5) to right side (exits 19.8); position unknown
+2468,f1200,795,427,visible,emerged from behind hub right side at 19.8; followed at 0.4 s steps to read 2468 at 22.4 and 22.8 (zoom); only crossing was 8515 (white body) not a lookalike
+2468,f1260,826,467,visible,followed back from read at 22.4
+2468,f1320,857,497,visible,followed; 8515 just in front; read 2468 at 22.4
+2468,f1380,920,473,visible,read 2468 on both front bumper faces at 23.0 (check sheet zoom); rotated, ring from three visible corners
+2468,f1440,845,474,visible,read 2468 on near bumper at 24.0 and 24.4 (zoom)
+2468,f1500,715,445,estimated,entering behind red hub right side (entered 24.8); part of red bumper visible at hub edge
+2468,f1560,,,skip,behind red hub 25-34.4; never seen at hub left edge (checked 25-34 at 1-2 s steps); position along hub unknown
+2468,f1620,,,skip,behind red hub; position unknown
+2468,f1680,,,skip,behind red hub; position unknown
+2468,f1740,,,skip,behind red hub; position unknown
+2468,f1800,,,skip,behind red hub; position unknown
+2468,f1860,,,skip,behind red hub; position unknown
+2468,f1920,,,skip,behind red hub; position unknown
+2468,f1980,,,skip,behind red hub; position unknown
+2468,f2040,720,440,estimated,behind red hub right side; emerges there at 34.5
+2468,f2100,822,427,visible,emerged from behind hub right side at 34.5 (2583 and 8515 elsewhere in view); followed at 0.5 s steps to read 2468 on near bumper at 37.5 (zoom); low black open-top box full of fuel
+2468,f2160,905,433,visible,followed; read 2468 at 37.5
+2468,f2220,856,451,visible,read 2468 on bumper at 37.0-37.5; 9140 (blue) touching front-left
+2468,f2280,818,422,visible,followed 0.5 s after read at 37.5; 9140 below-left
+2468,f2340,,,skip,behind red hub (went in at hub top-right at 38.4; a red box robot comes out at hub left at 39.6); position unknown; robot seen at 39.0 at (810 460) is 2583 (read)
+2468,f2400,575,468,unsure,red-bumper open-top box with fuel and green LEDs at hub left face 39.6-44.0 (came out from behind hub); no number readable; 2583 and 8515 seen elsewhere so probably 2468 but no read
+2468,f2460,572,470,unsure,same robot at hub left face; no read (2583 at far centre and 8515 near wall at 41)
+2468,f2520,572,470,unsure,same robot at hub left face; no read
+2468,f2580,570,468,unsure,same robot at hub left face; no read
+2468,f2640,568,458,unsure,same robot moving back behind hub left; no read
+2468,f2700,,,skip,behind red hub; a red box robot comes out at hub right at 45.4; position at 45.0 unknown
+2468,f2760,852,443,unsure,red-bumper black box that came out at hub right at 45.4; bumper text not readable (45.4-46.6 zoom)
+2468,f2820,855,505,unsure,same robot driving toward camera; no read; it then enters a pile-up with 2583 and 8515 at the red hub ramp
+2468,f2880,660,535,unsure,pile-up of three red robots (2468 2583 8515) at hub ramp; open-top box with fuel here is probably 2468 but 2583 overlaps it; no read
+2468,f2940,,,skip,pile-up at red hub ramp; could not tell which black box is 2468
+2468,f3000,527,490,visible,read 2468 on side bumper at 50.0-50.3 (tight zoom); open-top box with fuel and green LEDs
+2468,f3060,527,447,visible,2468 on bumper again at 51.0; followed from 50.3
+2468,f3120,552,455,visible,followed; partial 2468 on bumper at 52.0; beside red hub left
+2468,f3180,570,462,estimated,parked behind 2583 at hub left (2583 read on its own bumper in front); only hopper top of 2468 visible; ring hidden by 2583
+2468,f3240,575,462,estimated,ring hidden by 2583 parked in front; hopper top visible; followed 52.5-55.5 at 0.5 s steps
+2468,f3300,575,462,estimated,ring hidden by 2583 parked in front; hopper top visible
+2468,f3360,585,458,estimated,going behind red hub left edge; small part of red bumper visible
+2468,f3420,,,skip,behind red hub moving to its right side (comes out at hub right by 58.0); position unknown
+2468,f3480,853,430,visible,came out at hub right; followed at 1 s and 0.5 s to read 2468 at 60-63
+2468,f3540,818,476,visible,followed; read 2468 at 60.0
+2468,f3600,775,478,visible,read 2468 on near bumper at 60.0
+2468,f3660,858,452,visible,read 2468 on near bumper at 61.0; green LEDs visible on this robot
+2468,f3720,932,432,visible,read 2468 on near bumper at 62.0
+2468,f3780,860,432,visible,read 2468 on near bumper at 63.0
+2468,f3840,715,430,estimated,went behind red hub right side at about 63.8 (seen at 765 425 at 63.5 heading left); hidden by hub

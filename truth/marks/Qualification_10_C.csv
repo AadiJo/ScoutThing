@@ -1,0 +1,57 @@
+team,at,x,y,state,note
+2468,f7020,566,468,visible,read 2468 on near bumper (main zoom 6x); low black body with green lights, red bumper; right end behind red hub
+2468,f7080,690,440,estimated,behind red hub; entered 117.3-117.6 left side, came out right side 118.6
+2468,f7140,820,430,visible,followed: only robot to come out of the hub rear at 118.6; black box red bumper; 2583 seen separately below
+2468,f7200,1003,450,visible,followed from hub exit; near band partly behind blue 2158; all six robots accounted for at 118.6 (2583 and 8515 seen elsewhere)
+2468,f7260,1122,488,visible,followed; black box with white sticker by blue hub; 8515 (silver body) beside it but never swapped
+2468,f7320,1125,488,visible,followed; same black box with white side sticker
+2468,f7380,1085,462,visible,followed; 2583 still separate to its left; number on bumper not legible
+2468,f7440,975,424,visible,re-identified: black box with green corner light (as at 117 read) separating from 2583 (2583 read on its bumper at 123.5 in front of it); 8515 silver elsewhere
+2468,f7500,868,435,visible,bumper reads 24?8 in check crop (consistent with 2468); white side sticker
+2468,f7560,810,440,visible,followed; bumper 24.8 partly legible
+2468,f7620,912,437,visible,followed; reversed right; 8515 silver body below it
+2468,f7680,1068,427,visible,followed from 127 (continuous); 2583 by blue hub front-left; 8515 silver below
+2468,f7740,1235,437,estimated,behind blue hub; entered its left side 128.5 heading right; came out right side by 130
+2468,f7800,1337,440,unsure,came out of blue hub; no number read; identity only by elimination of the other five robots until the 139 read
+2468,f7860,1325,442,unsure,followed after hub with no read; see 130
+2468,f7920,1320,445,unsure,followed after hub with no read; see 130
+2468,f7980,1210,432,unsure,behind blue hub (went in right side after 132; came out left side 133.5); identity of robot not read since 128
+2468,f8040,1060,427,unsure,came out of blue hub; no read; 2583 not seen 131-134 so elimination is weak
+2468,f8100,890,435,unsure,followed; no read; touches 2583 at 135.75
+2468,f8160,760,462,visible,crossing moment: the other black box here reads 2583 (136.2 and 136.4 zoom) and drives right; this one (fuel in hopper) goes behind red hub and is read 2468 at 139; 8515 silver elsewhere
+2468,f8220,680,440,estimated,behind red hub; went in right side 136.3 and came out left side 138.0
+2468,f8280,590,443,visible,green light on body (as at 117); read follows at 139
+2468,f8340,530,446,visible,read 2468 on bumper (main zoom 4x at 139.0-139.5); 2583 read same time at right of field
+2468,f8400,538,463,visible,followed; green light visible
+2468,f8460,548,468,visible,followed
+2468,f8520,553,474,visible,followed; parked left of red hub; green light visible
+2468,f8580,558,476,visible,followed; green lights
+2468,f8640,555,472,visible,followed
+2468,f8700,553,474,visible,followed
+2468,f8760,507,495,visible,read 2468 on near bumper (check crop and zoom)
+2468,f8820,445,520,visible,read 2468 on near bumper (check lower crop); partly behind left goal ladder
+2468,f8880,512,492,visible,read 2468 on near bumper (check zoom)
+2468,f8940,435,503,visible,followed; bumper 24.8 partly visible; by left ladder
+2468,f9000,460,485,visible,read 2468 on near bumper (zoom 3x)
+2468,f9060,568,482,visible,followed; green light; drove right toward red hub
+2468,f9120,572,478,visible,followed from 151; against red hub left side
+2468,f9180,640,440,estimated,behind red hub; went behind its left side 152.5 and came out right side 154.0
+2468,f9240,770,428,visible,coming out of red hub right side; read 2468 at 154.5; 2583 read separately to its right
+2468,f9300,932,430,visible,read 2468 on bumper at 154.5 and 155 (zoom 3x); 2583 (read) just in front of it
+2468,f9360,988,462,visible,followed from 155 read; black box full of fuel with white side sticker; 2583 (read) far left of it
+2468,f9420,890,515,visible,followed; 2583 read above-left, 9140 read left
+2468,f9480,855,535,visible,read 2468 on side bumper (check zoom)
+2468,f9540,895,575,visible,followed; same box with white sticker; bumper number partly visible on right side
+2468,f9600,835,582,visible,read 2468 on near bumper (wide 1.75x and check zoom)
+2468,f9660,648,550,visible,read 2468 on near bumper (wide and check zoom); in front of red hub
+2468,f9720,505,552,visible,followed; white side sticker; 8515 silver to its left
+2468,f9780,450,540,visible,read 2468 on near bumper (check zoom)
+2468,f9840,465,535,visible,read 2468 on near bumper (check zoom)
+2468,f9900,525,535,visible,read 2468 on near bumper (check zoom)
+2468,f9960,518,535,visible,read 2468 on near bumper (check zoom)
+2468,f10020,515,537,visible,read 2468 on near bumper (check zoom)
+2468,f10080,515,537,visible,read 2468 on near bumper (check zoom)
+2468,f10140,515,537,visible,read 2468 on near bumper (check zoom)
+2468,f10200,500,535,visible,read 2468 on near bumper (check zoom)
+2468,f10260,512,537,visible,read 2468 on near bumper (check zoom)
+2468,f10320,515,535,visible,read 2468 partly on near bumper (check zoom); match end
