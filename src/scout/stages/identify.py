@@ -227,8 +227,10 @@ def _read_boxes(
     """Read every detector box in one decode pass. Returns reads (track_id still null) in
     detection order and the candidate crops for reads_check.jpg by row index."""
     teams = [str(s.team) for s in match.roster]
-    dets = read_detections(run.detections).sort(
-        "frame", "view", "conf", descending=[False, False, True]
+    dets = (
+        read_detections(run.detections)
+        .filter(pl.col("kind") == "bumper")
+        .sort("frame", "view", "conf", descending=[False, False, True])
     )
     cuda = torch.cuda.is_available()
     device = torch.device("cuda" if cuda else "cpu")

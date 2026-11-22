@@ -7,18 +7,24 @@ and the number of live tracks over time.
 Purity comes before completeness: a track that might have swapped robots is cut, and the
 pieces are left for the identify stage to label. Steps:
 
-1. Place boxes. Only the main view is calibrated, so only its boxes are used. A box's
-   centre is cast onto the plane at bumper centre height: a bumper wraps the robot, so the
-   centre of its box sits over the robot's centre (the bottom edge is the near bumper, half
-   a robot toward the camera). Boxes that land off the field (wall banners, displays, hub
-   tops all project far off it), inside a hub, or whose pixel size does not fit a robot at
-   that spot are dropped. Nothing else is called static: parked robots are real.
-2. Merge duplicates. A box mostly inside a larger box of the other colour is dropped.
-   Same-colour boxes in one frame closer than `MERGE_M`, or boxes of any colour that nearly
-   coincide, are one robot: their union box is placed again.
+1. Place boxes. Only the main view is calibrated, so only its boxes are used. A bumper
+   box's centre is cast onto the plane at bumper centre height: a bumper wraps the robot,
+   so the centre of its box sits over the robot's centre (the bottom edge is the near
+   bumper, half a robot toward the camera). A whole-robot box's centre is cast onto the
+   plane at `ROBOT_CENTER_HEIGHT_M`. Boxes that land off the field (wall banners, displays,
+   hub tops all project far off it), inside a hub, or whose pixel size does not fit a robot
+   at that spot are dropped. Nothing else is called static: parked robots are real.
+2. Merge duplicates. A bumper box mostly inside a larger box of the other colour is
+   dropped. Same-colour bumper boxes in one frame closer than `MERGE_M`, or boxes of any
+   colour that nearly coincide, are one robot: their union box is placed again. Whole-robot
+   boxes are merged among themselves the same way, then each is dropped when a bumper box
+   explains it (lies mostly inside it, or lands within `MERGE_M`): bumper boxes place better
+   and carry a colour. Only whole-robot boxes with no bumper box on them become
+   observations, with an unknown colour.
 3. Tracklets. Frame by frame, boxes are assigned to live tracklets by distance in metres
    within what a robot can drive. A link is cut instead when a rival box or tracklet is
-   nearly as good, or when another robot vanished next to the box in the last second.
+   nearly as good, or when another robot vanished next to the box in the last second, or
+   when it passes between whole-robot-only and bumper boxes with another robot near.
    Tracklets bridge at most one missed sample. Short or weak tracklets are dropped.
 4. Joins. With the whole match in hand, a tracklet end is joined to a later start across
    gaps up to `JOIN_MAX_S` when both ends, carried forward at their own velocities, meet,
@@ -57,7 +63,7 @@ from scout.games.rebuilt2026 import (
 from scout.run import RunDir, Stage
 from scout.schemas.detections import SAMPLE_HZ, read_detections
 from scout.schemas.match import MatchInfo
-from scout.schemas.tracks import COLOR, STATE, VIEW, write_tracks
+from scout.schemas.tracks import COLOR, KIND, STATE, VIEW, write_tracks
 from scout.schemas.video import VideoInfo
 
 F64 = NDArray[np.float64]
@@ -72,6 +78,21 @@ SIZE_RATIO_W = (0.2, 1.6)
 below 0.2 is a sliver of something, above 1.6 is bigger than any robot."""
 SIZE_RATIO_H = (0.3, 2.0)
 """The same for box height (tall boxes come from robots seen close and from above)."""
+ROBOT_CENTER_HEIGHT_M = 0.35
+"""Plane a whole-robot box's centre is cast onto. Against San Diego hand-tracked truth
+(6738 boxes on one robot each) it lands at median 0.20 m, p90 0.41 m, +0.05 m along the line
+of sight (0.30 m: +0.21; 0.40 m: -0.11); on the CapCity hand marks median 0.09-0.10 m. The
+box's bottom centre on the carpet lands 0.25-0.5 m short. On the same robot it sits a median
+0.2 m (p90 0.4 m) from the bumper rule's point."""
+ROBOT_SIZE_W = (0.45, 1.4)
+"""Allowed whole-robot box width over a robot's bumper band width at that spot. Narrower
+boxes are people, poles and slivers of half-hidden robots: on San Diego 97% of boxes on
+hand-tracked robots pass, and 101 of 121 boxes on no hand-tracked robot fail."""
+ROBOT_SIZE_H = (0.8, 3.0)
+"""The same for height over the bumper band's height: the box holds the whole robot (1%-99%
+of boxes on robots: 0.97-2.5)."""
+ROBOT_COVER = 0.6
+"""A bumper box with this share of its area inside a whole-robot box explains it."""
 MERGE_M = 0.75
 """Same-colour boxes closer than this in one frame are one robot: two robots' centres
 cannot be closer than a robot width (0.95 m) less calibration noise."""
@@ -97,6 +118,13 @@ CONTACT_M = 1.5
 touching robots are about 0.95 m apart, plus calibration noise and some driving."""
 CONTACT_S = 1.0
 """How long a vanished robot stays a possible stand-in for a neighbour's box."""
+SWITCH_S = 2.0
+"""A tracklet passing between whole-robot-only and bumper boxes is cut if another robot
+was within CONTACT_M of the box this recently. A whole-robot box has no colour and can sit
+between two touching robots: in Playoff 12 at 69 s a tracklet followed 2468 on whole-robot
+boxes and then took 2687's bumper box, 1.3 s after 2687's own tracklet was last seen. Cutting
+at every switch instead doubled the track count and cost label recall (Qualification 16
+target untracked 30 s -> 39 s), because one robot's pieces then block each other's joins."""
 MIN_TRACKLET_OBS = 3
 """Tracklets with fewer boxes are dropped: 0.3 s is too short to be checked."""
 MIN_TRACKLET_CONF = 0.35
@@ -132,6 +160,8 @@ class Obs:
     box: NDArray[np.float32]
     conf: NDArray[np.float32]
     color: I64
+    whole: NDArray[np.bool_]
+    """Backed by a whole-robot box only (no bumper box on that robot in that frame)."""
 
 
 @dataclass
@@ -169,12 +199,14 @@ def _in_rect(xy: F64, r: Rect, margin: float = 0.0) -> NDArray[np.bool_]:
     )
 
 
-def _place(cam: Camera, box: NDArray[np.float32]) -> tuple[F64, NDArray[np.bool_]]:
-    """Field centres of boxes (x1 y1 x2 y2 rows) and which of them can be a robot."""
+def _place(
+    cam: Camera, box: NDArray[np.float32], whole: NDArray[np.bool_]
+) -> tuple[F64, NDArray[np.bool_]]:
+    """Field centres of boxes (x1 y1 x2 y2 rows; `whole` marks whole-robot boxes) and which
+    of them can be a robot."""
     b = box.astype(np.float64)
-    xy = cam.to_field(
-        np.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2], 1), BUMPER_CENTER_HEIGHT_M
-    )
+    z = np.where(whole, ROBOT_CENTER_HEIGHT_M, BUMPER_CENTER_HEIGHT_M)
+    xy = cam.to_field(np.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2], 1), z)
     field_rect = Rect(0.0, 0.0, FIELD_LENGTH_M, FIELD_WIDTH_M)
     ok = np.isfinite(xy).all(1) & _in_rect(np.nan_to_num(xy, nan=-99.0), field_rect, FIELD_MARGIN_M)
     for hub in HUBS.values():
@@ -183,8 +215,15 @@ def _place(cam: Camera, box: NDArray[np.float32]) -> tuple[F64, NDArray[np.bool_
     with np.errstate(invalid="ignore", divide="ignore"):
         rw = (b[:, 2] - b[:, 0]) / ew
         rh = (b[:, 3] - b[:, 1]) / eh
-    ok &= (rw >= SIZE_RATIO_W[0]) & (rw <= SIZE_RATIO_W[1])
-    ok &= (rh >= SIZE_RATIO_H[0]) & (rh <= SIZE_RATIO_H[1])
+    lo_w, hi_w = (
+        np.where(whole, ROBOT_SIZE_W[0], SIZE_RATIO_W[0]),
+        np.where(whole, ROBOT_SIZE_W[1], SIZE_RATIO_W[1]),
+    )
+    lo_h, hi_h = (
+        np.where(whole, ROBOT_SIZE_H[0], SIZE_RATIO_H[0]),
+        np.where(whole, ROBOT_SIZE_H[1], SIZE_RATIO_H[1]),
+    )
+    ok &= (rw >= lo_w) & (rw <= hi_w) & (rh >= lo_h) & (rh <= hi_h)
     return xy, ok
 
 
@@ -242,6 +281,24 @@ def _merge_frame(xy: F64, box: NDArray[np.float32], color: I64) -> list[list[int
     return list(groups.values())
 
 
+def _union(b: NDArray[np.float32]) -> NDArray[np.float32]:
+    return np.array([b[:, 0].min(), b[:, 1].min(), b[:, 2].max(), b[:, 3].max()], np.float32)
+
+
+def _explained(
+    robot_box: NDArray[np.float32], robot_xy: F64, box: NDArray[np.float32], xy: F64
+) -> bool:
+    """Whether any of a frame's kept bumper boxes (`box`, placed at `xy`) is on the same
+    robot as a merged whole-robot box: mostly inside it, or placed within MERGE_M of any of
+    its member boxes' placements."""
+    for b, p in zip(box, xy, strict=True):
+        if _inter(b, robot_box) >= ROBOT_COVER * _area(b):
+            return True
+        if np.min(np.hypot(*(robot_xy - p).T)) < MERGE_M:
+            return True
+    return False
+
+
 def _observations(run: RunDir, cam: Camera) -> tuple[Obs, dict[str, int]]:
     """Main-view boxes placed on the field, filtered and merged per frame."""
     det = read_detections(run.detections)
@@ -249,11 +306,13 @@ def _observations(run: RunDir, cam: Camera) -> tuple[Obs, dict[str, int]]:
     det = det.filter((pl.col("view") == "main") & (pl.col("conf") >= CONF_MIN))
     counts["main_conf"] = len(det)
     box = det.select("x1", "y1", "x2", "y2").to_numpy().astype(np.float32)
-    xy, ok = _place(cam, box)
+    whole = (det["kind"] == "robot").to_numpy()
+    xy, ok = _place(cam, box, whole)
     counts["placed"] = int(ok.sum())
+    counts["robot_placed"] = int((ok & whole).sum())
     frame = det["frame"].to_numpy()[ok]
     t = det["t"].to_numpy()[ok]
-    xy, box = xy[ok], box[ok]
+    xy, box, whole = xy[ok], box[ok], whole[ok]
     conf = det["conf"].to_numpy()[ok].astype(np.float32)
     color = (
         det["color"]
@@ -267,27 +326,37 @@ def _observations(run: RunDir, cam: Camera) -> tuple[Obs, dict[str, int]]:
     out_box: list[NDArray[np.float32]] = []
     out_conf: list[float] = []
     out_col: list[int] = []
+    out_whole: list[bool] = []
+
+    def emit(ii: I64, is_whole: bool) -> None:
+        best = ii[int(np.argmax(conf[ii]))]
+        out_box.append(_union(box[ii]))
+        out_f.append(int(frame[best]))
+        out_t.append(float(t[best]))
+        out_conf.append(float(conf[ii].max()))
+        out_col.append(UNKNOWN if is_whole else int(color[best]))
+        out_whole.append(is_whole)
+
     order = np.argsort(frame, kind="stable")
     bounds = np.flatnonzero(np.diff(frame[order])) + 1
     for sel in np.split(order, bounds):
         if len(sel) == 0:
             continue
-        inside = _inside_other(box[sel], color[sel])
+        bum, rob = sel[~whole[sel]], sel[whole[sel]]
+        inside = _inside_other(box[bum], color[bum])
         counts["inside"] = counts.get("inside", 0) + int(inside.sum())
-        sel = sel[~inside]
-        for g in _merge_frame(xy[sel], box[sel], color[sel]):
-            ii = sel[g]
-            b = box[ii]
-            out_box.append(
-                np.array([b[:, 0].min(), b[:, 1].min(), b[:, 2].max(), b[:, 3].max()], np.float32)
-            )
-            best = ii[int(np.argmax(conf[ii]))]
-            out_f.append(int(frame[best]))
-            out_t.append(float(t[best]))
-            out_conf.append(float(conf[ii].max()))
-            out_col.append(int(color[best]))
+        bum = bum[~inside]
+        for g in _merge_frame(xy[bum], box[bum], color[bum]):
+            emit(bum[g], False)
+        for g in _merge_frame(xy[rob], box[rob], color[rob]):
+            ii = rob[g]
+            if _explained(_union(box[ii]), xy[ii], box[bum], xy[bum]):
+                counts["robot_explained"] = counts.get("robot_explained", 0) + 1
+            else:
+                emit(ii, True)
     mbox = np.array(out_box, np.float32).reshape(-1, 4)
-    mxy, _ = _place(cam, mbox)
+    mwhole = np.array(out_whole, np.bool_)
+    mxy, _ = _place(cam, mbox, mwhole)
     obs = Obs(
         frame=np.array(out_f, np.int64),
         t=np.array(out_t, np.float64),
@@ -295,8 +364,10 @@ def _observations(run: RunDir, cam: Camera) -> tuple[Obs, dict[str, int]]:
         box=mbox,
         conf=np.array(out_conf, np.float32),
         color=np.array(out_col, np.int64),
+        whole=mwhole,
     )
     counts["merged"] = len(obs.t)
+    counts["robot_only"] = int(mwhole.sum())
     return obs, counts
 
 
@@ -305,17 +376,19 @@ def _tracklets(obs: Obs) -> tuple[list[Piece], dict[str, int]]:
 
     A link from a tracklet to a box is cut when a rival box or tracklet is nearly as good
     (`AMBIGUOUS_M`), or when another robot vanished within `CONTACT_M` of the box in the
-    last `CONTACT_S` (it may be the robot now seen). Returns the tracklets and how many
-    links each rule cut."""
+    last `CONTACT_S` (it may be the robot now seen). A link between a whole-robot-only
+    observation and a bumper observation is also cut when another robot was seen within
+    `CONTACT_M` of the box in the last `SWITCH_S`, whether it is still tracked or not.
+    Returns the tracklets and how many links each rule cut."""
     pieces: list[Piece] = []
     cut: list[bool] = []
     live: list[int] = []
     recent: list[int] = []
-    cuts = {"rival": 0, "contact": 0}
+    cuts = {"rival": 0, "contact": 0, "kind": 0}
     for sel in _frames(obs):
         now = float(obs.t[sel[0]])
         live = [p for p in live if now - obs.t[pieces[p].idx[-1]] <= COAST_S]
-        recent = [p for p in recent if now - obs.t[pieces[p].idx[-1]] <= CONTACT_S]
+        recent = [p for p in recent if now - obs.t[pieces[p].idx[-1]] <= SWITCH_S]
         assigned: dict[int, int] = {}
         ended: set[int] = set()
         if live:
@@ -336,9 +409,14 @@ def _tracklets(obs: Obs) -> tuple[list[Piece], dict[str, int]]:
                 rivals = np.sum(feasible[r] & (cost[r] < close)) + np.sum(
                     feasible[:, c] & (cost[:, c] < close)
                 )
-                contact = _vanished_nearby(obs, pieces, cut, recent, taken, p, sel[c])
-                if rivals > 2 or contact:
-                    cuts["contact" if contact and rivals <= 2 else "rival"] += 1
+                j = int(sel[c])
+                contact = _near_other(obs, pieces, recent, p, j, CONTACT_S, taken, cut)
+                kind = obs.whole[pieces[p].idx[-1]] != obs.whole[j] and _near_other(
+                    obs, pieces, recent, p, j, SWITCH_S
+                )
+                if rivals > 2 or contact or kind:
+                    why = "rival" if rivals > 2 else "contact" if contact else "kind"
+                    cuts[why] += 1
                     del assigned[c]
                     ended.add(p)
                     cut[p] = True
@@ -354,24 +432,31 @@ def _tracklets(obs: Obs) -> tuple[list[Piece], dict[str, int]]:
     return pieces, cuts
 
 
-def _vanished_nearby(
+def _near_other(
     obs: Obs,
     pieces: list[Piece],
-    cut: list[bool],
     recent: list[int],
-    taken: set[int],
     p: int,
     j: int,
+    window_s: float,
+    skip: set[int] | None = None,
+    cut: list[bool] | None = None,
 ) -> bool:
-    """True if an established tracklet other than `p` (MIN_TRACKLET_OBS boxes, not seen
-    in this frame, not itself cut) was last seen within CONTACT_M of box `j` while `p`
-    already existed. One- or two-box blips are not robots that can stand in."""
+    """True if an established tracklet other than `p` (MIN_TRACKLET_OBS boxes) was last
+    seen within CONTACT_M of box `j`, at most `window_s` before it. One- or two-box blips
+    are not robots that can stand in. With `cut` (the contact rule), tracklets in `skip`
+    (seen this frame) or themselves cut are ignored, and only those last seen after `p`
+    started count, since a tracklet that ended before `p` began may be `p`'s own robot."""
     start = obs.t[pieces[p].idx[0]]
     for q in recent:
-        if q == p or q in taken or cut[q] or len(pieces[q].idx) < MIN_TRACKLET_OBS:
+        if q == p or len(pieces[q].idx) < MIN_TRACKLET_OBS:
             continue
         k = pieces[q].idx[-1]
-        if obs.t[k] > start and np.hypot(*(obs.xy[k] - obs.xy[j])) < CONTACT_M:
+        if obs.t[j] - obs.t[k] > window_s:
+            continue
+        if cut is not None and (cut[q] or q in (skip or set()) or obs.t[k] <= start):
+            continue
+        if np.hypot(*(obs.xy[k] - obs.xy[j])) < CONTACT_M:
             return True
     return False
 
@@ -415,8 +500,11 @@ def _join(obs: Obs, pieces: list[Piece]) -> tuple[list[Piece], int]:
 
     Each side is carried to the middle of the gap at its own end velocity; the two must
     meet within what NOISE_M and ACCEL_MPS2 allow, have compatible colours, and be
-    reachable at MAX_SPEED_MPS. A pair is joined only when it is the best option for both
-    ends by JOIN_MARGIN_M over every rival. Returns the joined tracks and the join count."""
+    reachable at MAX_SPEED_MPS. A pair is joined only when it beats by JOIN_MARGIN_M every
+    rival for either end: every other reachable, colour-compatible pairing, whether or not it
+    meets the bend limit. Without that, a robot's own continuation that bent a little too
+    hard was no rival, and a looser pairing with a neighbour won unopposed (Qualification 16,
+    46-48 s, 6800 joined onto 2468). Returns the joined tracks and the join count."""
     n = len(pieces)
     if n == 0:
         return [], 0
@@ -435,14 +523,15 @@ def _join(obs: Obs, pieces: list[Piece]) -> tuple[list[Piece], int]:
     resid = np.hypot(meet[..., 0], meet[..., 1])
     straight = e_xy[:, None, :] - s_xy[None, :, :]
     dist = np.hypot(straight[..., 0], straight[..., 1])
-    ok = (gap > 0) & (gap <= JOIN_MAX_S) & ~_mismatch(col, col)
-    ok &= dist <= MAX_SPEED_MPS * gap + NOISE_M
-    ok &= resid <= NOISE_M + ACCEL_MPS2 * gap**2 / 4
+    reach = (gap > 0) & (gap <= JOIN_MAX_S) & ~_mismatch(col, col)
+    reach &= dist <= MAX_SPEED_MPS * gap + NOISE_M
+    ok = reach & (resid <= NOISE_M + ACCEL_MPS2 * gap**2 / 4)
     cost = np.where(ok, resid, np.inf)
+    rival = np.where(reach, resid, np.inf)
     succ: dict[int, int] = {}
     for e, s_ in np.argwhere(ok).tolist():
-        rivals_e = np.delete(cost[e], s_)
-        rivals_s = np.delete(cost[:, s_], e)
+        rivals_e = np.delete(rival[e], s_)
+        rivals_s = np.delete(rival[:, s_], e)
         margin = cost[e, s_] + JOIN_MARGIN_M
         if (rivals_e >= margin).all() and (rivals_s >= margin).all():
             succ[e] = s_
@@ -534,6 +623,8 @@ def _rows(obs: Obs, tracks: Sequence[Piece], fps: float, step: int) -> pl.DataFr
     color = np.concatenate(cols["color"]).astype(np.int64) if tracks else np.zeros(0, np.int64)
     box = obs.box if len(obs.box) else np.zeros((1, 4), np.float32)
     conf = obs.conf if len(obs.conf) else np.zeros(1, np.float32)
+    whole = obs.whole if len(obs.whole) else np.zeros(1, np.bool_)
+    kind = [("robot" if whole[i] else "bumper") if i >= 0 else None for i in src.tolist()]
     df = pl.DataFrame(
         {
             "track_id": pl.Series(
@@ -553,6 +644,7 @@ def _rows(obs: Obs, tracks: Sequence[Piece], fps: float, step: int) -> pl.DataFr
             "x2": boxcol(box[:, 2]),
             "y2": boxcol(box[:, 3]),
             "conf": boxcol(conf),
+            "kind": pl.Series(kind, dtype=KIND),
         }
     )
     return df.sort("track_id", "frame")
@@ -704,11 +796,14 @@ def track(run: RunDir) -> None:
     live = df.group_by("frame").len()["len"].to_numpy()
     print(
         f"track: {counts['boxes']} boxes, {counts['main_conf']} main >= {CONF_MIN}, "
-        f"{counts['placed']} placed, {counts.get('inside', 0)} inside another colour, "
-        f"{counts['merged']} after merging"
+        f"{counts['placed']} placed ({counts['robot_placed']} whole-robot), "
+        f"{counts.get('inside', 0)} inside another colour, {counts['merged']} after merging "
+        f"({counts.get('robot_explained', 0)} whole-robot explained by bumpers, "
+        f"{counts['robot_only']} whole-robot only)"
     )
     print(
-        f"  {len(raw)} tracklets (cut: {cuts['rival']} rival, {cuts['contact']} contact), "
+        f"  {len(raw)} tracklets (cut: {cuts['rival']} rival, {cuts['contact']} contact, "
+        f"{cuts['kind']} box kind), "
         f"{len(pieces)} kept, {joins} joins, {dup_dropped} duplicate samples dropped, "
         f"{len(tracks)} tracks"
     )
