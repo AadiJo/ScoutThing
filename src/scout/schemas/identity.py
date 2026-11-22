@@ -13,18 +13,51 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from scout.schemas.common import VIEW_NAMES, StageFile, TableSpec
 
-LabelSource = Literal["digits", "digits_extended", "no_reads", "below_rule", "conflict"]
+LabelSource = Literal[
+    "digits",
+    "digits_extended",
+    "appearance",
+    "appearance_continuity",
+    "no_reads",
+    "below_rule",
+    "conflict",
+]
 """What decided a segment.
 
 - `digits`: between the first and last of at least three agreeing named bumper reads on the
   track, with no named read of another team in between.
 - `digits_extended`: the same label carried past those reads toward the track's ends, until
   the unnamed reads turn against the team or a time limit.
+- `appearance`: a stretch with no number-read label, named because its robot looks like that
+  team's number-read stretches in this match (appearance embedder) by a clear margin over
+  every team not labelled elsewhere at the time. See `AppearanceEvidence`.
+- `appearance_continuity`: the same with a looser appearance bar, allowed because the stretch
+  also continues a track labelled that team (same track, or the only track that ended or
+  began where and when this one starts or ends).
 - `no_reads` (team null): no bumper read joins this stretch of track.
 - `below_rule` (team null): reads join it, but not enough agreeing named reads.
 - `conflict` (team null): the track holds named reads of two teams around this stretch, or
   another track claimed the same team at the same time.
 """
+
+
+class AppearanceEvidence(BaseModel):
+    """Why an `appearance*` segment carries its team: its strength, to measure it apart from
+    number reads."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    cosine: float
+    """Mean over the stretch's boxes of the mean of the 10 highest cosines to the team's
+    number-read boxes in this match."""
+    margin: float
+    """`cosine` minus the runner-up candidate's (9.0 when there was no runner-up)."""
+    runner_up: int | None
+    """The next best candidate team, None when there was none."""
+    n_boxes: int = Field(ge=0)
+    """Embedded boxes on the stretch."""
+    candidates: list[int]
+    """Teams not labelled on another track during the stretch."""
 
 
 class LabelSegment(BaseModel):
@@ -40,10 +73,13 @@ class LabelSegment(BaseModel):
     team: int | None
     confidence: float = Field(ge=0.0, le=1.0)
     """Median probability of `team` over the reads joined to this segment (0 when it has none,
-    or when `team` is null). Low on a `digits_extended` segment means weak support."""
+    or when `team` is null). Low on a `digits_extended` segment means weak support. On an
+    `appearance*` segment, `appearance.cosine` clipped to [0, 1]."""
     source: LabelSource
     n_reads: int = Field(ge=0)
-    """Agreeing named reads behind the label (0 when `team` is null)."""
+    """Agreeing named reads behind the label (0 when `team` is null or not from reads)."""
+    appearance: AppearanceEvidence | None = None
+    """Set on `appearance*` segments only."""
 
 
 class ClaimConflict(BaseModel):
