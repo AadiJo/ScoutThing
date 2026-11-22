@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scout annotate</title>
+<style>
+  :root {
+    --bg: #000; --panel: #0d0f12; --panel2: #171a1f; --line: #2a2f37; --fg: #e8eaed; --dim: #8a919b;
+    --red: #ff5c5c; --blue: #4c95ff; --vis: #38d47c; --est: #ffb020; --gap: #ff5c3a; --sel: #7fb0ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--fg); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         display: grid; grid-template-rows: auto auto 1fr; overflow: hidden; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 6px 10px;
+           background: var(--panel); border-bottom: 1px solid var(--line); }
+  header b { font-size: 13px; }
+  select, button { font: inherit; color: var(--fg); background: var(--panel2); border: 1px solid var(--line);
+                   border-radius: 4px; padding: 3px 7px; }
+  button { cursor: pointer; }
+  button.on { border-color: var(--fg); }
+  .dim { color: var(--dim); }
+  #robots { display: flex; gap: 4px; }
+  .rb { min-width: 92px; text-align: left; font-weight: 600; border-left-width: 4px; }
+  .rb.red { border-left-color: var(--red); } .rb.blue { border-left-color: var(--blue); }
+  .rb.sel { background: #e8eaed; color: #000; }
+  .rb .pc { font-weight: 400; margin-left: 6px; }
+  .rb.done .pc { color: var(--vis); } .rb.sel.done .pc { color: #0a7a3a; }
+  .rb .tg { font-weight: 400; font-size: 10px; margin-left: 4px; opacity: .7; }
+  #save { padding: 2px 8px; border-radius: 4px; }
+  #save.saved { color: var(--vis); } #save.unsaved, #save.saving { color: var(--est); }
+  #save.error { background: var(--gap); color: #000; }
+  #say { padding: 4px 10px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  #say strong { color: #fff; }
+  main { display: grid; grid-template-columns: 1fr 290px; min-height: 0; }
+  #left { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 6px; gap: 6px; }
+  #wrap { flex: none; position: relative; }
+  #stage { position: absolute; background: #111; }
+  #stage video, #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #ov { cursor: crosshair; touch-action: none; }
+  #badge { position: absolute; left: 8px; top: 8px; padding: 3px 8px; border-radius: 4px; background: rgba(0,0,0,.75);
+           font-weight: 700; pointer-events: none; }
+  #badge.rec { background: #d01c1c; color: #fff; } #badge.est { background: var(--est); color: #000; }
+  #badge.out { background: #555; color: #fff; }
+  #toast { position: absolute; left: 50%; top: 8px; transform: translateX(-50%); padding: 4px 10px; border-radius: 4px;
+           background: var(--gap); color: #000; font-weight: 600; pointer-events: none; display: none; }
+  #toast.info { background: #9cc6ff; }
+  #tl { width: 100%; flex: 1; min-height: 96px; display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; cursor: pointer; }
+  #side { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 8px; display: flex;
+          flex-direction: column; gap: 8px; }
+  .box { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
+  .box h3 { margin: 0 0 4px; font-size: 11px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  .row { display: flex; justify-content: space-between; gap: 8px; }
+  .big { font-size: 15px; font-weight: 600; }
+  .warn { color: var(--gap); }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 1px 3px; vertical-align: top; }
+  td:first-child { white-space: nowrap; width: 1%; }
+  td:last-child { color: var(--dim); }
+  kbd { background: #000; border: 1px solid var(--line); border-radius: 3px; padding: 0 3px; font: inherit; font-size: 11px; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 3px; }
+</style>
+</head>
+<body>
+<header>
+  <b>scout annotate</b><span class="dim" id="vname"></span>
+  <div id="robots"></div>
+  <label class="dim" for="rate">rate</label>
+  <select id="rate" title="follow and Space playback rate ( - / = )">
+    <option value="0.1">0.1x</option><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1">1x</option>
+  </select>
+  <button id="guideBtn" title="G: the pipeline's boxes as a faint guide">guide off</button>
+  <button id="loupeBtn" title="L: magnifier">magnifier off</button>
+  <span id="save" class="saved">loading</span>
+</header>
+<div id="say"></div>
+<main>
+  <div id="left">
+    <div id="wrap">
+      <div id="stage">
+        <video id="vid" muted playsinline preload="auto"></video>
+        <canvas id="ov"></canvas>
+        <div id="badge">loading</div>
+        <div id="toast"></div>
+      </div>
+    </div>
+    <canvas id="tl" title="click: seek, shift-drag: select a range (Delete removes it)"></canvas>
+  </div>
+  <div id="side">
+    <div class="box">
+      <div class="row"><span class="big" id="frameTxt">frame</span><span class="big" id="clockTxt"></span></div>
+      <div class="row"><span class="dim" id="timeTxt"></span><span class="dim" id="hereTxt"></span></div>
+      <div class="dim" id="cursorTxt">cursor</div>
+      <div class="warn" id="warnTxt"></div>
+    </div>
+    <div class="box">
+      <h3>Selected robot</h3>
+      <div id="progTxt" class="dim"></div>
+      <div id="selTxt"></div>
+    </div>
+    <div class="box">
+      <span><i class="sw" style="background:var(--vis)"></i>visible</span>
+      <span><i class="sw" style="background:var(--est)"></i>estimated</span>
+      <span><i class="sw" style="background:var(--gap)"></i>gap</span>
+    </div>
+    <div class="box">
+      <h3>Keys</h3>
+      <table>
+        <tr><td>hold mouse</td><td>on the robot in the main view: plays at the rate and records every frame. Release pauses and saves.</td></tr>
+        <tr><td><kbd>Shift</kbd> held</td><td>samples are <b>estimated</b> (robot hidden)</td></tr>
+        <tr><td>re-follow</td><td>replaces what was there for the frames it covers</td></tr>
+        <tr><td><kbd>Space</kbd></td><td>play / pause, no recording</td></tr>
+        <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>one frame; <kbd>Shift</kbd>: one second</td></tr>
+        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>previous / next gap</td></tr>
+        <tr><td><kbd>1</kbd>-<kbd>6</kbd></td><td>select robot</td></tr>
+        <tr><td><kbd>-</kbd> <kbd>=</kbd></td><td>slower / faster</td></tr>
+        <tr><td>shift-drag</td><td>on the timeline: select a range; <kbd>Del</kbd> removes it, <kbd>Esc</kbd> clears</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>undo; <kbd>Ctrl</kbd>+<kbd>Y</kbd> redo</td></tr>
+        <tr><td><kbd>G</kbd> <kbd>L</kbd></td><td>pipeline guide, magnifier</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>save now (it saves on every release anyway)</td></tr>
+      </table>
+    </div>
+    <div class="box dim" id="pathTxt"></div>
+  </div>
+</main>
+<script>
+"use strict";
+// Samples are rows [frame, u, v, estimated] sorted by frame, the same shape the server
+// sends and receives. Frame f is on screen for video seconds [f/fps, (f+1)/fps); a sample
+// is the cursor at the moment its frame leaves the screen (the next frame arrives, or
+// the mouse is released).
+const $ = (id) => document.getElementById(id);
+const video = $("vid"), ov = $("ov"), octx = ov.getContext("2d"), tl = $("tl"), tctx = tl.getContext("2d");
+const GAP_FRAMES = 3;        // holes up to this many frames are not gaps (dropped display frames)
+const TRAIL_S = 2.0, PAD_S = 3.0, LOUPE_ZOOM = 3, UNDO_MAX = 100;
+const RATES = [0.1, 0.25, 0.5, 1];
+const COL = { red: "#ff5c5c", blue: "#4c95ff", vis: "#38d47c", est: "#ffb020", gap: "#ff5c3a" };
+
+const S = {
+  fps: 60, n: 0, vw: 1920, vh: 1080, views: {}, roster: [], sha: "", span: [0, 0], win: [0, 0], phases: [],
+  m: null, robots: {}, team: null, presented: 0, rec: null, cursor: { u: 0, v: 0, cx: 0, cy: 0, inside: false },
+  shift: false, rate: 0.25, guide: false, loupe: false, tracks: null, sel: null, selDrag: null, scrub: false,
+  version: 0,
+};
+
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage full or blocked */ } },
+  del(k) { try { localStorage.removeItem(k); } catch (e) { /* blocked */ } },
+};
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const frameOf = (mediaTime) => Math.round(mediaTime * S.fps);
+
+// ------------------------------------------------------------------ samples ---
+function lowerBound(rows, f) { let lo = 0, hi = rows.length; while (lo < hi) { const m = (lo + hi) >> 1; if (rows[m][0] < f) lo = m + 1; else hi = m; } return lo; }
+function deleteRange(rows, a, b) { const i = lowerBound(rows, a), j = lowerBound(rows, b + 1); if (j > i) rows.splice(i, j - i); return j - i; }
+function put(rows, row) { const i = lowerBound(rows, row[0]); if (rows[i] && rows[i][0] === row[0]) rows[i] = row; else rows.splice(i, 0, row); }
+function robot(team) { return S.robots[team] || (S.robots[team] = { rows: [], hash: null, dirty: 0, saved: 0, saving: false, undo: [], redo: [], conflict: false }); }
+const cur = () => (S.team == null ? null : robot(S.team));
+function viewOf(u, v) { for (const [name, r] of Object.entries(S.views)) if (u >= r.x && u < r.x + r.w && v >= r.y && v < r.y + r.h) return name; return null; }
+
+// Runs of samples whose frames are at most GAP_FRAMES + 1 apart, split where the state changes.
+function runs(rows, a, b) {
+  const out = []; let r = null;
+  for (let i = lowerBound(rows, a); i < rows.length && rows[i][0] <= b; i++) {
+    const [f, , , e] = rows[i];
+    if (r && r.e === e && f - r.f1 <= GAP_FRAMES + 1) r.f1 = f; else { r = { f0: f, f1: f, e }; out.push(r); }
+  }
+  return out;
+}
+// Holes longer than GAP_FRAMES inside the match span, as [first missing, last missing].
+function gaps(rows) {
+  const [a, b] = S.span, out = []; let prev = a - 1;
+  for (let i = lowerBound(rows, a); i < rows.length && rows[i][0] <= b; i++) {
+    const f = rows[i][0];
+    if (f - prev - 1 > GAP_FRAMES) out.push([prev + 1, f - 1]);
+    prev = f;
+  }
+  if (b - prev > GAP_FRAMES) out.push([prev + 1, b]);
+  return out;
+}
+function progress(rows) {
+  const g = gaps(rows), [a, b] = S.span, total = b - a + 1;
+  const missing = g.reduce((s, [x, y]) => s + y - x + 1, 0);
+  let est = 0, vis = 0;
+  for (const r of runs(rows, a, b)) { const n = r.f1 - r.f0 + 1; if (r.e) est += n; else vis += n; }
+  return { gaps: g, pct: 100 * (total - missing) / total, vis: vis / S.fps, est: est / S.fps, done: g.length === 0 };
+}
+
+function pushUndo(R) { R.undo.push(R.rows.slice()); if (R.undo.length > UNDO_MAX) R.undo.shift(); R.redo.length = 0; }
+function edited(R, saveSoon) { R.dirty++; S.version++; backup(R); setSave(); renderRobots(); draw(); if (saveSoon) save(R); else scheduleSave(R); }
+
+// ------------------------------------------------------------------- saving ---
+const bkKey = (team) => `scout-annotate:${S.sha}:${team}`;
+function backup(R) { LS.set(bkKey(teamOf(R)), { base: R.hash, rows: R.rows, at: Date.now() }); }
+function teamOf(R) { return Number(Object.keys(S.robots).find((t) => S.robots[t] === R)); }
+let saveTimer = null;
+function scheduleSave(R) { clearTimeout(saveTimer); saveTimer = setTimeout(() => save(R), 600); }
+async function save(R) {
+  if (!R || R.saving || R.conflict || R.dirty === R.saved) return;
+  const team = teamOf(R), version = R.dirty;
+  R.saving = true; setSave();
+  try {
+    const res = await fetch(`/api/robot/${team}`, { method: "PUT", headers: { "Content-Type": "application/json" },
+                                                    body: JSON.stringify({ base: R.hash, samples: R.rows }) });
+    const j = await res.json();
+    if (res.status === 409) { R.conflict = true; throw new Error(j.error + ". Your edits are kept in this browser; reload to choose."); }
+    if (!res.ok) throw new Error(j.error || res.statusText);
+    R.hash = j.hash; R.saved = version;
+    if (R.dirty === R.saved) LS.del(bkKey(team)); else backup(R);
+    $("warnTxt").textContent = "";
+  } catch (e) {
+    $("warnTxt").textContent = "save failed: " + e.message;
+    if (!R.conflict) setTimeout(() => save(R), 3000);
+  } finally {
+    R.saving = false; setSave();
+    if (!R.conflict && R.dirty !== R.saved) scheduleSave(R);
+  }
+}
+function setSave() {
+  const all = Object.values(S.robots), el = $("save");
+  if (all.some((R) => R.conflict)) { el.className = "error"; el.textContent = "save refused"; return; }
+  const pending = all.filter((R) => R.dirty !== R.saved || R.saving).length;
+  if (!pending) { el.className = "saved"; el.textContent = "saved " + new Date().toLocaleTimeString(); return; }
+  el.className = all.some((R) => R.saving) ? "saving" : "unsaved"; el.textContent = all.some((R) => R.saving) ? "saving" : "unsaved";
+}
+window.addEventListener("beforeunload", (e) => {
+  const pending = Object.values(S.robots).filter((R) => R.dirty !== R.saved || R.saving);
+  if (!pending.length) return;
+  for (const R of pending) backup(R);
+  e.preventDefault(); e.returnValue = "";
+});
+
+// ------------------------------------------------------------------- video ---
+function flash(msg, info) {
+  const t = $("toast"); t.textContent = msg; t.className = info ? "info" : ""; t.style.display = "block";
+  clearTimeout(flash.timer); flash.timer = setTimeout(() => { t.style.display = "none"; }, 1500);
+}
+function seek(f) {
+  if (S.rec) return;
+  if (!video.paused) video.pause();
+  f = clamp(Math.round(f), 0, S.n - 1);
+  S.presented = f;
+  video.currentTime = (f + 0.5) / S.fps;
+  draw();
+}
+function onFrame(_now, md) {
+  const f = frameOf(md.mediaTime);
+  if (S.rec && f !== S.presented) record(S.presented);
+  S.presented = f;
+  if (S.rec && f >= S.n - 1) stopFollow();
+  draw();
+  video.requestVideoFrameCallback(onFrame);
+}
+function play() { video.playbackRate = S.rate; const p = video.play(); if (p) p.catch(() => {}); }
+
+// --------------------------------------------------------------- following ---
+function inMain(c) { return c.inside && viewOf(c.u, c.v) === "main"; }
+function startFollow() {
+  const R = cur();
+  if (!R) { flash("pick a robot first"); return false; }
+  if (R.conflict) { flash("this robot's save was refused; reload the page"); return false; }
+  if (!inMain(S.cursor)) { flash("follow in the main view (the wide top panel)"); return false; }
+  pushUndo(R);
+  S.rec = { R, last: null, out: 0, n: 0 };
+  play(); draw();
+  return true;
+}
+function record(f) {
+  const Rc = S.rec, c = S.cursor;
+  if (inMain(c)) {
+    deleteRange(Rc.R.rows, Rc.last == null ? f : Rc.last + 1, f);
+    put(Rc.R.rows, [f, Math.round(c.u * 10) / 10, Math.round(c.v * 10) / 10, S.shift]);
+    Rc.n++;
+  } else Rc.out++;
+  Rc.last = Rc.last == null ? f : Math.max(Rc.last, f);
+  S.version++;
+}
+function stopFollow() {
+  if (!S.rec) return;
+  const Rc = S.rec;
+  video.pause();
+  record(S.presented);
+  S.rec = null;
+  seek(S.presented);
+  $("warnTxt").textContent = Rc.out ? `${Rc.out} frames not recorded: the cursor was outside the main view` : "";
+  if (Rc.n === 0) Rc.R.undo.pop(); else edited(Rc.R, true);
+  draw();
+}
+
+// ------------------------------------------------------------------ editing ---
+function undo() { const R = cur(); if (S.rec || !R || !R.undo.length) return; R.redo.push(R.rows); R.rows = R.undo.pop(); edited(R); }
+function redo() { const R = cur(); if (S.rec || !R || !R.redo.length) return; R.undo.push(R.rows); R.rows = R.redo.pop(); edited(R); }
+function deleteSel() {
+  const R = cur();
+  if (S.rec || !R) return;
+  if (!S.sel) { flash("shift-drag on the timeline to select a range first", true); return; }
+  pushUndo(R);
+  const n = deleteRange(R.rows, S.sel[0], S.sel[1]);
+  S.sel = null;
+  if (n) { edited(R); flash(`deleted ${n} samples`, true); } else { R.undo.pop(); draw(); }
+}
+function jumpGap(dir) {
+  const R = cur(); if (!R) return;
+  const f = S.presented, g = gaps(R.rows);
+  const t = dir > 0 ? g.find((x) => x[0] > f + 1) : [...g].reverse().find((x) => x[0] < f);
+  if (!t) { flash("no more gaps", true); return; }
+  seek(Math.max(0, t[0] - 1));
+}
+function selectTeam(team) {
+  if (S.rec || team == null) return;
+  S.team = team; LS.set("scout-annotate.team", team);
+  const R = robot(team);
+  renderRobots();
+  const last = R.rows.length ? R.rows[R.rows.length - 1][0] : S.span[0];
+  seek(clamp(last, S.win[0], S.win[1]));
+}
+function setRate(r) { S.rate = r; $("rate").value = String(r); LS.set("scout-annotate.rate", r); if (!video.paused) video.playbackRate = r; }
+function toggleGuide() {
+  if (!S.tracks) { flash("this run has no tracks", true); return; }
+  S.guide = !S.guide; $("guideBtn").textContent = S.guide ? "guide on" : "guide off"; $("guideBtn").classList.toggle("on", S.guide); draw();
+}
+function toggleLoupe() { S.loupe = !S.loupe; LS.set("scout-annotate.loupe", S.loupe); $("loupeBtn").textContent = S.loupe ? "magnifier on" : "magnifier off"; $("loupeBtn").classList.toggle("on", S.loupe); draw(); }
+
+// -------------------------------------------------------------------- input ---
+function evUV(e) {
+  const r = ov.getBoundingClientRect(), cx = e.clientX - r.left, cy = e.clientY - r.top;
+  return { u: cx / r.width * S.vw, v: cy / r.height * S.vh, cx, cy, inside: cx >= 0 && cy >= 0 && cx < r.width && cy < r.height };
+}
+ov.addEventListener("pointermove", (e) => { Object.assign(S.cursor, evUV(e)); S.shift = e.shiftKey; draw(); });
+ov.addEventListener("pointerleave", () => { if (!S.rec) { S.cursor.inside = false; draw(); } });
+ov.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  Object.assign(S.cursor, evUV(e)); S.shift = e.shiftKey;
+  if (!video.paused) video.pause();
+  if (startFollow()) { try { ov.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ } }
+});
+ov.addEventListener("pointerup", stopFollow);
+ov.addEventListener("pointercancel", stopFollow);
+ov.addEventListener("contextmenu", (e) => e.preventDefault());
+window.addEventListener("blur", () => { S.shift = false; stopFollow(); });
+
+const TL_GUTTER = 52, TL_TOP = 14;
+function tlFrame(e) {
+  const r = tl.getBoundingClientRect(), x = clamp((e.clientX - r.left - TL_GUTTER) / (r.width - TL_GUTTER), 0, 1);
+  return Math.round(S.win[0] + x * (S.win[1] - S.win[0]));
+}
+function tlRow(e) { const r = tl.getBoundingClientRect(); return Math.floor((e.clientY - r.top - TL_TOP) / ((r.height - TL_TOP - 2) / S.roster.length)); }
+tl.addEventListener("pointerdown", (e) => {
+  if (S.rec) return;
+  try { tl.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ }
+  const f = tlFrame(e);
+  if (e.shiftKey) { S.selDrag = f; S.sel = [f, f]; draw(); return; }
+  const r = tlRow(e);
+  if (e.clientX - tl.getBoundingClientRect().left < TL_GUTTER && S.roster[r]) { selectTeam(S.roster[r].team); return; }
+  S.scrub = true; seek(f);
+});
+tl.addEventListener("pointermove", (e) => {
+  if (S.selDrag != null) { const f = tlFrame(e); S.sel = [Math.min(S.selDrag, f), Math.max(S.selDrag, f)]; draw(); }
+  else if (S.scrub) seek(tlFrame(e));
+});
+tl.addEventListener("pointerup", () => { if (S.sel && S.sel[0] === S.sel[1]) S.sel = null; S.selDrag = null; S.scrub = false; draw(); });
+
+document.addEventListener("keydown", (e) => {
+  if (e.target && e.target.tagName === "SELECT") return;
+  if (e.key === "Shift") { S.shift = true; draw(); return; }
+  const k = e.key, ctrl = e.ctrlKey || e.metaKey;
+  if (ctrl && (k === "z" || k === "Z")) { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+  if (ctrl && (k === "y" || k === "Y")) { e.preventDefault(); redo(); return; }
+  if (ctrl && (k === "s" || k === "S")) { e.preventDefault(); for (const R of Object.values(S.robots)) save(R); return; }
+  if (ctrl || e.altKey) return;
+  if (/^[1-6]$/.test(k) && S.roster[+k - 1]) { selectTeam(S.roster[+k - 1].team); return; }
+  switch (e.code) {
+    case "Space": e.preventDefault(); if (S.rec) break; if (video.paused) play(); else seek(S.presented); break;
+    case "ArrowRight": e.preventDefault(); seek(S.presented + (e.shiftKey ? Math.round(S.fps) : 1)); break;
+    case "ArrowLeft": e.preventDefault(); seek(S.presented - (e.shiftKey ? Math.round(S.fps) : 1)); break;
+    case "BracketLeft": jumpGap(-1); break;
+    case "BracketRight": jumpGap(1); break;
+    case "Delete": case "Backspace": e.preventDefault(); deleteSel(); break;
+    case "Escape": S.sel = null; draw(); break;
+    case "Minus": setRate(RATES[Math.max(0, RATES.indexOf(S.rate) - 1)] ?? 0.25); break;
+    case "Equal": setRate(RATES[Math.min(RATES.length - 1, RATES.indexOf(S.rate) + 1)] ?? 0.25); break;
+    case "KeyG": toggleGuide(); break;
+    case "KeyL": toggleLoupe(); break;
+    default: return;
+  }
+});
+document.addEventListener("keyup", (e) => { if (e.key === "Shift") { S.shift = false; draw(); } });
+document.addEventListener("click", (e) => { const b = e.target.closest && e.target.closest("button"); if (b) b.blur(); });
+$("rate").onchange = (e) => { setRate(parseFloat(e.target.value)); e.target.blur(); };
+$("guideBtn").onclick = toggleGuide;
+$("loupeBtn").onclick = toggleLoupe;
+
+// ------------------------------------------------------------------ drawing ---
+let drawPending = false;
+function draw() { if (!drawPending) { drawPending = true; requestAnimationFrame(drawAll); } }
+let lastVersion = -1, lastTeam = null;
+function drawAll() {
+  drawPending = false;
+  drawOverlay(); drawTimeline(); readout();
+  if (lastVersion !== S.version || lastTeam !== S.team) { lastVersion = S.version; lastTeam = S.team; sidePanel(); }
+}
+function clockText(t) {
+  const m = S.m;
+  const fmt = (s) => { s = Math.max(0, Math.ceil(s - 1e-6)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+  if (t < m.auto_start_t) return "pre-match";
+  if (t < m.auto_end_t) return "AUTO " + fmt(20 - (t - m.auto_start_t));
+  if (t < m.teleop_start_t) return "auto > teleop";
+  if (t < m.teleop_end_t) return "TELEOP " + fmt(140 - (t - m.teleop_start_t));
+  return "post-match";
+}
+function readout() {
+  const f = S.presented, t = f / S.fps, R = cur();
+  $("frameTxt").textContent = `frame ${f}`;
+  $("clockTxt").textContent = S.m ? clockText(t) : "";
+  $("timeTxt").textContent = `video ${t.toFixed(3)} s`;
+  const row = R && R.rows[lowerBound(R.rows, f)];
+  $("hereTxt").textContent = row && row[0] === f ? (row[3] ? "estimated here" : "visible here") : "no sample here";
+  const c = S.cursor;
+  $("cursorTxt").textContent = c.inside ? `cursor ${c.u.toFixed(0)}, ${c.v.toFixed(0)}  ${viewOf(c.u, c.v) || "outside"}` : "cursor outside";
+  const b = $("badge");
+  if (S.rec) {
+    const out = !inMain(c);
+    b.className = out ? "out" : S.shift ? "est" : "rec";
+    b.textContent = out ? "outside main view: not recording" : `REC ${S.shift ? "estimated" : "visible"} ${S.rate}x  ${S.team}`;
+  } else {
+    b.className = "";
+    b.textContent = `${video.paused ? "paused" : "playing " + S.rate + "x"}  ${S.team ?? "pick a robot"}`;
+  }
+}
+function sidePanel() {
+  const R = cur();
+  if (!R) { $("progTxt").textContent = "pick a robot"; return; }
+  const p = progress(R.rows);
+  $("progTxt").innerHTML = `${S.team}: <b style="color:${p.done ? COL.vis : "var(--fg)"}">${p.done ? "done" : p.pct.toFixed(1) + "% of the match"}</b><br>` +
+    `${p.vis.toFixed(1)} s visible, ${p.est.toFixed(1)} s estimated<br>${p.gaps.length} gap${p.gaps.length === 1 ? "" : "s"}` +
+    (p.gaps.length ? `, next press <kbd>]</kbd>` : "") + `<br>${R.rows.length} samples`;
+  $("selTxt").innerHTML = S.sel ? `<span class="warn">range ${S.sel[0]}-${S.sel[1]}: ${lowerBound(R.rows, S.sel[1] + 1) - lowerBound(R.rows, S.sel[0])} samples. Del removes, Esc clears</span>` : "";
+}
+function renderRobots() {
+  const box = $("robots"); box.innerHTML = "";
+  S.roster.forEach((r, i) => {
+    const R = robot(r.team), p = progress(R.rows), b = document.createElement("button");
+    b.className = `rb ${r.alliance}` + (r.team === S.team ? " sel" : "") + (p.done ? " done" : "");
+    b.title = `${i + 1}: select ${r.team}`;
+    const pc = R.rows.length ? (p.done ? "done" : p.pct.toFixed(0) + "%") : "-";
+    b.innerHTML = `${r.team}<span class="pc">${pc}</span>${r.team === S.m.target_team ? '<span class="tg">target</span>' : ""}`;
+    b.onclick = () => selectTeam(r.team);
+    box.appendChild(b);
+  });
+}
+function rowAt(rows, f, tol) {
+  const i = lowerBound(rows, f - tol);
+  return rows[i] && rows[i][0] <= f + tol ? rows[i] : null;
+}
+function guideBoxes(f) {
+  const out = [];
+  for (const tr of S.tracks || []) {
+    const fr = tr.frames; if (f < fr[0] || f > fr[fr.length - 1]) continue;
+    let lo = 0, hi = fr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (fr[m] <= f) lo = m + 1; else hi = m; }
+    const i = lo - 1, j = Math.min(lo, fr.length - 1);
+    let box;
+    if (fr[i] === f) box = tr.boxes[i];
+    else if (fr[j] - fr[i] <= 6) { const w = (f - fr[i]) / (fr[j] - fr[i]); box = tr.boxes[i].map((x, k) => x + w * (tr.boxes[j][k] - x)); }
+    else continue;
+    const lab = tr.labels.find((s) => s[0] <= f && f <= s[1]);
+    out.push({ box, label: lab ? String(lab[2]) : `t${tr.id}`, color: tr.color });
+  }
+  return out;
+}
+function marker(ctx, x, y, r, col, est, lw) {
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.lineWidth = lw; ctx.strokeStyle = col;
+  if (est) { ctx.setLineDash([lw * 2, lw * 2]); ctx.stroke(); ctx.setLineDash([]); } else { ctx.fillStyle = col; ctx.fill(); }
+}
+function drawOverlay() {
+  const dpr = window.devicePixelRatio || 1, W = ov.width / dpr;
+  octx.setTransform(1, 0, 0, 1, 0, 0); octx.clearRect(0, 0, ov.width, ov.height);
+  if (!S.m) return;
+  const k = S.vw / W;   // video px per CSS px
+  octx.setTransform(ov.width / S.vw, 0, 0, ov.height / S.vh, 0, 0);
+  const f = S.presented, main = S.views.main;
+  octx.lineWidth = k; octx.strokeStyle = "rgba(255,255,255,.35)"; octx.strokeRect(main.x + .5, main.y + .5, main.w - 1, main.h - 1);
+  octx.font = `${11 * k}px ui-monospace, monospace`; octx.fillStyle = "rgba(255,255,255,.55)";
+  octx.fillText("main view: follow here", main.x + 6 * k, main.y + main.h - 6 * k);
+  if (S.guide) {
+    octx.lineWidth = 1.2 * k;
+    for (const g of guideBoxes(f)) {
+      const [x1, y1, x2, y2] = g.box;
+      octx.strokeStyle = "rgba(255,255,255,.4)"; octx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      octx.fillStyle = "rgba(255,255,255,.55)"; octx.fillText(g.label, x1, y1 - 3 * k);
+    }
+  }
+  octx.font = `bold ${11 * k}px ui-monospace, monospace`;
+  for (const r of S.roster) {
+    if (r.team === S.team) continue;
+    const row = rowAt(robot(r.team).rows, f, GAP_FRAMES); if (!row) continue;
+    octx.globalAlpha = 0.6;
+    marker(octx, row[1], row[2], 4 * k, COL[r.alliance], row[3], 1.5 * k);
+    octx.fillStyle = COL[r.alliance]; octx.fillText(String(r.team), row[1] + 7 * k, row[2] - 5 * k);
+    octx.globalAlpha = 1;
+  }
+  const R = cur();
+  if (R) {
+    const a = lowerBound(R.rows, f - TRAIL_S * S.fps), b = lowerBound(R.rows, f + 1);
+    octx.lineWidth = 2 * k;
+    for (let i = a + 1; i < b; i++) {
+      const p = R.rows[i - 1], q = R.rows[i];
+      if (q[0] - p[0] > GAP_FRAMES + 1) continue;
+      octx.globalAlpha = 0.25 + 0.75 * (1 - (f - q[0]) / (TRAIL_S * S.fps));
+      octx.strokeStyle = q[3] ? COL.est : COL.vis;
+      octx.beginPath(); octx.moveTo(p[1], p[2]); octx.lineTo(q[1], q[2]); octx.stroke();
+    }
+    octx.globalAlpha = 1;
+    const here = !S.rec && rowAt(R.rows, f, 0);
+    if (here) {
+      octx.beginPath(); octx.arc(here[1], here[2], 9 * k, 0, Math.PI * 2); octx.lineWidth = 2 * k; octx.strokeStyle = "#fff"; octx.stroke();
+      marker(octx, here[1], here[2], 3.5 * k, here[3] ? COL.est : COL.vis, here[3], 1.5 * k);
+    }
+  }
+  const c = S.cursor;
+  if (S.rec && c.inside) {
+    octx.beginPath(); octx.arc(c.u, c.v, 12 * k, 0, Math.PI * 2); octx.lineWidth = 2 * k;
+    octx.strokeStyle = S.shift ? COL.est : "#ff3030"; octx.stroke();
+  }
+  if (S.loupe && c.inside) drawLoupe(dpr, k);
+}
+function drawLoupe(dpr, k) {
+  const c = S.cursor, W = ov.width / dpr, H = ov.height / dpr;
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const L = Math.min(260, W * 0.3, H * 0.5), src = L / LOUPE_ZOOM * k;
+  const su = clamp(c.u - src / 2, 0, S.vw - src), sv = clamp(c.v - src / 2, 0, S.vh - src);
+  const lx = c.cx < W / 2 ? W - L - 8 : 8, ly = 30;
+  try { octx.drawImage(video, su, sv, src, src, lx, ly, L, L); } catch (e) { /* video not ready */ }
+  const mx = lx + (c.u - su) / src * L, my = ly + (c.v - sv) / src * L;
+  octx.strokeStyle = "#fff"; octx.lineWidth = 1;
+  octx.beginPath(); octx.moveTo(mx - 14, my); octx.lineTo(mx - 4, my); octx.moveTo(mx + 4, my); octx.lineTo(mx + 14, my);
+  octx.moveTo(mx, my - 14); octx.lineTo(mx, my - 4); octx.moveTo(mx, my + 4); octx.lineTo(mx, my + 14); octx.stroke();
+  octx.strokeStyle = "#888"; octx.strokeRect(lx + .5, ly + .5, L - 1, L - 1);
+}
+function drawTimeline() {
+  const dpr = window.devicePixelRatio || 1, W = tl.width, H = tl.height;
+  tctx.setTransform(1, 0, 0, 1, 0, 0); tctx.fillStyle = "#0d0f12"; tctx.fillRect(0, 0, W, H);
+  if (!S.m) return;
+  const g0 = TL_GUTTER * dpr, top = TL_TOP * dpr, [a, b] = S.win, span = Math.max(1, b - a);
+  const X = (f) => g0 + (f - a) / span * (W - g0);
+  const rowH = (H - top - 2 * dpr) / S.roster.length;
+  tctx.font = `${10 * dpr}px ui-monospace, monospace`; tctx.textBaseline = "middle";
+  for (const [label, t] of S.phases) {
+    const x = X(t * S.fps); tctx.fillStyle = "rgba(255,255,255,.3)"; tctx.fillRect(x, 0, dpr, H);
+    tctx.fillStyle = "#8a919b"; tctx.fillText(label, x + 3 * dpr, top / 2);
+  }
+  S.roster.forEach((r, i) => {
+    const y = top + i * rowH, R = robot(r.team), sel = r.team === S.team;
+    if (sel) { tctx.fillStyle = "#1d222a"; tctx.fillRect(0, y, W, rowH); }
+    tctx.fillStyle = COL[r.alliance]; tctx.fillRect(0, y + 1, 3 * dpr, rowH - 2);
+    tctx.fillStyle = sel ? "#fff" : "#8a919b"; tctx.fillText(String(r.team), 6 * dpr, y + rowH / 2);
+    if (sel) { tctx.fillStyle = "rgba(255,92,58,.28)"; for (const [x0, x1] of gaps(R.rows)) tctx.fillRect(X(x0), y + rowH * 0.35, Math.max(dpr, X(x1 + 1) - X(x0)), rowH * 0.3); }
+    for (const run of runs(R.rows, a, b)) {
+      tctx.fillStyle = run.e ? COL.est : COL.vis; tctx.globalAlpha = sel ? 1 : 0.6;
+      tctx.fillRect(X(run.f0), y + rowH * 0.2, Math.max(dpr, X(run.f1 + 1) - X(run.f0)), rowH * 0.6);
+    }
+    tctx.globalAlpha = 1;
+  });
+  if (S.sel) { tctx.fillStyle = "rgba(127,176,255,.3)"; tctx.fillRect(X(S.sel[0]), 0, Math.max(dpr, X(S.sel[1] + 1) - X(S.sel[0])), H); }
+  tctx.fillStyle = "#fff"; tctx.fillRect(X(S.presented) - dpr, 0, 2 * dpr, H);
+}
+// The video takes the most room it can at its aspect ratio; the timeline gets the rest.
+function layout() {
+  const left = $("left"), wrap = $("wrap"), st = $("stage"), ar = S.vw / S.vh;
+  const W = left.clientWidth - 12, H = left.clientHeight - 12 - 6 - 96;
+  let w = W, h = W / ar; if (h > H) { h = H; w = H * ar; }
+  w = Math.floor(w); h = Math.floor(h);
+  wrap.style.height = h + "px";
+  Object.assign(st.style, { width: w + "px", height: h + "px", left: Math.floor((W - w) / 2) + "px", top: "0px" });
+  const dpr = window.devicePixelRatio || 1;
+  ov.width = Math.round(w * dpr); ov.height = Math.round(h * dpr);
+  tl.width = Math.round(tl.clientWidth * dpr); tl.height = Math.round(tl.clientHeight * dpr);
+  draw();
+}
+window.addEventListener("resize", layout);
+
+// ------------------------------------------------------------------- start ---
+async function init() {
+  const s = await (await fetch("/api/session")).json();
+  const v = s.video, m = s.match;
+  Object.assign(S, { fps: v.fps, n: v.frame_count, vw: v.width, vh: v.height, sha: v.sha256, views: m.views, m });
+  S.roster = m.roster;
+  const fr = (t) => Math.round(t * S.fps);
+  S.span = [fr(m.auto_start_t), Math.min(S.n - 1, fr(m.teleop_end_t))];
+  S.win = [Math.max(0, fr(m.auto_start_t - PAD_S)), Math.min(S.n - 1, fr(m.teleop_end_t + PAD_S))];
+  S.phases = [["auto", m.auto_start_t], ["", m.auto_end_t], ["teleop", m.teleop_start_t], ["end", m.teleop_end_t]];
+  $("vname").textContent = v.name;
+  $("say").innerHTML = `<strong>${s.instruction}</strong> <span class="dim">Hold the mouse on it in the main view; hold Shift while it is hidden.</span>`;
+  $("pathTxt").textContent = `truth file: ${s.truth_path}`;
+  for (const [team, d] of Object.entries(s.robots)) Object.assign(robot(Number(team)), { rows: d.samples, hash: d.hash });
+  for (const r of S.roster) restoreBackup(r.team);
+  setRate(LS.get("scout-annotate.rate", 0.25));
+  if (LS.get("scout-annotate.loupe", false)) toggleLoupe();
+  if (s.has_tracks) fetch("/api/tracks").then((r) => r.json()).then((t) => { S.tracks = t; }).catch(() => {});
+  else $("guideBtn").disabled = true;
+  video.requestVideoFrameCallback(onFrame);
+  video.src = "/video";
+  layout();
+  const want = LS.get("scout-annotate.team", null);
+  const team = S.roster.some((r) => r.team === want) ? want : m.target_team;
+  video.addEventListener("loadedmetadata", () => selectTeam(team), { once: true });
+  setSave();
+}
+function restoreBackup(team) {
+  const bk = LS.get(bkKey(team), null), R = robot(team);
+  if (!bk || !bk.rows) return;
+  if (JSON.stringify(bk.rows) === JSON.stringify(R.rows)) { LS.del(bkKey(team)); return; }
+  const same = bk.base === R.hash;
+  if (same || confirm(`This browser holds unsaved samples for ${team} (${bk.rows.length}, ${new Date(bk.at).toLocaleString()}) that differ from the saved file (${R.rows.length}). Use the browser's copy?`)) {
+    R.rows = bk.rows; R.dirty++; S.version++;
+    flash(`restored ${bk.rows.length} unsaved samples for ${team}`, true);
+    save(R);
+  } else LS.del(bkKey(team));
+}
+if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype)) {
+  document.body.innerHTML = "<p style='padding:20px'>This page needs requestVideoFrameCallback (Chrome, Edge or Safari) to tie each sample to the exact frame on screen.</p>";
+} else init();
+</script>
+</body>
+</html>
