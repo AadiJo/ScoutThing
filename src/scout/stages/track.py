@@ -17,10 +17,17 @@ pieces are left for the identify stage to label. Steps:
 2. Merge duplicates. A bumper box mostly inside a larger box of the other colour is
    dropped. Same-colour bumper boxes in one frame closer than `MERGE_M`, or boxes of any
    colour that nearly coincide, are one robot: their union box is placed again. Whole-robot
-   boxes are merged among themselves the same way, then each is dropped when a bumper box
-   explains it (lies mostly inside it, or lands within `MERGE_M`): bumper boxes place better
-   and carry a colour. Only whole-robot boxes with no bumper box on them become
+   boxes are merged among themselves the same way, then each is dropped as an observation
+   when a bumper box explains it (lies mostly inside it, or lands within `MERGE_M`): bumper
+   boxes carry a colour. Only whole-robot boxes with no bumper box on them become
    observations, with an unknown colour.
+   Partial boxes. A whole-robot box that one robot's bumper boxes explain is paired with
+   them, and that observation is placed at the `WHOLE_WEIGHT` mix of the two placements: the
+   whole-robot box places better, most of all when the bumper box shows only part of the
+   bumper. A box is marked partial when it is a bumper box narrower than
+   `PARTIAL_OF_ROBOT` of its paired whole-robot box, an unpaired box narrower than
+   `PARTIAL_FILL` of a robot's width at its spot, or a box cut by the main view's edge.
+   An unpaired partial box (weak: nothing else places it) gets `WEAK_TRUST` in smoothing.
 3. Tracklets. Frame by frame, boxes are assigned to live tracklets by distance in metres
    within what a robot can drive. A link is cut instead when a rival box or tracklet is
    nearly as good, or when another robot vanished next to the box in the last second, or
@@ -31,8 +38,9 @@ pieces are left for the identify stage to label. Steps:
    the colours agree, and no rival comes close for either end.
 5. Duplicates. Where two tracks sit closer than `MERGE_M` for `DUP_MIN_S`, the weaker
    loses those samples.
-6. Samples. Positions are smoothed with a local linear fit in time, gaps up to
-   `INTERP_MAX_S` are filled by linear interpolation, longer gaps are left empty.
+6. Samples. Positions are smoothed with a local linear fit in time (weak samples weighted
+   down), gaps up to `INTERP_MAX_S` are filled by linear interpolation, longer gaps are left
+   empty.
 """
 
 from __future__ import annotations
@@ -61,6 +69,7 @@ from scout.games.rebuilt2026 import (
     Rect,
 )
 from scout.run import RunDir, Stage
+from scout.schemas.common import PixelRect
 from scout.schemas.detections import SAMPLE_HZ, read_detections
 from scout.schemas.match import MatchInfo
 from scout.schemas.tracks import COLOR, KIND, STATE, VIEW, write_tracks
@@ -93,6 +102,29 @@ ROBOT_SIZE_H = (0.8, 3.0)
 of boxes on robots: 0.97-2.5)."""
 ROBOT_COVER = 0.6
 """A bumper box with this share of its area inside a whole-robot box explains it."""
+WHOLE_WEIGHT = 0.75
+"""Weight of a paired whole-robot box's placement against its bumper box's. Against the dense
+hand truth, per box, the whole-robot box alone placed better than the bumper box (median 0.26
+vs 0.32 m Curie, 0.20 vs 0.26 m San Diego). Matched track samples, median / p90 at 0 / 0.5 /
+0.75 / 1.0: Curie 0.33/0.63, 0.29/0.59, 0.29/0.58, 0.28/0.59 m; San Diego 0.26/0.46,
+0.20/0.41, 0.19/0.41, 0.20/0.42 m."""
+PARTIAL_OF_ROBOT = 0.7
+"""A paired bumper box narrower than this share of its whole-robot box shows only part of the
+bumper. It marks only; placement uses WHOLE_WEIGHT either way (placing these from the
+whole-robot box alone changed track median error by under 0.005 m at 0.55-0.85). Per box,
+below 0.7 the bumper rule's median error was 0.35-0.41 m against 0.25-0.28 m above (Curie)."""
+EDGE_PX = 4
+"""A box edge this close to the main view's edge (or the scoreboard drawn over it) is cut
+there. Position error of such boxes was no worse except for whole-robot-only boxes (Curie
+median 0.51 m, 26 boxes)."""
+PARTIAL_FILL = 0.6
+"""An unpaired box narrower than this share of the width a robot's bumper band projects to
+at its spot is partial. Per box, below 0.6 median error was 0.33-0.40 m Curie, 0.29-0.41 m San
+Diego, against 0.13-0.24 m at 0.75-1.1. At 0.45 / 0.75 track error moved under 0.002 m."""
+WEAK_TRUST = 0.1
+"""Smoothing weight of a weak sample (unpaired and partial) against 1 for the rest. On weak
+samples, median error at 1.0 / 0.25 / 0.1 / 0.05: Curie 0.37 / 0.36 / 0.36 / 0.36 m, San
+Diego 0.29 / 0.26 / 0.24 / 0.23 m; other samples unchanged."""
 MERGE_M = 0.75
 """Same-colour boxes closer than this in one frame are one robot: two robots' centres
 cannot be closer than a robot width (0.95 m) less calibration noise."""
@@ -162,6 +194,12 @@ class Obs:
     color: I64
     whole: NDArray[np.bool_]
     """Backed by a whole-robot box only (no bumper box on that robot in that frame)."""
+    rbox: NDArray[np.float32]
+    """The whole-robot box paired with a bumper observation; NaN rows when none."""
+    partial: NDArray[np.bool_]
+    """The box saw only part of the robot (see `_combine`)."""
+    weak: NDArray[np.bool_]
+    """Partial with no second box: the position rests on the partial box alone."""
 
 
 @dataclass
@@ -285,21 +323,21 @@ def _union(b: NDArray[np.float32]) -> NDArray[np.float32]:
     return np.array([b[:, 0].min(), b[:, 1].min(), b[:, 2].max(), b[:, 3].max()], np.float32)
 
 
-def _explained(
+def _explaining(
     robot_box: NDArray[np.float32], robot_xy: F64, box: NDArray[np.float32], xy: F64
-) -> bool:
-    """Whether any of a frame's kept bumper boxes (`box`, placed at `xy`) is on the same
-    robot as a merged whole-robot box: mostly inside it, or placed within MERGE_M of any of
-    its member boxes' placements."""
-    for b, p in zip(box, xy, strict=True):
-        if _inter(b, robot_box) >= ROBOT_COVER * _area(b):
-            return True
-        if np.min(np.hypot(*(robot_xy - p).T)) < MERGE_M:
-            return True
-    return False
+) -> list[int]:
+    """Which of a frame's kept bumper boxes (`box`, placed at `xy`) are on the same robot as
+    a merged whole-robot box: mostly inside it, or placed within MERGE_M of any of its
+    member boxes' placements."""
+    return [
+        k
+        for k, (b, p) in enumerate(zip(box, xy, strict=True))
+        if _inter(b, robot_box) >= ROBOT_COVER * _area(b)
+        or np.min(np.hypot(*(robot_xy - p).T)) < MERGE_M
+    ]
 
 
-def _observations(run: RunDir, cam: Camera) -> tuple[Obs, dict[str, int]]:
+def _observations(run: RunDir, cam: Camera, match: MatchInfo) -> tuple[Obs, dict[str, int]]:
     """Main-view boxes placed on the field, filtered and merged per frame."""
     det = read_detections(run.detections)
     counts = {"boxes": len(det)}
@@ -324,13 +362,16 @@ def _observations(run: RunDir, cam: Camera) -> tuple[Obs, dict[str, int]]:
     out_f: list[int] = []
     out_t: list[float] = []
     out_box: list[NDArray[np.float32]] = []
+    out_rbox: list[NDArray[np.float32]] = []
     out_conf: list[float] = []
     out_col: list[int] = []
     out_whole: list[bool] = []
+    no_box = np.full(4, np.nan, np.float32)
 
-    def emit(ii: I64, is_whole: bool) -> None:
+    def emit(ii: I64, is_whole: bool, rbox: NDArray[np.float32]) -> None:
         best = ii[int(np.argmax(conf[ii]))]
         out_box.append(_union(box[ii]))
+        out_rbox.append(rbox)
         out_f.append(int(frame[best]))
         out_t.append(float(t[best]))
         out_conf.append(float(conf[ii].max()))
@@ -346,17 +387,30 @@ def _observations(run: RunDir, cam: Camera) -> tuple[Obs, dict[str, int]]:
         inside = _inside_other(box[bum], color[bum])
         counts["inside"] = counts.get("inside", 0) + int(inside.sum())
         bum = bum[~inside]
-        for g in _merge_frame(xy[bum], box[bum], color[bum]):
-            emit(bum[g], False)
+        bgroups = _merge_frame(xy[bum], box[bum], color[bum])
+        group_of = {k: j for j, g in enumerate(bgroups) for k in g}
+        paired: dict[int, NDArray[np.float32]] = {}
         for g in _merge_frame(xy[rob], box[rob], color[rob]):
             ii = rob[g]
-            if _explained(_union(box[ii]), xy[ii], box[bum], xy[bum]):
-                counts["robot_explained"] = counts.get("robot_explained", 0) + 1
-            else:
-                emit(ii, True)
+            rbox = _union(box[ii])
+            by = {group_of[k] for k in _explaining(rbox, xy[ii], box[bum], xy[bum])}
+            if not by:
+                emit(ii, True, no_box)
+                continue
+            counts["robot_explained"] = counts.get("robot_explained", 0) + 1
+            if len(by) == 1:
+                # Pair only a whole-robot box that one robot's bumpers explain; one spanning
+                # two robots would pull both toward the middle.
+                j = by.pop()
+                ub = _union(box[bum[bgroups[j]]])
+                if j not in paired or _inter(rbox, ub) > _inter(paired[j], ub):
+                    paired[j] = rbox
+        for j, g in enumerate(bgroups):
+            emit(bum[g], False, paired.get(j, no_box))
     mbox = np.array(out_box, np.float32).reshape(-1, 4)
+    rbox = np.array(out_rbox, np.float32).reshape(-1, 4)
     mwhole = np.array(out_whole, np.bool_)
-    mxy, _ = _place(cam, mbox, mwhole)
+    mxy, partial, weak = _combine(cam, mbox, mwhole, rbox, match.views["main"], match.scoreboard)
     obs = Obs(
         frame=np.array(out_f, np.int64),
         t=np.array(out_t, np.float64),
@@ -365,10 +419,66 @@ def _observations(run: RunDir, cam: Camera) -> tuple[Obs, dict[str, int]]:
         conf=np.array(out_conf, np.float32),
         color=np.array(out_col, np.int64),
         whole=mwhole,
+        rbox=rbox,
+        partial=partial,
+        weak=weak,
     )
     counts["merged"] = len(obs.t)
     counts["robot_only"] = int(mwhole.sum())
+    counts["paired"] = int(np.isfinite(rbox[:, 0]).sum())
+    counts["partial"] = int(partial.sum())
+    counts["weak"] = int(weak.sum())
     return obs, counts
+
+
+def _cut(box: NDArray[np.float32], view: PixelRect, board: PixelRect) -> NDArray[np.bool_]:
+    """Boxes with an edge within EDGE_PX of the main view's edge, or of the scoreboard when it
+    is drawn over the view's top."""
+    top = view.y
+    over = board.x < view.x + view.w and view.x < board.x + board.w
+    if over and board.y <= view.y < board.y + board.h:
+        top = board.y + board.h
+    return (
+        (box[:, 0] < view.x + EDGE_PX)
+        | (box[:, 1] < top + EDGE_PX)
+        | (box[:, 2] > view.x + view.w - EDGE_PX)
+        | (box[:, 3] > view.y + view.h - EDGE_PX)
+    )
+
+
+def _combine(
+    cam: Camera,
+    box: NDArray[np.float32],
+    whole: NDArray[np.bool_],
+    rbox: NDArray[np.float32],
+    view: PixelRect,
+    board: PixelRect,
+) -> tuple[F64, NDArray[np.bool_], NDArray[np.bool_]]:
+    """Field positions of merged observations, which are partial, and which of those rest
+    on the partial box alone (`weak`).
+
+    A bumper observation with a paired whole-robot box (`rbox`, NaN when none) is placed at
+    the WHOLE_WEIGHT mix of the two boxes' placements; its bumper box is partial when
+    narrower than PARTIAL_OF_ROBOT of the whole-robot box. (Falling back to the bumper box
+    when the whole-robot box is cut by the picture's edge made San Diego worse: median 0.192
+    to 0.197 m, p90 0.41 to 0.42 m; far robots' boxes often touch the scoreboard.) An
+    observation with no second box is placed at its own centre and is partial when narrower
+    than PARTIAL_FILL of the width a robot projects to there, or when cut by the picture's
+    edge (`_cut`); it is then weak. Any cut box is partial."""
+    bxy, _ = _place(cam, box, whole)
+    r = rbox.astype(np.float64)
+    rxy = cam.to_field(
+        np.stack([(r[:, 0] + r[:, 2]) / 2, (r[:, 1] + r[:, 3]) / 2], 1), ROBOT_CENTER_HEIGHT_M
+    )
+    has = np.isfinite(rxy).all(1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        fw = (box[:, 2] - box[:, 0]) / (r[:, 2] - r[:, 0])
+    ew, _ = _expected_size(cam, bxy)
+    cut = _cut(box, view, board)
+    weak = ~has & (cut | ((box[:, 2] - box[:, 0]) < PARTIAL_FILL * ew))
+    partial = (has & (fw < PARTIAL_OF_ROBOT)) | cut | weak
+    mix = WHOLE_WEIGHT * rxy + (1 - WHOLE_WEIGHT) * bxy
+    return np.where(has[:, None], mix, bxy), partial, weak
 
 
 def _tracklets(obs: Obs) -> tuple[list[Piece], dict[str, int]]:
@@ -573,13 +683,14 @@ def _drop_duplicates(obs: Obs, tracks: list[Piece]) -> tuple[list[Piece], int]:
     return [p for p in out if len(p.idx) >= MIN_TRACKLET_OBS], sum(len(d) for d in drop)
 
 
-def _smooth(t: F64, xy: F64) -> F64:
-    """Gaussian-weighted local linear fit of positions over time, evaluated at `t`."""
+def _smooth(t: F64, xy: F64, trust: F64) -> F64:
+    """Gaussian-weighted local linear fit of positions over time, evaluated at `t`, each
+    sample also weighted by its `trust`."""
     out = np.empty_like(xy)
     for i, ti in enumerate(t):
         lo, hi = np.searchsorted(t, [ti - 3 * SMOOTH_S, ti + 3 * SMOOTH_S])
         dt = t[lo:hi] - ti
-        w = np.exp(-0.5 * (dt / SMOOTH_S) ** 2)
+        w = np.exp(-0.5 * (dt / SMOOTH_S) ** 2) * trust[lo:hi]
         a = np.stack([np.ones_like(dt), dt], 1) * np.sqrt(w)[:, None]
         coef, *_ = np.linalg.lstsq(a, xy[lo:hi] * np.sqrt(w)[:, None], rcond=None)
         out[i] = coef[0]
@@ -595,7 +706,7 @@ def _rows(obs: Obs, tracks: Sequence[Piece], fps: float, step: int) -> pl.DataFr
     for tid, p in enumerate(tracks):
         idx = np.asarray(p.idx)
         fr = obs.frame[idx]
-        xy = _smooth(obs.t[idx], obs.xy[idx])
+        xy = _smooth(obs.t[idx], obs.xy[idx], np.where(obs.weak[idx], WEAK_TRUST, 1.0))
         frames_out = [fr]
         xs, ys, src = [xy[:, 0]], [xy[:, 1]], [idx]
         for k in np.flatnonzero((np.diff(fr) > step) & (np.diff(fr) / fps <= INTERP_MAX_S + 1e-9)):
@@ -625,6 +736,7 @@ def _rows(obs: Obs, tracks: Sequence[Piece], fps: float, step: int) -> pl.DataFr
     conf = obs.conf if len(obs.conf) else np.zeros(1, np.float32)
     whole = obs.whole if len(obs.whole) else np.zeros(1, np.bool_)
     kind = [("robot" if whole[i] else "bumper") if i >= 0 else None for i in src.tolist()]
+    partial = obs.partial if len(obs.partial) else np.zeros(1, np.bool_)
     df = pl.DataFrame(
         {
             "track_id": pl.Series(
@@ -645,6 +757,9 @@ def _rows(obs: Obs, tracks: Sequence[Piece], fps: float, step: int) -> pl.DataFr
             "y2": boxcol(box[:, 3]),
             "conf": boxcol(conf),
             "kind": pl.Series(kind, dtype=KIND),
+            "partial": pl.Series(
+                [bool(partial[i]) if i >= 0 else None for i in src.tolist()], dtype=pl.Boolean
+            ),
         }
     )
     return df.sort("track_id", "frame")
@@ -655,6 +770,7 @@ def _rows(obs: Obs, tracks: Sequence[Piece], fps: float, step: int) -> pl.DataFr
 PX_PER_M = 70
 PAD = 30
 BGR = {"red": (60, 60, 230), "blue": (230, 140, 40), "unknown": (160, 160, 160)}
+PARTIAL_BGR = (255, 0, 255)
 
 
 def _palette(n: int) -> list[tuple[int, int, int]]:
@@ -694,8 +810,16 @@ def _field_panel(df: pl.DataFrame, n_tracks: int, step: int) -> NDArray[np.uint8
         pts = px(g["x"].to_numpy(), g["y"].to_numpy())
         for seg in np.split(np.arange(len(fr)), np.flatnonzero(np.diff(fr) > step) + 1):
             cv2.polylines(img, [pts[seg]], False, colours[tid], 1, cv2.LINE_AA)
+        for p in pts[g["partial"].fill_null(False).to_numpy()].tolist():
+            cv2.circle(img, (p[0], p[1]), 2, PARTIAL_BGR, 1, cv2.LINE_AA)
     cv2.putText(
-        img, f"{n_tracks} tracks, top-down (blue wall left)", (PAD, 22), 0, 0.6, (255, 255, 255), 1
+        img,
+        f"{n_tracks} tracks, top-down (blue wall left); magenta rings = partial boxes",
+        (PAD, 22),
+        0,
+        0.6,
+        (255, 255, 255),
+        1,
     )
     return img
 
@@ -728,11 +852,14 @@ def _timeline_panel(
         xs = tx(g["t"].to_numpy())
         colour = BGR[str(g["color"][0])]
         interp = (g["state"] == "interpolated").to_numpy()
-        for x, it in zip(xs.tolist(), interp.tolist(), strict=True):
-            cv2.line(img, (x, y), (x + 1, y), (255, 255, 255) if it else colour, row - 1)
+        part = g["partial"].fill_null(False).to_numpy()
+        for x, it, pa in zip(xs.tolist(), interp.tolist(), part.tolist(), strict=True):
+            c = (255, 255, 255) if it else PARTIAL_BGR if pa else colour
+            cv2.line(img, (x, y), (x + 1, y), c, row - 1)
     cv2.putText(
         img,
-        "tracks over time (rows; white = interpolated; orange = auto, teleop, end)",
+        "tracks over time (rows; white = interpolated; magenta = partial box; orange = auto, "
+        "teleop, end)",
         (left, 20),
         0,
         0.5,
@@ -778,7 +905,7 @@ def track(run: RunDir) -> None:
     match = MatchInfo.load(run.match_json)
     cam = Camera.load(run.calibration_json, "main")
     step = max(1, round(info.fps / SAMPLE_HZ))
-    obs, counts = _observations(run, cam)
+    obs, counts = _observations(run, cam, match)
     raw, cuts = _tracklets(obs)
     pieces = [
         p
@@ -800,6 +927,10 @@ def track(run: RunDir) -> None:
         f"{counts.get('inside', 0)} inside another colour, {counts['merged']} after merging "
         f"({counts.get('robot_explained', 0)} whole-robot explained by bumpers, "
         f"{counts['robot_only']} whole-robot only)"
+    )
+    print(
+        f"  {counts['paired']} bumper observations placed with a whole-robot box; "
+        f"{counts['partial']} partial, {counts['weak']} of them weak"
     )
     print(
         f"  {len(raw)} tracklets (cut: {cuts['rival']} rival, {cuts['contact']} contact, "

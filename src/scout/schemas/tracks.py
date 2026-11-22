@@ -9,7 +9,9 @@ is a consequence of the tracking, not a guarantee.
 
 - `color` is the track's bumper colour (confidence-weighted majority of its boxes), not its
   alliance: at offseason events a robot can play for one alliance in the other's bumpers.
-- `x`, `y` are the smoothed robot centre on the carpet.
+- `x`, `y` are the smoothed robot centre on the carpet. When a whole-robot box was paired
+  with the source bumper box, the measured position mixes both boxes' placements, so it need
+  not sit at the source box's centre.
 - `state` is `measured` when a box backs the sample, `interpolated` inside a short gap.
 - `view`, `x1`..`y2` (full-frame pixels) and `conf` are the measured sample's source box,
   for cropping and weighting; null on interpolated rows. When duplicate boxes on one robot
@@ -17,6 +19,11 @@ is a consequence of the tracking, not a guarantee.
 - `kind` is what that source box frames: `bumper`, or `robot` when only a whole-robot box saw
   the robot in that frame (its colour does not count toward the track's `color`; a track
   seen only that way has colour `unknown`); null on interpolated rows.
+- `partial` is true when the source box framed only part of the robot (a bumper box much
+  narrower than the whole-robot box on the same robot, a box much narrower than a robot at
+  that spot, or a box cut by the edge of the picture); null on interpolated rows. When no
+  second box backed a partial sample, its position is mostly carried by the track's other
+  samples (it is weighted down in smoothing); it is still `measured`, but less sure.
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ TRACKS = TableSpec(
         "y2": pl.Float32(),
         "conf": pl.Float32(),
         "kind": KIND,
+        "partial": pl.Boolean(),
     },
 )
 
