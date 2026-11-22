@@ -8,6 +8,15 @@ from typing import Annotated
 
 import typer
 
+from scout.annotate.marks import (
+    PROTOCOL,
+    MarkView,
+    check_sheets,
+    compile_truth,
+    frames_of,
+    marking_images,
+    read_marks,
+)
 from scout.annotate.server import serve
 from scout.assets import ROOT, fetch_assets
 from scout.bench import BenchRefusedError, run_bench
@@ -118,6 +127,92 @@ def annotate(
         raise typer.BadParameter(f"{run_dir} is missing {', '.join(missing)}; run scout first")
     stem = Path(VideoInfo.load(rd.video_json).source_path).stem
     serve(rd, truth or TRUTH_DIR / f"{stem}.json", host, port)
+
+
+def _xy(text: str, sep: str) -> tuple[float, float]:
+    a, ok, b = text.partition(sep)
+    if not ok:
+        raise typer.BadParameter(f"expected two numbers like 1040{sep}520, got {text!r}")
+    return float(a), float(b)
+
+
+MarksDir = Annotated[Path, typer.Option(help="Folder for the images.")]
+
+
+@app.command(name="mark-frames")
+def mark_frames(
+    run_dir: RunPath,
+    at: Annotated[
+        list[str],
+        typer.Argument(
+            help="Moments: video seconds (70.5), a frame (f4225), or start:end[:step] s."
+        ),
+    ],
+    view: Annotated[MarkView, typer.Option(help="Panel to show.")] = "main",
+    around: Annotated[str | None, typer.Option(help="Crop centre x,y in source pixels.")] = None,
+    size: Annotated[str, typer.Option(help="Crop WxH in source pixels; 'all' = whole view.")] = (
+        "all"
+    ),
+    zoom: Annotated[float | None, typer.Option(help="Scale; default fits 1400 px wide.")] = None,
+    per_image: Annotated[int, typer.Option(help="Moments stacked into one image.")] = 1,
+    context: Annotated[bool, typer.Option(help="Show the whole view beside the crop.")] = False,
+    out: MarksDir = Path("/tmp/scout-marks"),
+) -> None:
+    """Gridded images of the raw video to read bumper-centre pixels from (AI annotation)."""
+    rd = _run_dir(run_dir)
+    info = VideoInfo.load(rd.video_json)
+    wh = None if size == "all" else tuple(round(n) for n in _xy(size, "x"))
+    paths = marking_images(
+        rd,
+        frames_of(info, at),
+        out,
+        view,
+        _xy(around, ",") if around else None,
+        (wh[0], wh[1]) if wh else None,
+        zoom,
+        per_image,
+        context,
+    )
+    print("\n".join(map(str, paths)))
+
+
+@app.command(name="mark-check")
+def mark_check(
+    run_dir: RunPath,
+    marks: Annotated[Path, typer.Argument(help="Mark file (CSV: team,at,x,y,state,note).")],
+    out: MarksDir = Path("/tmp/scout-marks"),
+) -> None:
+    """Contact sheets drawing each mark as a ring on its frame, to check it by eye."""
+    rd = _run_dir(run_dir)
+    for path in check_sheets(rd, read_marks(marks, VideoInfo.load(rd.video_json)), out):
+        print(path)
+
+
+@app.command(name="mark-compile")
+def mark_compile(
+    run_dir: RunPath,
+    marks: Annotated[list[Path], typer.Argument(help="One or more annotators' mark files.")],
+    truth: Annotated[
+        Path | None, typer.Option(help="Output. Default: truth/<video-stem>.json in the repo.")
+    ] = None,
+    tol_px: Annotated[
+        float, typer.Option(help="Two marks on one frame further apart than this disagree.")
+    ] = 12.0,
+) -> None:
+    """Compile AI annotators' mark files into a truth file with source "ai"."""
+    rd = _run_dir(run_dir)
+    stem = Path(VideoInfo.load(rd.video_json).source_path).stem
+    try:
+        print(compile_truth(rd, marks, truth or TRUTH_DIR / f"{stem}.json", tol_px))
+    except ValueError as e:
+        print(f"scout: {e}")
+        raise typer.Exit(1) from e
+
+
+@app.command(name="mark-protocol")
+def mark_protocol() -> None:
+    """Print the protocol handed to AI annotators."""
+    print(PROTOCOL.read_text(), end="")
 
 
 @app.command()

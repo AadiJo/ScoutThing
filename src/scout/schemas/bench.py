@@ -16,6 +16,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from scout.schemas.common import StageFile
+from scout.schemas.truth import TruthSource
 
 
 class WrongStretch(BaseModel):
@@ -126,7 +127,7 @@ class Bench(StageFile):
     schema_version: Literal[1] = 1
     video_sha256: str
     truth_path: str
-    truth_source: Literal["hand", "imported"]
+    truth_source: TruthSource
     click_height_m: float
     grid_hz: float
     created_at: datetime

@@ -26,6 +26,9 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from scout.schemas.common import StageFile, ViewName, atomic_write
 
 TruthState = Literal["visible", "estimated"]
+TruthSource = Literal["hand", "imported", "ai"]
+"""`hand`: the `scout annotate` page. `imported`: converted from another tool. `ai`: AI
+annotators' marks compiled by `scout mark-compile` (sparse, about one per second)."""
 
 
 class TruthSample(BaseModel):
@@ -67,7 +70,7 @@ class Truth(StageFile):
     schema_version: Literal[1] = 1
     video_sha256: str
     video_name: str
-    source: Literal["hand", "imported"]
+    source: TruthSource
     click_height_m: float
     """Height above the carpet of the point the annotator follows."""
     notes: str

@@ -1,0 +1,57 @@
+team,at,x,y,state,note
+# identity: corner_left 8-9s read "246." on near-wall red robot; main zoom 8s near bumper "2468" blurred. Body: black box with roller bars, fills with fuel from 13s
+2468,f600,562,665,visible,followed from 9s read (corner_left 246.), driving right along near wall behind clear wall
+2468,f660,880,660,visible,followed continuously 10-11s; 9506 alongside on its right; near band behind wall rail
+2468,f720,885,555,visible,read 2468 on near bumper (main zoom); 9506 read beside it on right
+2468,f780,808,545,visible,read 2468 near bumper; 9506 at x~1000
+2468,f840,595,552,visible,read ..68 near bumper; hopper full of fuel
+2468,f900,445,558,visible,read 2468 near bumper
+2468,f960,440,568,visible,read 2468 near bumper; parked shooting left of red hub
+2468,f1020,445,570,visible,read 2468 near bumper
+2468,f1080,450,568,visible,read 2468 near bumper
+2468,f1140,430,572,visible,read 2468 near bumper; turning
+2468,f1200,465,642,visible,followed at 0.5s steps from 19s read; passing ramp nose, no robot nearby; partly hidden by ramp
+2468,f1260,718,635,visible,read 2468 on right side bumper
+2468,f1320,768,538,visible,read 2468 near bumper
+2468,f1380,882,535,visible,read 2468 near bumper; in fuel pile
+2468,f1440,758,565,visible,read 2468 near bumper
+2468,f1500,545,548,visible,between reads at 24.5 and 25.5; beside parked 2687 (green lights, own read 2687) at red hub; near band behind ramp
+2468,f1560,458,548,visible,read 2468 near bumper
+2468,f1620,462,545,visible,read 2468 near bumper
+2468,f1680,455,548,visible,read 2468 near bumper
+2468,f1740,465,545,visible,read 2468 near bumper
+2468,f1800,465,545,visible,read 2468 near bumper
+2468,f1860,457,548,visible,read 2468 near bumper
+2468,f1920,460,548,visible,read 2468 near bumper
+2468,f1980,462,552,visible,read 2468 near bumper
+2468,f2040,415,632,visible,followed at 0.5s steps from 33s read; along near wall by referee stand; near band behind wall
+2468,f2100,650,650,visible,followed at 0.5s steps; passing ramp nose along near wall; no robot nearby (9506 at x~1000 in far pile)
+2468,f2160,897,595,visible,read 2468 near bumper (blurred); green lights on top
+2468,f2220,1085,520,visible,read 2468 near bumper; 9506 read at right of blue hub same moment
+2468,f2280,1065,470,visible,read ..68 at 38.0/38.5; in fuel pile left of blue hub
+2468,f2340,975,492,visible,followed at 0.5s steps from 38.5 read; driving left; 9506 last seen at blue hub
+2468,f2400,800,535,visible,read 2468 near bumper
+2468,f2460,718,548,visible,read 2468 near bumper; beside red hub
+2468,f2520,790,548,visible,read 2468 near bumper
+2468,f2580,910,508,visible,read 2468 near bumper; green lights
+2468,f2640,1035,458,visible,read 2468 near bumper; blue robot (white body) just behind it
+2468,f2700,1010,457,visible,read 2468 near bumper
+2468,f2760,965,472,visible,read 24G8 near bumper
+2468,f2820,865,470,visible,read 2468 near bumper
+2468,f2880,800,482,visible,read 2468 near bumper
+2468,f2940,755,530,visible,front robot overlapping 5572 (5572 read on bumper behind it); reads 2468 at 48.5 and 49.5; white sticker on side; near band hidden by fuel
+2468,f3000,702,556,visible,read 2468 near bumper; 5572 read separately at x~800 y~470
+2468,f3060,730,558,visible,read 2468 near bumper
+2468,f3120,728,558,visible,read 2468 near bumper
+2468,f3180,740,568,visible,read 2468 at 53.5; followed at 0.5s steps; 9506 (read 9506 at 52.5) just below/near it and 8515 beside; 2468 has white side sticker; 9506 has red roller and blue-striped bumper
+2468,f3240,890,550,visible,followed at 0.5s steps; 2 visible on near bumper; 8515 in front; 9506 separate below at y~630
+2468,f3300,1072,518,visible,read 2468 near bumper; green lights
+2468,f3360,1030,465,visible,read ..68 near bumper; 5572 read separately at x~900
+2468,f3420,940,488,visible,read 2468 near bumper
+2468,f3480,775,555,visible,read 24.. near bumper; 8515 overlapping right side
+2468,f3540,458,568,visible,read ..68 near bumper; at ramp left of red hub
+2468,f3600,420,588,visible,read 2G68 near bumper
+2468,f3660,285,605,visible,read 24G8 near bumper; behind clear wall near left driver station
+2468,f3720,205,612,visible,read 2G6. near bumper; 5572 read at x~345 y~470 same moment
+2468,f3780,280,602,visible,read 2468 near bumper; green lights
+2468,f3840,388,577,visible,read 2468 near bumper

@@ -1,0 +1,205 @@
+AI ANNOTATION PROTOCOL: marking one robot's position in an FRC match video
+
+You are making ground truth: where one robot is, about once a second, in one match video.
+A tracking tool will later be scored against your marks, so your marks must be correct,
+evenly spaced and made without looking at anything the tool produced. A wrong mark is
+worse than no mark. You work only through four commands (run from the repo root):
+
+  uv run --no-sync scout mark-protocol                      prints this text
+  uv run --no-sync scout mark-frames RUN AT... [options]    gridded images of the video
+  uv run --no-sync scout mark-check RUN MARKS.csv           your marks drawn back as rings
+  (the coordinator runs scout mark-compile on your file afterwards)
+
+RUN is the run folder you were given (e.g. runs/Qualification_16). Open the PNG paths the
+commands print with your image reading tool.
+
+----------------------------------------------------------------------------------------
+1. WHAT YOU ARE LOOKING AT
+----------------------------------------------------------------------------------------
+Each frame of the broadcast has a scoreboard at the top, a wide MAIN camera view, and two
+small corner camera views at the bottom that show the two ends of the field closer up.
+Only the main view counts: every mark you write is a pixel in the main view. The corner
+views (--view corner_left / corner_right) are only for reading bumper numbers.
+
+Each robot is a square base about 0.95 m wide wrapped in a BUMPER RING: a padded band
+about 13 cm tall, all the way round the base, in alliance colour (red or blue) with the
+team number printed in white on it. Six robots play: three red, three blue.
+
+Coordinates are SOURCE-FRAME pixels: x from the left edge, y from the top edge of the full
+1920x1080 frame. The images are scaled and cropped, so the only way to get coordinates is
+to read the labelled grid lines. NEVER estimate a coordinate from where something sits in
+the picture you are viewing (your view of the image is scaled; its pixels are not source
+pixels). Find the two labelled lines on each side of the point and interpolate.
+
+----------------------------------------------------------------------------------------
+2. WHICH POINT TO MARK
+----------------------------------------------------------------------------------------
+Mark the CENTRE OF THE BUMPER RING: the middle of the robot's square base, at bumper
+height. Not the top of the robot, not the middle of the robot's visible body, not the
+nearest bumper edge, not the bumper numbers.
+
+The main camera looks down on the field from high up, so the ring appears as a squashed
+four-sided shape: the near (front) bumper low in the picture, the far bumper higher up and
+usually hidden behind the robot's body. To find its centre:
+  - x: the middle of the ring left to right. Use the outside ends of the near bumper, or of
+    both side bumpers where visible.
+  - y: halfway between the near bumper band and the far bumper band. If the far band is
+    hidden, follow a side bumper back from the near corner to where it disappears; the
+    centre is halfway along the side bumper. The far band is roughly as far above the near
+    band as the robot's width looks foreshortened, which is much less than its width.
+  - Ignore everything above the bumpers (arms, turrets, hoppers, shooters). A tall robot's
+    body rises far above its ring centre; marking its visual middle puts the mark too high,
+    which casts onto the field too far from the camera.
+  - Mark the middle of the band's height (the band, not the carpet below it).
+Typical sizes on an official broadcast main view: robot 80 to 200 px wide; the ring is
+about 30 px deep (near band to far band) in the far half of the field and 60 to 90 px deep
+close to the camera, so the centre is 15 to 45 px ABOVE the middle of the near bumper band.
+Do not mark on the near bumper band itself. A mark 15 px off is a large error.
+
+----------------------------------------------------------------------------------------
+3. IDENTITY
+----------------------------------------------------------------------------------------
+The robot is identified by its bumper number and nothing else.
+  - First get the roster: `mark-frames RUN <t> --view scoreboard` shows the six team
+    numbers (left group one alliance, right group the other; their colour tells which).
+    Only these six numbers are possible.
+  - At the start of your segment, read the number on a bumper. Use a tight zoom in the main
+    view (--size 160x120) or a corner view when the robot is near an end of the field.
+  - Re-confirm the number every time you lose the robot: after it passes behind a hub,
+    a referee, a field element or another robot, or after any second you could not see it.
+  - Robots of one alliance share a bumper colour and often look alike; some numbers look
+    alike at low resolution (6, 8, 9, 0; 1, 7). Shape and colour of the robot's body help
+    you FOLLOW a robot between reads; they never replace a read. Write down in your notes
+    what the robot looks like once you have confirmed it (e.g. "low black box, open top").
+  - Following without a read: continuity counts only if you saw the robot in every assigned
+    second since the last read and it never touched, crossed or overlapped a lookalike. If
+    it crossed a same-alliance robot, you need a new read before marking it visible again.
+  - A mark whose identity rests on a guess gets state `unsure` (it is left out of the
+    truth). Never write `visible` on a guess.
+
+----------------------------------------------------------------------------------------
+4. STATES
+----------------------------------------------------------------------------------------
+  visible    You can see the robot's bumper ring (or enough of it to place the centre) and
+             its identity is confirmed (section 3).
+  estimated  The robot is hidden (behind a hub, a person, another robot) but you know where
+             it is: it went in and has not come out, and you can place the ring centre to
+             within about half a robot. Mark where the centre is, not the edge of what hides
+             it. Say in the note what hides it.
+  unsure     You can place a robot, but you are not sure it is this one.
+  skip       You cannot say where the robot is, or it is outside the main view (robots do
+             drive out of the picture at the left and right edges and along the near
+             wall). Leave x and y empty and say why in the note.
+Partly hidden but the centre can still be placed (half the ring visible): `visible`.
+Seen through the clear near wall: `visible` if you can place the ring.
+
+BEFORE you write `estimated` or `skip`, look at the WHOLE main view (--size all) for that
+moment and, near an end of the field, the corner view. "It went behind X" is only true if
+it is nowhere else. In the trial a robot "hidden behind the camera operator" had in fact
+driven along the near wall and out of the left edge of the picture; seven marks were
+3 to 4.5 m wrong because only half the view had been searched.
+
+----------------------------------------------------------------------------------------
+5. WHICH MOMENTS
+----------------------------------------------------------------------------------------
+Mark exactly the times you are assigned (usually every whole second, e.g. 70, 71, 72 ...).
+Do not move a mark to a nearby moment where the robot is easier to see, and do not add
+extra marks at interesting moments. Every assigned time gets one line: a mark, or `skip`
+with a reason. Hard moments left out would make the tracker look better than it is.
+
+----------------------------------------------------------------------------------------
+6. INDEPENDENCE
+----------------------------------------------------------------------------------------
+Do not open, read or list anything the tool produced in the run folder: tracks, labels,
+identity, detections, reads, facts, calibration, grade, bench, overlay video, or any
+*_check.jpg. Do not look at other truth files. Use only the commands above and what you
+see in their images. If you saw tool output by accident, say so in your report.
+
+----------------------------------------------------------------------------------------
+7. THE MARK FILE
+----------------------------------------------------------------------------------------
+CSV, one line per assigned time, first line exactly the header:
+
+  team,at,x,y,state,note
+  2839,f4195,1043,512,visible,read 2839 on near bumper (zoom)
+  2839,f4255,1060,505,visible,followed; same black box
+  2839,f4315,,,skip,behind red hub since 71.5 and two red robots near it
+  2839,f4375,1090,470,estimated,behind red hub; entered at 72.3 left side
+
+`at` is the frame printed on the image as f<number> (preferred) or video seconds. Notes may
+contain commas. Lines starting with # are comments. Write lines as you go (append to the
+file after every batch) so nothing depends on an image you can no longer see.
+
+----------------------------------------------------------------------------------------
+8. THE WORKING LOOP
+----------------------------------------------------------------------------------------
+Images cost a lot of context (each about 1,500 to 2,500 tokens). The loop that worked:
+
+  a) Start. `mark-frames RUN <t0> --view scoreboard` for the roster, then
+     `mark-frames RUN <t0>` (whole main view) to find the robot, then a tight zoom
+     (--around X,Y --size 400x260 --zoom 2) to read its number.
+  b) Guess, then check. Write the next 3 to 6 assigned times into a separate batch file
+     with a guessed position (the last known one) and note "p". Run
+       mark-check RUN batch.csv --out <dir>
+     Each cell shows one line as a magenta ring on its own frame: a 3x zoom with a grid on
+     top, and a 480x240 crop at 1x below. Use the lower crop to find the robot and read its
+     number, the zoom to read the ring centre. Six cells per sheet.
+  c) Correct each line from the sheet, append the corrected lines to your mark file.
+  d) Check the corrected lines with mark-check again when any moved by more than about
+     15 px, or when you placed them from a wide image. Fix what is off.
+  e) Lost robot (not in the lower crop of its cell): one wide image of several moments,
+       mark-frames RUN f6173 f6233 f6293 --around 960,450 --size 1400x430 --per-image 3
+     then go back to b). Before writing estimated or skip, see section 4.
+  Keep the batch to six or fewer lines so the sheet fits one image; delete old images.
+
+Read coordinates only from the grid labels of the image you are looking at: find the two
+labelled lines either side of the point and interpolate. Your view of a large image is
+scaled down, so "about 900 px across the picture" is not x=900.
+
+----------------------------------------------------------------------------------------
+9. WHAT TO REPORT AT THE END
+----------------------------------------------------------------------------------------
+  - Counts of lines per state (visible, estimated, unsure, skip) per robot.
+  - Every moment identity was established or re-established, and from what (which view,
+    which digits you could read).
+  - Every stretch you did not mark as visible, and why.
+  - Anything you were unsure about, and anything from section 6 you saw by accident.
+  - Images opened and the mark file path.
+
+----------------------------------------------------------------------------------------
+10. LESSONS FROM THE TRIALS
+----------------------------------------------------------------------------------------
+From a blind trial against dense human truth (two robots, 80 assigned times):
+  - Typical error of a careful mark is 15 to 25 px (0.2 to 0.4 m). Most of it is the far
+    band being hidden: the depth of the ring has to be judged. Near the camera a robot is
+    150 to 200 px wide and the ring 60 to 90 px deep, so judge x from the ring's outer
+    corners, not from where the number is printed.
+  - Easy mistake 1: reading a position off a wide image by eye instead of from its grid
+    labels. It put three marks 75 to 105 px off. The check sheet caught all of them.
+  - Easy mistake 2: following the wrong robot after it leaves the crop. A same-alliance
+    robot drove into the crop where the target had been; only its bumper number showed
+    the swap. Re-read the number whenever the robot left your crop.
+  - Easy mistake 3: calling a robot hidden without searching the whole view (section 4).
+  - Robots with similar bodies on one alliance were separated only by bumper numbers.
+    Read them on the lower crop of the check sheet; at 1x a facing number 10 px tall is
+    readable on the official broadcast.
+  - Easy mistake 4: copying a position from the wrong cell. Sheets hold several moments;
+    the worst error in the trials (200 px) was the next second's position written on this
+    second's line. Read the time in the cell caption before writing each line.
+  - Easy mistake 5: misjudging x on a big robot close to the camera (150 to 200 px wide)
+    from the 1x crop. Errors of 90 to 130 px happened there. When the robot fills most of
+    the zoom tile, check x against both outer corners of the near bumper.
+  - Corner views differ by broadcast. On some they are low cameras aimed across the field
+    or at the crowd and show nothing useful; look once, then stop using them if so.
+  - Cost: about 0.45 images per mark with the guess-then-check loop (about 1,200 tokens
+    per mark in all), about 0.8 with a separate locate image for every moment.
+
+Harder footage (low camera close to the field, strong lens distortion, offseason event):
+  - Robots are 40 to 60 px wide in the main view and bumpers are often hidden behind the
+    near wall, a referee or the field edge. Numbers were readable in about 1 moment in 4.
+  - Several robots can share one body type (e.g. black open-top boxes). Expect most marks
+    there to be `unsure` unless a number is read every few seconds. Do not raise them to
+    `visible` because the body looks right.
+  - Bumper colour may not match the alliance at an offseason event. Use the number only.
+  - Straight field lines bend near the image edges; ignore them when judging the ring
+    shape and use the robot's own bumpers.

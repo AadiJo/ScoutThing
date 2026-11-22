@@ -1,0 +1,57 @@
+team,at,x,y,state,note
+2468,63,866,432,visible,read 2468 on near bumper at 61 and 62 (zoom); followed continuously to 63; low black open-top box with fuel and green lights
+2468,64,690,430,estimated,behind red hub (far side); entered right side at 63.5 heading left; 2583 visible separately left of hub at 64
+2468,65,570,458,unsure,"left of red hub partly hidden; identity by chain back from 70.8 read: this robot entered behind the hub at 67.9 while 2583 (read) was visible right of the hub at 67.25-68; UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,66,588,464,unsure,"left of red hub partly hidden; same robot seen at 0.5 s steps 64.5-67.75; see 65; UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,67,575,462,unsure,"left of red hub; at 67.25 and 67.5 2583 (read 68) is visible right of hub at the same time; UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,68,680,425,estimated,behind red hub moving left to right along far side; 2583 visible right of hub so nothing else is behind it
+2468,69,760,425,estimated,mostly hidden behind red hub right ramp; emerges at 69.5 and followed to read at 70.8
+2468,70,870,428,visible,followed back from partial read 24?8 at 70.8-71; never left view 69.5-71; 2583 read separately in front
+2468,71,1035,440,visible,partial read 24?8 on near bumper at 70.8 and 71 (zoom); 2583 and white 8515 visible elsewhere at same time
+2468,72,1082,483,estimated,mostly hidden behind white 8515; followed continuously from 71 read; crossing with 2583 happens after 72.3
+2468,73,1020,466,visible,followed back from clear read 2468 at 75; 2583 read on the other robot behind it at 73
+2468,74,915,438,visible,followed back from read 2468 at 75 (seen at 73.2-74.5 every 0.2-0.5 s; green lights)
+2468,75,828,432,visible,read 2468 on near bumper (zoom 5x) at 75 and 75.5
+2468,76,838,432,visible,read 2468 on near bumper (zoom) at 76
+2468,77,1025,432,visible,followed from read at 76 (seen at 76.5 and 77; no other robot near)
+2468,78,1180,430,estimated,behind blue hub (far side); entered at 77.5 from the left heading right
+2468,79,1320,440,unsure,"back robot right of blue hub behind 2583 (2583 read on front robot); chain forward to read at 86 with 2583 always visible elsewhere; UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,80,1300,440,unsure,"same back robot as 79 behind 2583; see 79; UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,81,1220,430,estimated,behind blue hub far side moving left; emerges at 81.5 at about 1150,420; 2583 visible in front of hub at 81
+2468,82,1060,432,visible,followed 81.5-86 at 0.5 s steps to partial read 2?68 at 86 and 87; 2583 stays right of blue hub
+2468,83,1020,458,visible,followed to read at 86; turning
+2468,84,1115,500,visible,followed to read at 86; next to white 8515
+2468,85,1105,500,visible,partly hidden behind white 8515; number partly visible; followed to read at 86
+2468,86,1035,472,visible,partial read 2?68 on near bumper (zoom 3.4x); not 2583 (ends 68)
+2468,87,868,440,visible,partial read 2468 on near bumper (zoom)
+2468,88,748,430,visible,partly hidden behind red hub ramp; right part of bumper visible; followed from 87
+2468,89,760,432,visible,partly behind red hub ramp; followed to read at 89.7
+2468,90,860,437,visible,read 2?68 on near bumper at 89.7 90 and 90.8 (zoom 4x)
+2468,91,752,465,visible,right of red hub; partial read 2?68 on near bumper (check sheet zoom); followed from 90
+2468,92,660,440,estimated,behind red hub moving right to left; came out left at 93; 2583 visible near blue hub (whole view at 92)
+2468,93,562,462,unsure,"left of red hub partly hidden; came out from behind hub; 2583 far right at the time; green lights; UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,94,540,468,unsure,"left of red hub; green lights; followed from 93; UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,95,563,470,unsure,"left of red hub; followed; 2583 far right (whole view at 95); UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,96,570,465,unsure,"left of red hub partly hidden by fuel and hub; followed; UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,97,570,460,unsure,"left of red hub partly hidden; followed; goes behind hub at 97.5; UNSURE: hub occlusion on both sides of this stretch and no number read inside it (identity only by exclusion, 2583 seen elsewhere)"
+2468,98,650,430,estimated,behind red hub; 2583 visible at blue hub front in whole view at 98 99 99.5
+2468,99,720,425,estimated,behind red hub moving right; peeks out at 99.5 at about 790,425
+2468,100,843,438,visible,came out right of red hub at 99.5 while 2583 visible at blue hub; number not readable at 99.5-101
+2468,101,970,470,visible,followed from 100 at 0.5 s steps; blue 3847 nearby (blue bumpers)
+2468,102,968,487,visible,followed from 101; next to blue 3847; read 2468 at 103 one second later with no crossing
+2468,103,950,482,visible,read 2468 on near bumper (check sheet zoom)
+2468,104,865,472,visible,read 2468 on near bumper (check sheet zoom)
+2468,105,650,440,estimated,behind red hub moving right to left; seen right of hub at 104.5 and coming out left at 105.5; 2583 visible far right at 105
+2468,106,515,478,visible,left of red hub; partial read on near bumper; came out from behind hub at 105.5
+2468,107,535,452,visible,partial read 2?68 on near bumper; green lights
+2468,108,505,442,visible,followed from 107; green lights
+2468,109,545,460,visible,left of red hub; partial read 2?68 on near bumper (check sheet); green lights; followed from 108
+2468,110,575,465,visible,left of red hub; followed; 2583 far right at 110
+2468,111,568,468,visible,left of red hub; followed; 2583 far right
+2468,112,555,462,visible,left of red hub; followed; partial read on near bumper
+2468,113,540,475,visible,partial read 2?6? on near bumper; moving left
+2468,114,385,492,visible,partly behind red ladder structure at left; partial read 2?6 on bumper; followed from 113.5
+2468,115,515,490,visible,followed from 114; green lights
+2468,116,540,490,visible,partial read 24?8 on near bumper (check sheet)
+2468,117,560,472,visible,read 2468 on near bumper (check sheet)
+2468,118,,,skip,went behind red hub at about 117.3; not seen anywhere in the whole main view at 117.5 118 118.5; position behind the hub not known to half a robot
