@@ -4,18 +4,21 @@ Writes reads.parquet: the bumper number reader's verdict on every detector box i
 view, scored against the six roster teams, with the track each main-view box joins. Writes
 identity.json: which stretch of which track is which team, or null when unsure. Also writes
 `reads_check.jpg` (crops exactly as the reader sees them, sampled across views and
-confidence) and `identity_check.jpg` (one timeline row per track, coloured by label, with a
-tick per named read).
+confidence) and `identity_check.jpg` (one timeline row per track, coloured by label, hatched
+where the label is not from number reads, with a tick per named read).
 
-Reading: one ffmpeg decode pass at the detector's SAMPLE_HZ. Each box is cut and resized on
-the CPU (a few hundred pixels each); full batches of crops go to the GPU in half precision.
-Only one decoded frame is held at a time.
+Reading: one ffmpeg decode pass at the detector's SAMPLE_HZ. Each detector box is cut for the
+number reader and each measured track box for the appearance embedder on the CPU; full
+batches go to the GPU in half precision. Only one decoded frame is held at a time.
 
 Labelling: named reads are sparse anchors on tracks (tracks are main view only, so corner
 reads never label). A few agreeing reads label a stretch of a track, which may carry on
 past them while the weaker reads do not contradict; named reads of two teams on one track
 mark a change of robot, and the stretch between them stays null. No team is left on two
-tracks at once. Unread tracks stay null: no colour, position or elimination guesses.
+tracks at once. Then each remaining null stretch (not `conflict`) may be named from its
+appearance against this match's number-read boxes, among the teams not labelled elsewhere
+at the time, with continuity loosening the bar (`_label_unread`). Those labels never
+replace a number-read label and are marked `appearance*` in `source`.
 """
 
 from __future__ import annotations
@@ -36,11 +39,13 @@ from scipy.spatial import KDTree  # pyright: ignore[reportMissingTypeStubs]
 
 from scout.assets import asset
 from scout.readers.digits import Crop, DigitReader
+from scout.readers.embedder import Embedder
 from scout.run import RunDir, Stage
 from scout.schemas.common import ViewName
 from scout.schemas.detections import SAMPLE_HZ, read_detections
 from scout.schemas.identity import (
     READER_NAME,
+    AppearanceEvidence,
     ClaimConflict,
     Identity,
     LabelSegment,
@@ -101,6 +106,45 @@ in a row mark a likely change of robot the tracker missed. On Qualification 16 a
 this stop removed one of two same-team clashes; extending 3- and 4-read labels caused the
 other clash and the one wrong hand-marked label (a pin where one box covers two robots)."""
 
+EMBED_BATCH = 256
+"""Appearance crops per GPU batch (224x224 each)."""
+APPEAR_TOPK = 10
+"""A box's score for a team is the mean of its APPEAR_TOPK highest cosines to that team's
+gallery (a nearest-neighbour score; a single mean vector per team picked the true team for
+83 of 102 clean Qualification 8 stretches against 90 for this)."""
+GALLERY_MIN = 20
+"""A team needs this many embedded `digits` boxes to be scored. A candidate team below it
+(never read, like 9066 in Qualification 8) is an unseen robot: appearance cannot rule it out,
+so the stretch must then reach UNSEEN_MIN_COS."""
+APPEAR_MIN_BOXES = 5
+"""An `appearance` label needs this many embedded boxes (0.5 s). On the development runs,
+stretches of 1-4 boxes held 9 of the 13 wrong appearance-only stretches at margin 0.1."""
+APPEAR_MARGIN = 0.10
+"""cosine units: the chosen team must beat every other candidate by this. At 0.05 the
+development runs gained 4% more correct samples and 1 more wrong stretch; at 0.2, 15% fewer
+correct and the same wrong ones (those come from wrong eliminations, not close calls)."""
+APPEAR_MIN_COS = 0.60
+"""cosine: below this the stretch looks like none of the gallery (cross-match, 0.59 passed
+89% of true pairs and 9% of false ones). Barely binding at margin 0.1."""
+UNSEEN_MIN_COS = 0.75
+"""cosine: the bar when some candidate team has no gallery. 0.75 kept 29 of 31 judged
+Qualification 8 stretches correct; with no bar, Playoff 12 labelled 9506 and 9988 (both
+unread, 9506 an open-top lookalike of 2468) as 2468 in 7 short stretches."""
+CONT_MARGIN = 0.05
+CONT_MIN_BOXES = 1
+"""`appearance_continuity` labels: appearance bars when continuity agrees (cosine margin;
+embedded boxes). Continuity alone was 91% precise (553/605 samples), appearance at these
+looser bars alone 96-97%; agreeing, 103 of 104 samples were right."""
+CONT_GAP_S = 2.0
+CONT_SPEED_MPS = 5.5
+CONT_NOISE_M = 0.35
+"""A track that ended at most CONT_GAP_S before a stretch starts (or began at most that
+after it ends) continues it when the gap is drivable at CONT_SPEED_MPS plus CONT_NOISE_M of
+position noise; only a sole such track counts. The track stage's JOIN_MAX_S, MAX_SPEED_MPS
+and NOISE_M (repeated here: stages do not import each other)."""
+
+HATCH = {"appearance": 5, "appearance_continuity": 3}
+"""identity_check.jpg stripe spacing in pixels for labels not from number reads."""
 CHECK_BINS = (0.0, 0.5, 0.9, ACCEPT_P, 1.01)
 CHECK_PER_CELL = 5
 """reads_check.jpg samples this many crops per (view, confidence bin) cell."""
@@ -221,11 +265,21 @@ def _draw_check(path: Path, crops: dict[int, NDArray[np.uint8]], reads: pl.DataF
         cv2.imwrite(str(path), np.vstack(tiles_rows), [cv2.IMWRITE_JPEG_QUALITY, 90])
 
 
+@dataclass
+class _Embeds:
+    """Appearance vectors of measured track samples: `index[(track_id, frame)]` is a row of
+    `vecs`."""
+
+    index: dict[tuple[int, int], int]
+    vecs: NDArray[np.float32]
+
+
 def _read_boxes(
-    run: RunDir, info: VideoInfo, match: MatchInfo, timer: _Timer
-) -> tuple[pl.DataFrame, dict[int, NDArray[np.uint8]]]:
-    """Read every detector box in one decode pass. Returns reads (track_id still null) in
-    detection order and the candidate crops for reads_check.jpg by row index."""
+    run: RunDir, info: VideoInfo, match: MatchInfo, tracks: pl.DataFrame, timer: _Timer
+) -> tuple[pl.DataFrame, dict[int, NDArray[np.uint8]], _Embeds]:
+    """Read every detector box and embed every measured track box in one decode pass.
+    Returns reads (track_id still null) in detection order, the candidate crops for
+    reads_check.jpg by row index, and the track box embeddings."""
     teams = [str(s.team) for s in match.roster]
     dets = (
         read_detections(run.detections)
@@ -236,7 +290,28 @@ def _read_boxes(
     device = torch.device("cuda" if cuda else "cpu")
     mark = time.perf_counter()
     reader = DigitReader.load(asset("digits"), device)
+    embedder = Embedder.load(asset("embedder"), device)
     mark = timer.add("load model", mark)
+    main_panel = match.views["main"]
+    to_embed: dict[int, list[tuple[int, list[float]]]] = {}
+    for tid, fr, x1, y1, x2, y2 in (
+        tracks.filter(pl.col("state") == "measured")
+        .select("track_id", "frame", "x1", "y1", "x2", "y2")
+        .iter_rows()
+    ):
+        box = [float(x1), float(y1), float(x2), float(y2)]
+        if Embedder.usable(box):
+            to_embed.setdefault(int(fr), []).append((int(tid), box))
+    emb_keys: list[tuple[int, int]] = []
+    emb_out: list[NDArray[np.float32]] = []
+    emb_pending: list[NDArray[np.uint8]] = []
+
+    def flush_embed() -> float:
+        nonlocal emb_pending
+        t0 = time.perf_counter()
+        emb_out.append(embedder.embed(emb_pending))
+        emb_pending = []
+        return timer.add("gpu embed", t0)
 
     frame_col = dets["frame"].to_numpy()
     uniq, starts = np.unique(frame_col, return_index=True)
@@ -265,11 +340,17 @@ def _read_boxes(
         pending_rows, pending = [], []
         return timer.add("gpu read", t0)
 
-    last = int(frame_col.max()) if len(frame_col) else -1
+    last = max([int(frame_col.max()) if len(frame_col) else -1, *to_embed])
     end_t = (last + 1) / info.fps
     n_frames = 0
     for f in frames(run.video, info, sample_hz=SAMPLE_HZ, end=end_t):
         mark = timer.add("decode", mark)
+        for tid, box in to_embed.get(f.frame, []):
+            emb_keys.append((tid, f.frame))
+            emb_pending.append(embedder.model_input(f.image, box, main_panel))
+        mark = timer.add("embed crop", mark)
+        if len(emb_pending) >= EMBED_BATCH:
+            mark = flush_embed()
         span = spans.get(f.frame)
         if span is None:
             continue
@@ -295,6 +376,14 @@ def _read_boxes(
             mark = flush()
     if pending:
         mark = flush()
+    if emb_pending:
+        mark = flush_embed()
+    if len(emb_keys) != sum(len(v) for v in to_embed.values()):
+        raise RuntimeError("not every track box was embedded")
+    embeds = _Embeds(
+        {k: i for i, k in enumerate(emb_keys)},
+        np.concatenate(emb_out) if emb_out else np.zeros((0, embedder.dim), np.float32),
+    )
     if n_frames != len(spans):
         raise RuntimeError(f"decoded {n_frames} of {len(spans)} frames with boxes")
 
@@ -334,7 +423,7 @@ def _read_boxes(
         reader=pl.lit(READER_NAME),
     )
     timer.add("decide", mark)
-    return reads, check_rows
+    return reads, check_rows, embeds
 
 
 def _join_tracks(reads: pl.DataFrame, tracks: pl.DataFrame) -> pl.Series:
@@ -503,7 +592,151 @@ def _resolve_claims(labels: pl.DataFrame) -> tuple[pl.DataFrame, list[ClaimConfl
     return out, conflicts
 
 
-def _label(reads: pl.DataFrame, tracks: pl.DataFrame, roster: list[int]) -> Identity:
+@dataclass(frozen=True)
+class _End:
+    """One end of a track: time, field position and its label there (None if unlabelled)."""
+
+    track_id: int
+    t: float
+    x: float
+    y: float
+    team: int | None
+
+
+def _continuers(stretch_end: _End, ends: list[_End], after: bool) -> list[_End]:
+    """Track ends that could be this robot: ends of other tracks within CONT_GAP_S before
+    (`after` False: tracks ending before the stretch starts) or after it, drivable at
+    CONT_SPEED_MPS plus CONT_NOISE_M."""
+    out: list[_End] = []
+    for e in ends:
+        if e.track_id == stretch_end.track_id:
+            continue
+        gap = e.t - stretch_end.t if after else stretch_end.t - e.t
+        if not 0 < gap <= CONT_GAP_S + 1e-9:
+            continue
+        if (
+            np.hypot(e.x - stretch_end.x, e.y - stretch_end.y)
+            <= CONT_SPEED_MPS * gap + CONT_NOISE_M
+        ):
+            out.append(e)
+    return out
+
+
+def _label_unread(
+    labels: pl.DataFrame, tracks: pl.DataFrame, embeds: _Embeds, roster: list[int]
+) -> tuple[pl.DataFrame, dict[tuple[int, int], AppearanceEvidence]]:
+    """Name null stretches (not `conflict`) of tracks from appearance, elimination and
+    continuity. Returns the labels and the evidence per (track_id, first frame) of each named
+    stretch.
+
+    Per stretch: candidates are roster teams not labelled on any other track at any of its
+    frames (one robot, one place). Each candidate with a gallery (GALLERY_MIN `digits` boxes)
+    gets the stretch's mean APPEAR_TOPK score; the best must beat the runner-up by
+    APPEAR_MARGIN, reach APPEAR_MIN_COS (UNSEEN_MIN_COS if a candidate has no gallery), be the
+    best over the whole roster too (a team labelled elsewhere that looks more alike vetoes),
+    and have APPEAR_MIN_BOXES boxes: `appearance`. Continuity names a team when the track is
+    labelled it just before or after the stretch, or the sole track that ended (began) next
+    to its start (end) is. When every continuity team equals the appearance pick, the looser
+    CONT_MARGIN and CONT_MIN_BOXES apply (a continuity team that disagrees did not need to
+    veto an `appearance` label: on the development runs that veto removed 67 right samples
+    and no wrong ones):
+    `appearance_continuity`. Two new stretches of one team that overlap in time both lose."""
+    xy = tracks.select("track_id", "frame", "x", "y")
+    lab = labels.join(xy, on=["track_id", "frame"], how="left").sort("track_id", "frame")
+    lab = lab.with_row_index("i").with_columns(
+        run=pl.struct(pl.col("team").is_null(), "source").rle_id().over("track_id")
+    )
+
+    gallery: dict[int, NDArray[np.float32]] = {}
+    for team in roster:
+        keys = lab.filter((pl.col("source") == "digits") & (pl.col("team") == team))
+        rows = [
+            embeds.index[k]
+            for k in keys.select("track_id", "frame").iter_rows()
+            if k in embeds.index
+        ]
+        if len(rows) >= GALLERY_MIN:
+            gallery[team] = embeds.vecs[rows]
+    named = lab.filter(pl.col("team").is_not_null())
+    busy = {int(team): set(g["frame"].to_list()) for (team,), g in named.group_by("team")}
+
+    def end(g: pl.DataFrame, k: int) -> _End:
+        r = g.row(k, named=True)
+        return _End(r["track_id"], r["t"], r["x"], r["y"], r["team"])
+
+    by_track = {int(tid): g for (tid,), g in lab.group_by("track_id")}
+    starts = [end(g, 0) for g in by_track.values()]
+    stops = [end(g, -1) for g in by_track.values()]
+
+    picks: list[tuple[int, list[int], int, str, AppearanceEvidence]] = []
+    open_runs = lab.filter(pl.col("team").is_null() & (pl.col("source") != "conflict"))
+    for (tid, _), g in open_runs.group_by("track_id", "run", maintain_order=True):
+        frames_ = g["frame"].to_list()
+        whole = by_track[int(tid)]
+        cands = [t for t in roster if not (busy.get(t, set()) & set(frames_))]
+        rows = [embeds.index[(int(tid), f)] for f in frames_ if (int(tid), f) in embeds.index]
+        if not cands or not rows:
+            continue
+        sims = embeds.vecs[rows]
+        score = {
+            t: float(np.sort(sims @ gal.T, axis=1)[:, -APPEAR_TOPK:].mean())
+            for t, gal in gallery.items()
+        }
+        scored = sorted((t for t in cands if t in score), key=lambda t: -score[t])
+        if not scored or max(score, key=lambda t: score[t]) != scored[0]:
+            continue
+        best = scored[0]
+        runner = scored[1] if len(scored) > 1 else None
+        margin = score[best] - score[runner] if runner is not None else 9.0
+        min_cos = UNSEEN_MIN_COS if len(scored) < len(cands) else APPEAR_MIN_COS
+        if score[best] < min_cos:
+            continue
+        before = whole.filter(pl.col("frame") < frames_[0])
+        after = whole.filter(pl.col("frame") > frames_[-1])
+        pred = [end(before, -1)] if len(before) else _continuers(end(g, 0), stops, after=False)
+        succ = [end(after, 0)] if len(after) else _continuers(end(g, -1), starts, after=True)
+        cont = {e[0].team for e in (pred, succ) if len(e) == 1 and e[0].team is not None}
+        if margin >= APPEAR_MARGIN and len(rows) >= APPEAR_MIN_BOXES:
+            source = "appearance"
+        elif cont == {best} and margin >= CONT_MARGIN and len(rows) >= CONT_MIN_BOXES:
+            source = "appearance_continuity"
+        else:
+            continue
+        ev = AppearanceEvidence(
+            cosine=score[best],
+            margin=margin,
+            runner_up=runner,
+            n_boxes=len(rows),
+            candidates=cands,
+        )
+        picks.append((int(tid), frames_, best, source, ev))
+
+    clash: set[int] = set()
+    for (i, a), (j, b) in itertools.combinations(enumerate(picks), 2):
+        if a[2] == b[2] and set(a[1]) & set(b[1]):
+            clash |= {i, j}
+    team_col = labels["team"].to_list()
+    source_col = labels["source"].to_list()
+    where = {
+        (t, f): k for k, (t, f) in enumerate(zip(labels["track_id"], labels["frame"], strict=True))
+    }
+    evidence: dict[tuple[int, int], AppearanceEvidence] = {}
+    for k, (tid, frames_, team, source, ev) in enumerate(picks):
+        if k in clash:
+            continue
+        for f in frames_:
+            team_col[where[(tid, f)]] = team
+            source_col[where[(tid, f)]] = source
+        evidence[(tid, frames_[0])] = ev
+    out = labels.with_columns(
+        team=pl.Series(team_col, dtype=pl.Int64), source=pl.Series(source_col, dtype=pl.String)
+    )
+    return out, evidence
+
+
+def _label(
+    reads: pl.DataFrame, tracks: pl.DataFrame, roster: list[int], embeds: _Embeds
+) -> Identity:
     """identity.json from reads (with track_id) and tracks."""
     joined = reads.filter(pl.col("track_id").is_not_null() & ~pl.col("static")).sort("t")
     by_track = {int(k): g for (k,), g in joined.group_by("track_id")}
@@ -531,6 +764,7 @@ def _label(reads: pl.DataFrame, tracks: pl.DataFrame, roster: list[int]) -> Iden
         },
     )
     labels, conflicts = _resolve_claims(labels)
+    labels, evidence = _label_unread(labels, tracks, embeds, roster)
     segments: list[LabelSegment] = []
     runs = labels.sort("track_id", "frame").with_columns(
         run=pl.struct("team", "source", "n_reads").rle_id().over("track_id")
@@ -539,7 +773,10 @@ def _label(reads: pl.DataFrame, tracks: pl.DataFrame, roster: list[int]) -> Iden
         first, last = g.row(0, named=True), g.row(-1, named=True)
         team: int | None = first["team"]
         conf = 0.0
-        if team is not None:
+        ev = evidence.get((int(tid), first["frame"]))
+        if ev is not None:
+            conf = ev.cosine
+        elif team is not None:
             rs = by_track.get(int(tid), empty).filter(pl.col("t").is_between(first["t"], last["t"]))
             if len(rs):
                 k = roster.index(team)
@@ -555,6 +792,7 @@ def _label(reads: pl.DataFrame, tracks: pl.DataFrame, roster: list[int]) -> Iden
                 confidence=min(1.0, max(0.0, conf)),
                 source=first["source"],
                 n_reads=first["n_reads"],
+                appearance=ev,
             )
         )
     return Identity(segments=segments, conflicts=conflicts)
@@ -566,7 +804,9 @@ def _draw_identity(
     """Write identity_check.jpg: one row per track over match time, coloured by label (the
     target team orange, other teams in their own colours, null grey, `conflict` dark red),
     a short white tick at the top of the row at each named read joined to the track, and a
-    strip on top that is orange wherever some track carries the target team."""
+    strip on top that is orange wherever some track carries the target team. Labels from
+    number reads are solid; `appearance*` labels are hatched with dark stripes (sparse for
+    `appearance`, dense for `appearance_continuity`), in the strip too."""
     left, width, strip = 70, 1800, 34
     by_track: dict[int, list[LabelSegment]] = {}
     for s in ident.segments:
@@ -579,15 +819,21 @@ def _draw_identity(
     def x(t: float) -> int:
         return left + round(t / duration * width)
 
+    def fill(x0: int, y0: int, x1: int, y1: int, c: tuple[int, int, int], source: str) -> None:
+        cv2.rectangle(img, (x0, y0), (x1, y1), c, -1)
+        step = HATCH.get(source)
+        if step:
+            for xx in range(x0 - (y1 - y0), x1, step):
+                cv2.line(img, (xx, y1), (xx + (y1 - y0), y0), (20, 20, 20), 1)
+            cv2.rectangle(img, (x0, y0), (x1, y1), c, 1)
+
     others = [s.team for s in match.roster if s.team != match.target_team]
     palette = [(255, 160, 60), (90, 200, 90), (220, 120, 220), (60, 220, 220), (200, 200, 90)]
     colour: dict[int, tuple[int, int, int]] = {match.target_team: (0, 140, 255)}
     colour |= {team: palette[i % len(palette)] for i, team in enumerate(others)}
     for s in ident.segments:
         if s.team == match.target_team:
-            cv2.rectangle(
-                img, (x(s.t_start), 6), (x(s.t_end) + 1, strip), colour[match.target_team], -1
-            )
+            fill(x(s.t_start), 6, x(s.t_end) + 1, strip, colour[match.target_team], s.source)
     cv2.putText(img, f"{match.target_team} labelled", (4, strip - 8), 0, 0.4, (255, 255, 255), 1)
     named = reads.filter(~pl.col("abstain") & pl.col("track_id").is_not_null())
     ticks = {int(k): g["t"].to_list() for (k,), g in named.group_by("track_id")}
@@ -597,7 +843,7 @@ def _draw_identity(
             c = colour.get(s.team, (90, 90, 90)) if s.team is not None else (90, 90, 90)
             if s.source == "conflict":
                 c = (40, 40, 150)
-            cv2.rectangle(img, (x(s.t_start), y0), (x(s.t_end) + 1, y0 + rh - 2), c, -1)
+            fill(x(s.t_start), y0, x(s.t_end) + 1, y0 + rh - 2, c, s.source)
         for t in ticks.get(tid, []):
             cv2.line(img, (x(t), y0), (x(t), y0 + max(1, rh // 3)), (255, 255, 255), 1)
         if rh >= 8 or row % 5 == 0:
@@ -610,9 +856,10 @@ def _draw_identity(
         cv2.line(img, (x(t), strip + 2), (x(t), bottom), (255, 255, 255), 1)
     legend = [(str(k), v) for k, v in colour.items()]
     legend += [("null", (90, 90, 90)), ("conflict", (40, 40, 150)), ("| named read", (20, 20, 20))]
+    legend += [("appearance", (200, 200, 200)), ("appearance_continuity", (200, 200, 200))]
     lx = left
     for name, c in legend:
-        cv2.rectangle(img, (lx, strip + 18), (lx + 14, strip + 32), c, -1)
+        fill(lx, strip + 18, lx + 14, strip + 32, c, name)
         cv2.putText(img, name, (lx + 18, strip + 30), 0, 0.45, (255, 255, 255), 1)
         lx += 30 + 10 * len(name)
     cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -628,7 +875,7 @@ def identify(run: RunDir) -> None:
     tracks = read_tracks(run.tracks)
     timer = _Timer()
     start = time.perf_counter()
-    reads, check_rows = _read_boxes(run, info, match, timer)
+    reads, check_rows, embeds = _read_boxes(run, info, match, tracks, timer)
     mark = time.perf_counter()
     reads = reads.with_columns(_join_tracks(reads, tracks).cast(pl.Int32))
     write_reads(run.reads, reads)
@@ -636,7 +883,7 @@ def identify(run: RunDir) -> None:
     _draw_check(run.path / "reads_check.jpg", check_rows, reads)
     mark = timer.add("reads sheet", mark)
     roster = [s.team for s in match.roster]
-    ident = _label(reads, tracks, roster)
+    ident = _label(reads, tracks, roster, embeds)
     ident.save(run.identity_json)
     mark = timer.add("label", mark)
     _draw_identity(run.path / "identity_check.jpg", ident, reads, match, info.duration_s)
@@ -646,11 +893,16 @@ def identify(run: RunDir) -> None:
     named = reads.filter(~pl.col("abstain"))
     joined = named.filter(pl.col("track_id").is_not_null())
     target = [s for s in ident.segments if s.team == match.target_team]
+    by_source: dict[str, float] = {}
+    for s in ident.segments:
+        if s.team is not None:
+            by_source[s.source] = by_source.get(s.source, 0.0) + s.t_end - s.t_start + 1 / SAMPLE_HZ
     print(
-        f"identify: {len(reads)} boxes read, {len(named)} named, {len(joined)} named on a track;"
-        f" {len(ident.segments)} segments, {len(target)} for {match.target_team},"
-        f" {len(ident.conflicts)} same-team conflicts"
+        f"identify: {len(reads)} boxes read, {len(named)} named, {len(joined)} named on a track,"
+        f" {len(embeds.index)} track boxes embedded; {len(ident.segments)} segments,"
+        f" {len(target)} for {match.target_team}, {len(ident.conflicts)} same-team conflicts"
     )
+    print("  labelled track time: " + ", ".join(f"{k} {v:.0f}s" for k, v in by_source.items()))
     print("  " + "  ".join(f"{k} {v:.1f}s" for k, v in timer.s.items()) + f"  total {total:.1f}s")
     gpu = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
