@@ -11,15 +11,20 @@ Conventions:
   x right, y down, with the same origin as `cv2.projectPoints` (pixel centres at integers).
 - The model is OpenCV's pinhole camera: camera frame x right, y down, z forward;
   `pc = R @ p + t` with `R = Rodrigues(rvec)`, normalised `(x, y) = pc[:2] / pc[2]`.
-- Distortion is OpenCV's five-term model `dist = (k1, k2, p1, p2, k3)`: with r^2 =
-  x^2 + y^2 and g = 1 + k1 r^2 + k2 r^4 + k3 r^6,
-  `xd = x g + 2 p1 x y + p2 (r^2 + 2 x^2)`, `yd = y g + p1 (r^2 + 2 y^2) + 2 p2 x y`,
-  then `u = fx xd + cx`, `v = fy yd + cy`. `project` equals `cv2.projectPoints`.
-  `to_field` inverts it to 1e-10 in normalised units (radial bisection, then Newton on
-  the full model), not with OpenCV's few fixed-point steps.
+- Distortion is one of two families, chosen by the calibration's lens model:
+  - polynomial (OpenCV's five-term model) `dist = (k1, k2, p1, p2, k3)`: with r^2 =
+    x^2 + y^2 and g = 1 + k1 r^2 + k2 r^4 + k3 r^6,
+    `xd = x g + 2 p1 x y + p2 (r^2 + 2 x^2)`, `yd = y g + p1 (r^2 + 2 y^2) + 2 p2 x y`;
+    `project` equals `cv2.projectPoints`.
+  - fisheye (Kannala-Brandt, OpenCV's fisheye model) `dist = (k1, k2, k3, k4)`: with
+    theta = atan(r), `(xd, yd) = (x, y) theta (1 + k1 theta^2 + k2 theta^4 + k3 theta^6
+    + k4 theta^8) / r`; `project` equals `cv2.fisheye.projectPoints`.
+  Then `u = fx xd + cx`, `v = fy yd + cy`. `to_field` inverts the lens to 1e-10 in
+  normalised units (radial bisection, then Newton on the full polynomial model), not with
+  OpenCV's few fixed-point steps.
 - The lens is used only inside its monotonic region, out to `r_fold`, the undistorted
-  radius where the radial mapping `r g(r)` stops increasing (tangential terms are small
-  and ignored there). Past it a point outside the field of view would fold back into the
+  radius where the radial mapping stops increasing (tangential terms are small and
+  ignored there). Past it a point outside the field of view would fold back into the
   image, so such points project to NaN, as do points less than 0.3 m in front of the
   camera. A pixel past the fold, or whose ray is parallel to the plane or meets it behind
   the camera, maps to NaN.
@@ -29,13 +34,14 @@ All methods are vectorised over leading dimensions and return float64 arrays.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from scout.schemas.calibration import Calibration, CameraCalibration
+from scout.schemas.calibration import FISHEYE_MODELS, Calibration, CameraCalibration
 from scout.schemas.common import ViewName
 
 F64 = NDArray[np.float64]
@@ -53,9 +59,42 @@ def dist5(dist: ArrayLike) -> tuple[float, float, float, float, float]:
     return float(d[0]), float(d[1]), float(d[2]), float(d[3]), float(d[4])
 
 
-def fold_radius(dist: ArrayLike) -> float:
-    """Undistorted normalised radius where `r * g(r)` stops increasing, or inf if it never
-    does within about 87 degrees off axis. Used by `Camera` and the calibrate stage."""
+def lens_terms(dist: ArrayLike, fisheye: bool) -> tuple[float, ...]:
+    """The coefficients of a lens family: (k1, k2, p1, p2, k3) polynomial or
+    (k1, k2, k3, k4) fisheye, from a list of up to that many terms."""
+    if not fisheye:
+        return dist5(dist)
+    src = np.asarray(dist, np.float64).reshape(-1)
+    if len(src) > 4 and np.any(src[4:] != 0.0):
+        raise ValueError(f"the fisheye model has four coefficients, got {src}")
+    d = np.zeros(4)
+    d[: min(4, len(src))] = src[:4]
+    return tuple(float(v) for v in d)
+
+
+def radial(dist: ArrayLike, fisheye: bool, r: F64) -> F64:
+    """Distorted normalised radius of undistorted radius `r` (tangential terms ignored)."""
+    if fisheye:
+        k1, k2, k3, k4 = lens_terms(dist, True)
+        th = np.arctan(r)
+        t2 = th * th
+        return th * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+    k1, k2, _, _, k3 = dist5(dist)
+    r2 = r * r
+    return r * (1 + k1 * r2 + k2 * r2**2 + k3 * r2**3)
+
+
+def fold_radius(dist: ArrayLike, fisheye: bool = False) -> float:
+    """Undistorted normalised radius where the radial mapping stops increasing, or inf if
+    it never does within about 87 degrees off axis. Used by `Camera` and the calibrate
+    stage."""
+    if fisheye:
+        k1, k2, k3, k4 = lens_terms(dist, True)
+        th = np.linspace(0.0, math.atan(_R_SEARCH_MAX), 200_001)
+        t2 = th * th
+        slope = 1 + t2 * (3 * k1 + t2 * (5 * k2 + t2 * (7 * k3 + t2 * 9 * k4)))
+        bad = np.flatnonzero(slope <= 0)
+        return float("inf") if len(bad) == 0 else math.tan(float(th[bad[0]]))
     k1, k2, _, _, k3 = dist5(dist)
     r = np.linspace(0.0, _R_SEARCH_MAX, 200_001)
     r2 = r * r
@@ -64,15 +103,16 @@ def fold_radius(dist: ArrayLike) -> float:
     return float("inf") if len(bad) == 0 else float(r[bad[0]])
 
 
-def reach_radius(dist: ArrayLike) -> float:
+def reach_radius(dist: ArrayLike, fisheye: bool = False) -> float:
     """Largest distorted normalised radius the lens reaches before it folds (inf if it never
-    folds). A pixel farther than this from the principal point maps to no ray."""
-    k1, k2, _, _, k3 = dist5(dist)
-    r = fold_radius(dist)
+    folds; a fisheye that never folds reaches its value about 87 degrees off axis). A pixel
+    farther than this from the principal point maps to no ray."""
+    r = fold_radius(dist, fisheye)
     if not np.isfinite(r):
-        return float("inf")
-    r2 = r * r
-    return float(r * (1 + k1 * r2 + k2 * r2**2 + k3 * r2**3))
+        if not fisheye:
+            return float("inf")
+        r = _R_SEARCH_MAX
+    return float(radial(dist, fisheye, np.array(r)))
 
 
 @dataclass(frozen=True)
@@ -81,8 +121,10 @@ class Camera:
 
     k: F64
     """3x3 camera matrix in full-frame pixels."""
-    dist: tuple[float, float, float, float, float]
-    """(k1, k2, p1, p2, k3)."""
+    dist: tuple[float, ...]
+    """(k1, k2, p1, p2, k3), or (k1, k2, k3, k4) when `fisheye`."""
+    fisheye: bool
+    """Kannala-Brandt fisheye lens rather than the polynomial one."""
     r: F64
     """3x3 rotation, field to camera."""
     t: F64
@@ -92,12 +134,14 @@ class Camera:
 
     @classmethod
     def from_calibration(cls, cal: CameraCalibration) -> Camera:
+        fisheye = cal.model in FISHEYE_MODELS
         return cls(
             k=np.asarray(cal.k, np.float64).reshape(3, 3),
-            dist=dist5(cal.dist),
+            dist=lens_terms(cal.dist, fisheye),
+            fisheye=fisheye,
             r=_rodrigues(np.asarray(cal.rvec, np.float64).reshape(3)),
             t=np.asarray(cal.tvec, np.float64).reshape(3),
-            r_fold=fold_radius(cal.dist),
+            r_fold=fold_radius(cal.dist, fisheye),
         )
 
     @classmethod
@@ -154,6 +198,11 @@ class Camera:
         return 1 + k1 * r2 + k2 * r2**2 + k3 * r2**3
 
     def _distort(self, x: F64, y: F64) -> tuple[F64, F64]:
+        if self.fisheye:
+            r = np.hypot(x, y)
+            safe = np.where(r > 0, r, 1.0)
+            s = np.where(r > 0, radial(self.dist, True, r) / safe, 1.0)
+            return x * s, y * s
         _, _, p1, p2, _ = self.dist
         r2 = x * x + y * y
         g = self._gain(r2)
@@ -162,19 +211,23 @@ class Camera:
         ) + 2 * p2 * x * y
 
     def _undistort(self, xd: F64, yd: F64) -> tuple[F64, F64]:
-        """Invert `_distort`: exact radial inverse by bisection on [0, r_fold), then Newton
-        steps on the full model. NaN past the fold's reach or where Newton fails."""
-        k1, k2, p1, p2, k3 = self.dist
+        """Invert `_distort`: exact radial inverse by bisection on [0, r_fold), then (for
+        the polynomial model) Newton steps on the full model. NaN past the fold's reach or
+        where Newton fails."""
         hi_r = min(self.r_fold, _R_SEARCH_MAX)
-        reach = hi_r * float(self._gain(np.array(hi_r * hi_r)))
+        reach = float(radial(self.dist, self.fisheye, np.array(hi_r)))
         rd = np.hypot(xd, yd)
         lo, hi = np.zeros_like(rd), np.full_like(rd, hi_r)
         for _ in range(60):
             mid = 0.5 * (lo + hi)
-            below = mid * self._gain(mid * mid) < rd
+            below = radial(self.dist, self.fisheye, mid) < rd
             lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
         scale = np.where(rd > 0, 0.5 * (lo + hi) / np.where(rd > 0, rd, 1.0), 1.0)
         x, y = xd * scale, yd * scale
+        if self.fisheye:
+            good = (rd < reach) & (np.hypot(x, y) < self.r_fold)
+            return np.where(good, x, np.nan), np.where(good, y, np.nan)
+        k1, k2, p1, p2, k3 = self.dist
         for _ in range(20):
             ex, ey = self._distort(x, y)
             ex, ey = ex - xd, ey - yd
