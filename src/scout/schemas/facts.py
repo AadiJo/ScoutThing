@@ -134,7 +134,7 @@ class PhaseFact(_Fact):
 # --- coverage gaps --------------------------------------------------------------
 
 GapCause = Literal["match_start", "match_end", "track_ended", "label_ended", "label_conflict"]
-GapInference = Literal["stayed_in_place", "in_own_zone_beyond_barrier"]
+GapInference = Literal["stayed_in_place", "in_own_zone_beyond_barrier", "entered_own_zone"]
 
 
 class NearInGap(_Model):
@@ -167,7 +167,10 @@ class GapData(_Model):
     measurement. `stayed_in_place`: at most BRIDGE_MAX_S long and `before` and `after` at most
     BRIDGE_M apart, so it very probably stayed there. `in_own_zone_beyond_barrier`: last seen
     on or at its own barrier driving toward its own wall and next seen at the same barrier
-    driving away from it, so it very probably spent the gap in its own zone. None: unknown."""
+    driving away from it, so it very probably spent the gap in its own zone.
+    `entered_own_zone`: at least OWN_INFER_MIN_S long, last seen on or at its own barrier
+    driving toward its own wall and next seen in its own zone, so it very probably crossed
+    home just after it was last seen. None: unknown."""
     others_near: list[NearInGap]
     """Other tracked robots near the target's last-seen or next-seen position during the gap
     (unlabelled tracks closer than SAME_ROBOT_M are left out: they are probably the target
@@ -315,6 +318,11 @@ class CrossingTurnedBackData(_Model):
     """Untracked time on the band that was bridged (robot at nearly the same place either
     side)."""
     min_speed_mps: float | None
+    slowest_mps: float | None
+    """Lowest speed on the band, from entering to leaving it, read on the filled path (a
+    bridged gap counts as the straight line across it, so a stall hidden in one reads slow);
+    None when no speed could be read. A drive past reads at driving pace; a stall or a
+    reversal reads slow."""
     far_side_t: float | None
     """First tracked time in `far_side` (off the barrier) after turning back; None if never
     before the match ended."""
@@ -657,7 +665,7 @@ FactKind = Literal[
 class Facts(StageFile):
     """All facts for one team, sorted by `t_start`, plus match-wide coverage."""
 
-    schema_version: Literal[4] = 4
+    schema_version: Literal[5] = 5
     team: int
     alliance: Alliance
     clock_rate: float

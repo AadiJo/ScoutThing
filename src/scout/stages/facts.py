@@ -856,15 +856,12 @@ def _inference(ctx: Ctx, g: GapSpan) -> GapInference | None:
         return on is not None and on[0] == ctx.alliance
 
     vin, vout = _heading(ctx, g.before, True), _heading(ctx, g.after, False)
-    if (
-        at_own(g.before)
-        and at_own(g.after)
-        and vin is not None
-        and vout is not None
-        and vin >= HEADING_MPS
-        and vout <= -HEADING_MPS
-    ):
+    if not at_own(g.before) or vin is None or vin < HEADING_MPS:
+        return None
+    if at_own(g.after) and vout is not None and vout <= -HEADING_MPS:
         return "in_own_zone_beyond_barrier"
+    if ctx.raw_zone(float(p.x[g.after])) == "own":
+        return "entered_own_zone"
     return None
 
 
@@ -1387,6 +1384,7 @@ def _crossing_facts(
         on = _in_span(ctx, a.t_in, a.t_out)
         fidx = _f_span(ctx, a.t_in, a.t_out)
         stopped, _ = _f_still_s(ctx, fidx, STOP_MPS)
+        fsp = ctx.filled.speed[fidx]
         sp = p.speed[on]
         near = [d for i in on.tolist() for d, _ in _nearest(ctx, i)[:1]]
         d_min = min(ps.nearest_edge_m for ps in a.passes)
@@ -1405,6 +1403,7 @@ def _crossing_facts(
             stopped_s=_r(stopped),
             unseen_s=_r(int((ctx.filled.src[fidx] < 0).sum()) * ctx.dt),
             min_speed_mps=_ro(float(np.nanmin(sp)) if np.isfinite(sp).any() else None),
+            slowest_mps=_ro(float(np.nanmin(fsp)) if np.isfinite(fsp).any() else None),
             far_side_t=_ro(reached),
             far_side_after_gap=arrive is not None and arrive > 0 and not bool(p.link[arrive - 1]),
             seconds_to_far_side=None if reached is None else _r(reached - a.t_in),

@@ -3,16 +3,18 @@
 Before the grader runs, code builds two ledgers from facts.json: the driving ledger (every
 turned-back attempt toward home, stop or stay on a barrier, slow crossing and trip out of its
 own zone in its own active time, with the active seconds it could cost) and the readiness
-ledger (every real hub activation, with how late the target was). It also lists the defense
-items: every teleop contact with a robot not known to be a partner, and every gap or inferred
-stop in the target's own active time with such a robot near.
+ledger (every real hub activation, with how late the target was). Each barrier and readiness
+line carries a default ruling that code computed from measured features, and the rule that
+set it. Code also lists the defense items: every teleop contact with a robot not known to be
+a partner, and every gap or inferred stop in the target's own active time with such a robot
+near.
 
-A coding agent writes `GradeAnswer` (its JSON schema is handed to `claude --json-schema`):
-one call per ledger line (charged or not, and why; a hopper reading for each trip), defense
-episodes that account for every defense item, the three scores, notes and an auto report. The
-stage checks it, computes each line's charged seconds and each episode's cost, and from them
-each skill's band (the score must sit inside it), resolves the `{...}` references in the text,
-and wraps it into `Grade`.
+A coding agent writes `GradeAnswer` (its JSON schema is handed to `claude --json-schema`): a
+hopper reading for each trip, an overrule only where a tile shows a checkable contradiction
+of a default, defense episodes that account for every defense item, a summary per skill,
+notes and an auto report. The stage checks it, computes each line's charged seconds, each
+episode's cost and each skill's score, resolves the `{...}` references in the text, and wraps
+it into `Grade`.
 
 Citations (`cites`) are fact ids from facts.json (`stop-03`) or `frame:<video seconds>`
 for a moment the frame tool really served (`frame:92.8`). Free text may not contain numbers:
@@ -23,9 +25,9 @@ rest.
 
 from __future__ import annotations
 
-from typing import Literal, Self
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from scout.schemas.common import StageFile
 
@@ -41,6 +43,9 @@ number comes from a `{...}` reference to a fact field, a ledger field or a serve
 View = Literal["target", "full", "corner_left", "corner_right"]
 """Frame tool views: a crop of the main camera around the target, the whole main camera, or
 one of the two uncalibrated corner camera panels (no ring, no boxes)."""
+Ruling = Literal["charged", "cleared"]
+"""A ledger line's default: `charged` costs its `lost_s` (readiness: `late_s`), `cleared`
+costs nothing."""
 
 
 class _Model(BaseModel):
@@ -67,15 +72,19 @@ class DrivingLine(_Model):
     lost_s: float
     """Barrier lines: seconds of its own active time the line costs when charged (a
     turned-back attempt's `own_active_s`, a stop's `own_active_s`, the active part of a stay's
-    or slow crossing's `excess_s`). `loaded_trip`: the trip's seconds out of its own zone in
-    its own active time, the most it could cost."""
+    or slow crossing's `excess_s`); a turned-back attempt's less the lateness a readiness line
+    already charges.
+    `loaded_trip`: the trip's seconds out of its own zone in its own active time, the most it
+    could cost."""
     bound: bool
     """True when `lost_s` is an upper bound: the arrival home was first seen after a gap."""
     unseen_s: float
     """Part of the line's time inferred across tracking gaps."""
-    corner_reach: bool
-    """A turned-back attempt where only a corner of the robot could have touched the
-    barrier: it may be a curving drive past it with no stall."""
+    default: Ruling
+    """What the line costs unless the grader overrules it on a tile. `loaded_trip` lines are
+    `cleared` until a hopper reading charges them."""
+    why: str
+    """The measured features and thresholds that set `default`."""
     look_at: list[float]
     """`loaded_trip` only: the tile times at which to read the hopper (served at zoom 2)."""
     opponent_contacts: list[str]
@@ -102,6 +111,10 @@ class ReadinessLine(_Model):
     late_is_bound: bool
     """True when the arrival was first seen after a gap, so it was at most `late_s` late."""
     never_home: bool
+    default: Ruling
+    """`cleared` when tracked in its own zone, or untracked inside a gap whose `inference`
+    puts it there; otherwise `charged` (`late_s`)."""
+    why: str
     text: str
 
 
@@ -112,68 +125,70 @@ class DefenseItem(_Model):
     t_start: float
     t_end: float
     home_active: bool
-    """The target was in its own zone during its own active time: an opponent pressing it
-    there costs only its pin time (`pin_s`), never route time."""
+    """The target was in its own zone during its own active time."""
     pin_s: float
     """Seconds the target was nearly still in this item (inferred still time counted half);
-    an episode's pin cost is its items' sum beyond the rubric's allowance."""
+    held time beyond the rubric's allowance costs."""
     text: str
 
 
 # --- the agent's answer -----------------------------------------------------------------
 
 Call = Literal[
-    "charged",
     "opponent",
     "partner",
-    "frame_contradicts",
-    "uncertain",
+    "misplaced",
+    "home_earlier",
+    "not_home",
     "heaped",
     "not_heaped",
     "cannot_see",
 ]
-"""Barrier and readiness lines: `charged` (self-inflicted), `opponent` (an opponent held it;
-needs an overlapping `opponent_on_target` episode), `partner` (its own partner was in the way;
-barrier lines only, needs a tile and a partner contact), `frame_contradicts` (a tile shows the
-facts' shape is wrong), `uncertain` (the evidence cannot decide; counts half).
-`loaded_trip` lines: `heaped` (a tile shows a heaped hopper; `heaped_at` says from when),
-`not_heaped` (empty or part full on the trip's late tiles), `cannot_see` (the hopper cannot
-be read on any tile), or `frame_contradicts`."""
+"""Overrules of a barrier or readiness line's default, each needing a checkable contradiction:
+`opponent` (an opponent held or blocked it; needs a contact inside the line in an
+`opponent_on_target` episode; the line's seconds from that contact on move to the defense
+score), `partner` (barrier lines: its own partner was
+in the way; needs a tile and a partner contact), `misplaced` (barrier lines charged by
+default: ringed tiles show the facts put the target in the wrong place, or the ring on another
+robot), `home_earlier` (a line whose time is an upper bound: a tile shows it home sooner;
+`charged_s` gives the seconds), `not_home` (readiness lines cleared by a gap inference: a tile
+at the activation shows it out of its zone). `loaded_trip` lines (always called): `heaped`
+(`heaped_at` says from when), `not_heaped` (empty or part full on its late tiles) or
+`cannot_see`."""
 
 
 class LineCall(_Model):
-    """The grader's decision on one ledger line."""
+    """The grader's decision on one ledger line: every trip, and only the barrier and
+    readiness lines whose default it overrules."""
 
     line: str = Field(description="Ledger line id, e.g. D1 or R2.")
     call: Call
     charged_s: float | None = Field(
         default=None,
         ge=0.0,
-        description="Barrier lines whose lost_s is an upper bound only: the seconds from the "
-        "line's start to a cited tile that shows the target home, when that is earlier. Null "
-        "charges lost_s.",
+        description="home_earlier only: seconds from the line's start (readiness: the "
+        "activation) to the cited tile that shows the target home.",
     )
     heaped_at: float | None = Field(
         default=None,
-        description="heaped only: video time of the earliest cited tile in the trip where the "
-        "hopper is heaped.",
+        description="heaped only: video time of the earliest cited tile in the trip from "
+        "which every later hopper tile is heaped.",
     )
     corner_bumper: int | None = Field(
         default=None,
         description="Required when the call cites a corner camera tile: the target's bumper "
         "number as you read it there.",
     )
-    text: Text = Field(description="One sentence: what the evidence shows.")
+    text: Text = Field(description="One sentence: what the tiles show.")
     cites: Cites
 
 
 Verdict = Literal["opponent_on_target", "target_on_opponent", "partner", "apart", "could_not_tell"]
 IdentifiedBy = Literal["track_label", "bumper_number", "bumper_red", "bumper_blue", "none"]
-WhileHeld = Literal["not_shooting", "shooting", "cannot_see"]
 
 
 class DefenseEpisode(_Model):
-    """One episode that accounts for one or more defense items."""
+    """One episode that accounts for one or more defense items. Its cost is computed by code."""
 
     facts: list[str] = Field(min_length=1, description="Defense item fact ids it covers.")
     verdict: Verdict
@@ -183,36 +198,16 @@ class DefenseEpisode(_Model):
         "bumper_number: you read the number on a cited tile. bumper_red / bumper_blue: you saw "
         "a clearly red or blue bumper on a cited tile. none: not identified."
     )
-    cost_s: float = Field(
-        ge=0.0,
-        description="opponent_on_target only: seconds the opponent cost it in getting home or "
-        "onto its route (0 when it kept its route, and 0 when home in its own active time). "
-        "Pin time is computed by code from pin_s and while_held. 0 for every other verdict.",
-    )
-    while_held: WhileHeld | None = Field(
-        default=None,
-        description="opponent_on_target with pin_s in its items: what the tiles across the "
-        "still stretch show. Null otherwise.",
-    )
     text: Text
     cites: Cites = Field(min_length=1)
 
 
-class SkillGrade(_Model):
-    """One skill on the absolute scale. `score` is None when the evidence cannot support
-    one, and then `null_reason` says why."""
+class SkillSummary(_Model):
+    """Why one skill scored what code computed."""
 
     skill: SkillName
-    score: int | None = Field(ge=1, le=10)
-    null_reason: Text | None
-    summary: Text = Field(description="Two or three plain sentences on why this score.")
+    summary: Text = Field(description="Two or three plain sentences on what drove this skill.")
     cites: Cites = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _reason_iff_null(self) -> Self:
-        if (self.score is None) != (self.null_reason is not None):
-            raise ValueError("null_reason is required exactly when score is null")
-        return self
 
 
 class AgentNote(_Model):
@@ -239,11 +234,14 @@ class AutoReport(_Model):
 class GradeAnswer(_Model):
     """The agent's whole answer."""
 
-    line_calls: list[LineCall] = Field(description="Exactly one per ledger line.")
+    line_calls: list[LineCall] = Field(
+        description="One per loaded_trip line, plus one per barrier or readiness line whose "
+        "default you overrule."
+    )
     episodes: list[DefenseEpisode] = Field(
         description="Together they cover every defense item fact id."
     )
-    skills: list[SkillGrade] = Field(min_length=3, max_length=3)
+    skills: list[SkillSummary] = Field(min_length=3, max_length=3)
     notes: list[AgentNote] = Field(min_length=1)
     auto: AutoReport
 
@@ -251,28 +249,43 @@ class GradeAnswer(_Model):
 # --- grade.json -------------------------------------------------------------------------
 
 
-class ScoredSkill(SkillGrade):
-    """A skill in grade.json: the agent's grade plus the band the stage computed."""
+class ScoredSkill(SkillSummary):
+    """A skill in grade.json: the agent's summary plus the score code computed."""
 
+    score: int | None
+    """1-10 from the charged seconds (see rubric.md); None when the rubric requires it."""
     band: tuple[int, int] | None
-    """Lowest and highest score the rubric allows from the calls and episodes; None when the
-    score must be null."""
+    """The rubric's two-score band around `score`; None when `score` is None."""
+    null_reason: str | None
+    """Why `score` is None."""
 
 
-class ScoredCall(LineCall):
-    """A line call in grade.json, with the seconds code charged for it."""
+class ScoredCall(_Model):
+    """One ledger line's outcome in grade.json: its default, the grader's call if any, and the
+    seconds code charged."""
 
+    line: str
+    default: Ruling
+    call: Call | None
+    """The grader's call; None when it kept the default."""
     charged_total_s: float
-    """Seconds this call adds to the driving total or is the readiness lateness."""
+    """Seconds this line adds to the driving total, or the readiness lateness."""
+    charged_s: float | None = None
+    heaped_at: float | None = None
+    corner_bumper: int | None = None
+    text: str
+    """The grader's sentence, or the default's rule when it kept the default."""
+    cites: Cites
 
 
 class ScoredEpisode(DefenseEpisode):
     """An episode in grade.json, with its cost as code computed it."""
 
     pin_cost_s: float
-    """Its items' `pin_s` beyond the allowance, scaled by `while_held`."""
+    """Its share of held still time beyond the allowance (see rubric.md)."""
     total_cost_s: float
-    """The larger of `cost_s` and `pin_cost_s`: what the defense score counts."""
+    """`pin_cost_s` plus the seconds of barrier lines called `opponent` from its first contact
+    in them: what the defense score counts."""
 
 
 class Note(AgentNote):
@@ -339,7 +352,7 @@ class Grade(StageFile):
     """The grade for the target team. Auto is reported but not scored. Text fields have
     their `{...}` references resolved."""
 
-    schema_version: Literal[4] = 4
+    schema_version: Literal[5] = 5
     team: int
     rubric_version: str
     skills: list[ScoredSkill]

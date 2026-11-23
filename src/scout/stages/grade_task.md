@@ -13,14 +13,14 @@ The corner camera panel showing its own end: {{home_view}}
 
 # Driving ledger
 
-One call per line. A barrier line's `lost_s` is what it costs when charged; a `loaded_trip`
-line is costed from its hopper tiles (see the rubric).
+Each barrier line's DEFAULT stands unless you overrule it on a tile (see the rules); a charged
+line costs its `lost_s`. Each `loaded_trip` line needs a hopper call from its HOPPER TILES.
 
 {{driving_ledger}}
 
 # Readiness ledger
 
-One call per line. `late_s` is what a charged line costs.
+Each DEFAULT stands unless you overrule it on a tile; a charged line costs `late_s`.
 
 {{readiness_ledger}}
 
