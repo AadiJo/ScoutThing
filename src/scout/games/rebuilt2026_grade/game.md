@@ -23,7 +23,8 @@ Cut down from the scouting guide to what robot positions and video frames can sh
   loaded when your hub turns on. Being away from home when your hub is active is a mistake
   only if the robot could have got home and chose not to. If it was blocked, that is the
   defender's doing.
-- Leaving home during an active shift to reload is good play, not a mistake.
+- Leaving home during an active shift to get more fuel can be good play; from positions it
+  looks the same as a wasted trip.
 - AUTO is the robot's code: the drive team does not control it. A robot may not completely
   cross the centre line in auto.
 - Defense is legal. PINNING an opponent for more than 3 s is a foul. Contact is common.
