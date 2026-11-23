@@ -47,12 +47,18 @@ from scout.games.rebuilt2026 import (
     BARRIER_X,
     CENTER_LINE_X_M,
     FIELD_LENGTH_M,
+    HUBS,
     ROBOT_FOOTPRINT_M,
-    TRENCHES,
+    ROBOT_HALF_DIAGONAL_M,
     Lane,
     PhaseName,
     Zone,
     barrier_at,
+    barrier_edge_m,
+    guardrail_m,
+    lane_at,
+    own_wall_m,
+    rect_distance_m,
     zone_of,
 )
 from scout.run import RunDir, Stage
@@ -65,6 +71,7 @@ from scout.schemas.facts import (
     ContactData,
     ContactEnd,
     ContactFact,
+    CostEnd,
     Coverage,
     CrossingData,
     CrossingFact,
@@ -86,6 +93,7 @@ from scout.schemas.facts import (
     PhaseData,
     PhaseFact,
     Place,
+    Reach,
     Relation,
     Seen,
     SpeedWindow,
@@ -96,6 +104,7 @@ from scout.schemas.facts import (
     TripData,
     TripFact,
     Waypoint,
+    Where,
     ZoneVisitData,
     ZoneVisitFact,
 )
@@ -121,15 +130,30 @@ STOP_MIN_S = 2.0
 ZONE_HYST_M = 0.3
 """A zone change needs the centre this far past the line: 0.2 m accuracy plus margin, so
 jitter on a line is one visit."""
+ZONE_DWELL_S = 1.0
+"""Or this long on the other side of the line, so a robot parked just inside a line (the
+audit's shooter sat 0.09 m inside its zone for 6 s) is on the side it is on."""
 BAND_MARGIN_M = 0.2
-"""The barrier band is the bumps' depth plus this on each side (position accuracy), so a
-robot riding a ramp's edge counts as on it while one beside the hub face does not."""
+"""The centre is on a trench (or the opponent's barrier) within this of its depth: position
+accuracy. Trenches are flat floor under an arm, so only the centre's place matters there."""
+CORNER_M = ROBOT_HALF_DIAGONAL_M
+"""On the neutral face of its own bumps (the climb home) the band reaches this far: a corner
+can touch the ramp from here if the robot is turned. The audit's nose-on-ramp stall read
+0.66 m (partial boxes, robot diagonal in frame); 0.475 m catches 3 of the 4 frame-checked
+stalls, this all 4 plus 4 frame-checked nose-in-and-back touches the human did not list."""
+BAND_HYST_M = 0.2
+"""Going back to the side it came from needs the centre this far clear of the band (position
+accuracy), so a robot sitting on the band's edge is one attempt, not a flicker of them."""
 PERCH_M = ROBOT_FOOTPRINT_M / 2
-"""Centre within this of the bumps' depth puts part of the robot over the bump or trench;
-the audit's perched robot read 0.27 to 0.31 m past the bump end with its frame on the ramp."""
+"""Centre within this of the bumps' depth puts part of the robot over them whatever its
+heading (`reach` `footprint`)."""
 PERCH_MIN_S = 2.5
-"""A barrier stay this long is its own visit: a clean crossing of the perch area (2.1 m)
-takes about 1 s, a slow one 2 s."""
+"""A barrier stay this long is its own visit: a clean pass across the band takes 0.5 to 1 s,
+a slow one 2 s."""
+NORMAL_CROSSING_S = 1.2
+"""Slowest normal pass across the band: 90% of 71 clean seen dev crossings took at most
+1.06 s (own bumps median 0.77 s), plus margin. Time beyond it is `excess_s`; each 0.1 s
+changes every excess by 0.1 s."""
 BRIDGE_MAX_S = 6.0
 """Longest gap that can be bridged: the audit's pinned and stalled robots went unseen for
 1.4 to 5 s, and leaving and coming back to the same spot takes longer than this."""
@@ -138,9 +162,11 @@ BRIDGE_M = 0.5
 NEVER_CLEARED_M = PERCH_M
 """A crossing whose far side stayed within this of the bumps' far end before it came back
 never got off the barrier (same as PERCH_M)."""
-REROUTE_MAX_S = 8.0
-"""A crossing this soon after turning back is the way round; later, it went elsewhere first.
-The audit's reroutes took 2.6 to 3.1 s from turning back."""
+STILL_MPS = 0.4
+"""Nearly still in a contact: a pinned robot pushing back read 0.1 to 0.3 m/s; slow
+collecting is 0.5 m/s and up."""
+STILL_WINDOW_S = 1.0
+"""Window for that speed, so 0.2 m position noise reads at most 0.3 m/s."""
 CONTACT_M = 1.6
 """Centre distance for a contact: touching robots are 0.95 m (side by side) to 1.34 m
 (corner to corner) apart, plus 0.2 m accuracy on each."""
@@ -170,7 +196,8 @@ TRIP_MIN_S = 2.0
 SLOW_MPS = 0.8
 """Slow stretch on a trip: below driving pace (1.5 m/s and up), above slow collecting."""
 HEADING_MPS = 0.5
-"""A gap edge counts as driving toward or away from the own wall above this speed."""
+"""A gap edge counts as driving toward or away from the own wall above this speed; a pass
+that only a corner could have touched counts only when driving toward the bumps this fast."""
 NEAR_BARRIER_M = 1.5
 """A gap edge this close to the own barrier's depth counts as at the barrier."""
 OWN_INFER_MIN_S = 2.0
@@ -182,13 +209,18 @@ THRESHOLDS: dict[str, float] = {
     "STOP_MPS": STOP_MPS,
     "STOP_MIN_S": STOP_MIN_S,
     "ZONE_HYST_M": ZONE_HYST_M,
+    "ZONE_DWELL_S": ZONE_DWELL_S,
     "BAND_MARGIN_M": BAND_MARGIN_M,
+    "CORNER_M": CORNER_M,
+    "BAND_HYST_M": BAND_HYST_M,
     "PERCH_M": PERCH_M,
     "PERCH_MIN_S": PERCH_MIN_S,
+    "NORMAL_CROSSING_S": NORMAL_CROSSING_S,
     "BRIDGE_MAX_S": BRIDGE_MAX_S,
     "BRIDGE_M": BRIDGE_M,
     "NEVER_CLEARED_M": NEVER_CLEARED_M,
-    "REROUTE_MAX_S": REROUTE_MAX_S,
+    "STILL_MPS": STILL_MPS,
+    "STILL_WINDOW_S": STILL_WINDOW_S,
     "CONTACT_M": CONTACT_M,
     "CONTACT_BRIDGE_S": CONTACT_BRIDGE_S,
     "CONTACT_GAP_MAX_S": CONTACT_GAP_MAX_S,
@@ -294,6 +326,8 @@ class Ctx:
     """Every track's frames, for telling a lost track from a dropped label."""
     team_share: dict[int, float]
     """Share of sampled match frames with a track labelled as each roster team."""
+    active: list[tuple[float, float]]
+    """Teleop spans with the own hub active, merged (auto is the robot's code)."""
     place: list[Place] = field(default_factory=list[Place])
     """Per path sample: its zone, or `on_barrier` inside a barrier stay of PERCH_MIN_S."""
     perch: dict[int, tuple[Barrier, Lane]] = field(default_factory=dict[int, tuple[Barrier, Lane]])
@@ -312,6 +346,47 @@ class Ctx:
     def toward_own(self, dx: float) -> float:
         """A field-x displacement as a displacement toward the target's own wall."""
         return -dx if self.alliance == "blue" else dx
+
+    def band_edges(self, barrier: Barrier, y: float) -> tuple[float, float] | None:
+        """Field-x extent of `barrier`'s band at y; None beside a hub face. The band is the
+        bumps' depth widened by BAND_MARGIN_M, by CORNER_M on the neutral face of the own
+        bumps, and cut at the own zone line: a centre in its own zone is in its own zone."""
+        lane = lane_at(y)
+        if lane is None:
+            return None
+        x0, x1 = BARRIER_X[barrier]
+        if barrier != self.alliance:
+            return x0 - BAND_MARGIN_M, x1 + BAND_MARGIN_M
+        reach = CORNER_M if lane == "bump" else BAND_MARGIN_M
+        line = ALLIANCE_ZONE_DEPTH_M
+        if barrier == "blue":
+            return line, x1 + reach
+        return x0 - reach, FIELD_LENGTH_M - line
+
+    def band(self, x: float, y: float) -> tuple[Barrier, Lane] | None:
+        """The barrier band (see `band_edges`) and lane under (x, y), if any."""
+        for barrier in ALLIANCES:
+            edges = self.band_edges(barrier, y)
+            if edges is not None and edges[0] <= x <= edges[1]:
+                lane = lane_at(y)
+                assert lane is not None
+                return barrier, lane
+        return None
+
+    def where(self, x: float, y: float) -> Where:
+        return Where(
+            x=_r(x),
+            y=_r(y),
+            zone=self.raw_zone(x),
+            into_own_zone_m=_r(ALLIANCE_ZONE_DEPTH_M - own_wall_m(x, self.alliance)),
+            own_hub_m=_r(rect_distance_m(HUBS[self.alliance], x, y)),
+            own_wall_m=_r(own_wall_m(x, self.alliance)),
+            guardrail_m=_r(guardrail_m(y)),
+        )
+
+    def active_s(self, a: float, b: float) -> float:
+        """Seconds of [a, b] in teleop time with the own hub active."""
+        return sum(max(0.0, min(b, e) - max(a, s)) for s, e in self.active)
 
 
 def _load(run: RunDir) -> Ctx:
@@ -380,7 +455,7 @@ def _load(run: RunDir) -> Ctx:
         link=link,
         bridged=bridged,
         speed=speed,
-        zone=_zones(x, link, match.target_alliance),
+        zone=_zones(t, x, link, match.target_alliance),
     )
 
     by_frame: dict[int, list[tuple[int, float, float]]] = {}
@@ -438,6 +513,7 @@ def _load(run: RunDir) -> Ctx:
         conflicts=conflicts,
         track_frames=track_frames,
         team_share=team_share,
+        active=_own_active_spans(match),
     )
     place, perch = _places(ctx)
     ctx.place.extend(place)
@@ -493,26 +569,37 @@ def _fill(p: Path, step: int, fps: float, rate: float) -> Filled:
     )
 
 
-def _zones(x: F64, link: B, alliance: Alliance) -> list[Zone]:
+def _zones(t: F64, x: F64, link: B, alliance: Alliance) -> list[Zone]:
     """Zone per sample with ZONE_HYST_M hysteresis, restarting after every gap: the zone
-    changes only when the centre is clear of the line on both sides of the margin."""
+    changes when the centre is clear of the line by the margin, or has stayed on the other
+    side of it for ZONE_DWELL_S (then from where that stay began)."""
     out: list[Zone] = []
     cur: Zone = "neutral"
+    since: int | None = None
     for i, xi in enumerate(x.tolist()):
+        raw = zone_of(xi, alliance)
         lo, hi = zone_of(xi - ZONE_HYST_M, alliance), zone_of(xi + ZONE_HYST_M, alliance)
         if i == 0 or not link[i - 1]:
-            cur = zone_of(xi, alliance)
+            cur, since = raw, None
         elif lo == hi:
-            cur = lo
+            cur, since = lo, None
+        elif raw == cur:
+            since = None
+        elif since is None or zone_of(float(x[since]), alliance) != raw:
+            since = i
         out.append(cur)
+        if since is not None and t[i] - t[since] >= ZONE_DWELL_S - 1e-6:
+            fill: list[Zone] = [raw] * (i - since + 1)
+            out[since:] = fill
+            cur, since = raw, None
     return out
 
 
 def _places(ctx: Ctx) -> tuple[list[Place], dict[int, tuple[Barrier, Lane]]]:
     """Each sample's zone, replaced by `on_barrier` inside stays of PERCH_MIN_S or more on
-    one barrier's perch area (filled path, so a stay survives a bridged gap)."""
+    one barrier's band (filled path, so a stay survives a bridged gap)."""
     p, f = ctx.path, ctx.filled
-    on = [barrier_at(float(x), float(y), PERCH_M) for x, y in zip(f.x, f.y, strict=True)]
+    on = [ctx.band(float(x), float(y)) for x, y in zip(f.x, f.y, strict=True)]
     place: list[Place] = list(p.zone)
     perch: dict[int, tuple[Barrier, Lane]] = {}
     mask = np.array([o is not None for o in on], np.bool_)
@@ -929,6 +1016,8 @@ def _visit_facts(ctx: Ctx, visits: list[Visit]) -> list[Fact]:
             went_to=went,
             path_length_m=_r(length, 1),
             mean_speed_mps=_r(length / dur * ctx.rate) if dur > 0 else None,
+            excess_s=_r(max(0.0, dur - NORMAL_CROSSING_S)) if perch else None,
+            own_active_s=_r(ctx.active_s(float(p.t[v.first]), float(p.t[v.last]))),
         )
         out.append(
             ZoneVisitFact.model_validate(
@@ -960,6 +1049,8 @@ class Pass:
     y_m: float
     from_zone: Zone | None
     to_zone: Zone | None
+    nearest_edge_m: float
+    """Closest the centre came to the bumps' or trench's depth along x."""
     data: dict[str, object]
     """The other `CrossingData` fields."""
 
@@ -993,18 +1084,47 @@ def _edge_time(ctx: Ctx, out_i: int, in_i: int, edge: float) -> float:
     return float(p.t[out_i] + f * (p.t[in_i] - p.t[out_i]))
 
 
+def _band_sides(ctx: Ctx, barrier: Barrier, meas: I64) -> I64:
+    """Per measured sample: 0 on `barrier`'s band, else -1 or +1 for the low-x or high-x
+    side. Leaving back to the side it came from needs the centre BAND_HYST_M clear."""
+    p = ctx.path
+    x0, x1 = BARRIER_X[barrier]
+    mid = (x0 + x1) / 2
+    out = np.zeros(len(meas), np.int64)
+    entry = 0
+    for k, i in enumerate(meas.tolist()):
+        x, s = float(p.x[i]), -1 if p.x[i] < mid else 1
+        e = ctx.band_edges(barrier, float(p.y[i]))
+        linked = k > 0 and p.t[i] - p.t[meas[k - 1]] <= GAP_S + 1e-6
+        on_before = linked and out[k - 1] == 0
+        inside = e is not None and e[0] <= x <= e[1]
+        if not inside and on_before and e is not None and s == entry:
+            inside = e[0] - BAND_HYST_M <= x <= e[1] + BAND_HYST_M
+        if inside and not on_before:
+            entry = int(out[k - 1]) if linked else 0
+        out[k] = 0 if inside else s
+    return out
+
+
+def _edge_x(ctx: Ctx, barrier: Barrier, i: int, side: int) -> float:
+    """Field x of `barrier`'s band edge on `side` at path sample i's y."""
+    e = ctx.band_edges(barrier, float(ctx.path.y[i]))
+    x0, x1 = BARRIER_X[barrier]
+    lo, hi = e if e is not None else (x0 - BAND_MARGIN_M, x1 + BAND_MARGIN_M)
+    return lo if side < 0 else hi
+
+
 def _passes(ctx: Ctx) -> tuple[list[Pass], list[GapPass]]:
     """Bump and trench passes judged from measured samples only. A pass is a run of boxes
-    on a barrier band; its sides are the nearest boxes before and after it, even across a
-    gap. Two boxes on opposite sides with none on the band between are a crossing in a
-    gap. Returns (passes, crossings in gaps), each in time order with ids."""
+    on a barrier band (`Ctx.band_edges`); its sides are the nearest boxes before and after
+    it, even across a gap. Two boxes on opposite sides with none on the band between are a
+    crossing in a gap. Returns (passes, crossings in gaps), each in time order with ids."""
     p = ctx.path
     meas = np.flatnonzero(p.measured)
     seen: list[Pass] = []
     gap: list[tuple[float, float, CrossingInGapData]] = []
-    for barrier, (x0, x1) in BARRIER_X.items():
-        lo, hi = x0 - BAND_MARGIN_M, x1 + BAND_MARGIN_M
-        side = np.where(p.x[meas] < lo, -1, np.where(p.x[meas] > hi, 1, 0))
+    for barrier in ALLIANCES:
+        side = _band_sides(ctx, barrier, meas)
         j = 0
         while j < len(meas):
             if side[j] != 0:
@@ -1044,12 +1164,12 @@ def _passes(ctx: Ctx) -> tuple[list[Pass], list[GapPass]]:
             entry_ok = entry_unseen is not None and entry_unseen <= GAP_S + 1e-6
             exit_ok = exit_unseen is not None and exit_unseen <= GAP_S + 1e-6
             t_in = (
-                _edge_time(ctx, prev, first, lo if side[s - 1] < 0 else hi)
+                _edge_time(ctx, prev, first, _edge_x(ctx, barrier, prev, int(side[s - 1])))
                 if entry_ok and prev is not None
                 else float(p.t[first])
             )
             t_out = (
-                _edge_time(ctx, last, nxt, lo if side[e + 1] < 0 else hi)
+                _edge_time(ctx, last, nxt, _edge_x(ctx, barrier, nxt, int(side[e + 1])))
                 if exit_ok and nxt is not None
                 else float(p.t[last])
             )
@@ -1062,19 +1182,26 @@ def _passes(ctx: Ctx) -> tuple[list[Pass], list[GapPass]]:
             on = _in_span(ctx, t_in, t_out)
             sp = p.speed[on]
             y_med = float(np.median(p.y[meas[s : e + 1]]))
-            trench = any(r.y0 <= y_med <= r.y1 and r.x0 == x0 for r in TRENCHES)
             span = max(t_out - t_in, ctx.dt)
             measured_s = min(span, int(p.measured[on].sum()) * ctx.dt)
+            whole = _r(span) if entry_ok and exit_ok else None
             data: dict[str, object] = {
                 "entry_unseen_s": _ro(entry_unseen),
                 "exit_unseen_s": _ro(exit_unseen),
-                "time_on_barrier_s": _r(span) if entry_ok and exit_ok else None,
+                "time_on_barrier_s": whole,
                 "observed_s": _r(span),
                 "stopped_s": _r(int((sp < STOP_MPS).sum()) * ctx.dt),
                 "min_speed_mps": _ro(float(np.nanmin(sp)) if np.isfinite(sp).any() else None),
                 "mean_speed_mps": _ro(_mean(sp)),
                 "measured_s": _r(measured_s),
+                "excess_s": _r(max(0.0, span - NORMAL_CROSSING_S)),
+                "own_active_s": _r(ctx.active_s(t_in, t_out)),
             }
+            nearest = min(barrier_edge_m(float(p.x[i]), barrier) for i in range(first, last + 1))
+            if nearest > PERCH_M:
+                v = _heading(ctx, first, True)
+                if v is None or v < HEADING_MPS:
+                    continue
             seen.append(
                 Pass(
                     id="",
@@ -1084,10 +1211,11 @@ def _passes(ctx: Ctx) -> tuple[list[Pass], list[GapPass]]:
                     last=last,
                     outcome=outcome,
                     barrier=barrier,
-                    lane="trench" if trench else "bump",
+                    lane=lane_at(y_med) or "bump",
                     y_m=_r(y_med),
                     from_zone=None if prev is None else ctx.raw_zone(float(p.x[prev])),
                     to_zone=None if nxt is None else ctx.raw_zone(float(p.x[nxt])),
+                    nearest_edge_m=nearest,
                     data=data,
                 )
             )
@@ -1111,29 +1239,28 @@ def _never_cleared(ctx: Ctx, i0: int, i1: int, barrier: Barrier) -> bool:
     return True
 
 
-@dataclass
+@dataclass(frozen=True)
 class Attempt:
-    passes: list[Pass]
+    """One time the target went onto a barrier and came back out the side it came from."""
+
+    passes: tuple[Pass, ...]
     side: Zone
     t_in: float
     t_out: float
     far: bool
-    tries: int = 1
 
 
 def _attempts(ctx: Ctx, passes: list[Pass], in_gap: list[GapPass]) -> list[Attempt]:
-    """Passes that came back out the side they came from: `returned` passes, and a
-    `crossed` pass whose robot never got off the barrier before crossing back."""
+    """`returned` passes, and a `crossed` pass whose robot never got off the barrier before
+    crossing back (one attempt of two passes). Never chained: each is its own attempt."""
     out: list[Attempt] = []
     used: set[str] = set()
     for k, ps in enumerate(passes):
-        if ps.id in used:
-            continue
         side = ps.from_zone
-        if side is None:
+        if ps.id in used or side is None:
             continue
         if ps.outcome == "returned":
-            out.append(Attempt([ps], side, ps.t_in, ps.t_out, far=False))
+            out.append(Attempt((ps,), side, ps.t_in, ps.t_out, far=False))
             continue
         if ps.outcome != "crossed":
             continue
@@ -1147,23 +1274,52 @@ def _attempts(ctx: Ctx, passes: list[Pass], in_gap: list[GapPass]) -> list[Attem
             )
             and _never_cleared(ctx, ps.last, nxt.first, ps.barrier)
         ):
-            out.append(Attempt([ps, nxt], side, ps.t_in, nxt.t_out, far=True))
+            out.append(Attempt((ps, nxt), side, ps.t_in, nxt.t_out, far=True))
             used.add(nxt.id)
-    out.sort(key=lambda a: a.t_in)
-    chained: list[Attempt] = []
-    for a in out:
-        last = chained[-1] if chained else None
-        if (
-            last is not None
-            and last.passes[0].barrier == a.passes[0].barrier
-            and last.side == a.side
-            and a.t_in - last.t_out <= REROUTE_MAX_S
-        ):
-            last.passes.extend(a.passes)
-            last.t_out, last.far, last.tries = a.t_out, last.far or a.far, last.tries + 1
-        else:
-            chained.append(a)
-    return chained
+    return sorted(out, key=lambda a: a.t_in)
+
+
+def _reach(lane: Lane, d: float) -> Reach:
+    if lane == "trench" or d <= BAND_MARGIN_M:
+        return "centre"
+    return "footprint" if d <= PERCH_M else "corner"
+
+
+def _cost_end(
+    ctx: Ctx, a: Attempt, far: Zone, nxt: Attempt | None
+) -> tuple[float, CostEnd, int | None]:
+    """End of a toward-home attempt's cost window (see `CrossingTurnedBackData.cost_end`),
+    and the path index where it was first tracked on the far side (None if never)."""
+    p = ctx.path
+    arrive = next(
+        (
+            k
+            for k in np.flatnonzero(p.t > a.t_out + 1e-6).tolist()
+            if ctx.raw_zone(float(p.x[k])) == far and ctx.band(float(p.x[k]), float(p.y[k])) is None
+        ),
+        None,
+    )
+    ends: list[tuple[float, CostEnd]] = [(ctx.t1, "match_end")]
+    if arrive is not None:
+        ends.append((float(p.t[arrive]), "reached_far_side"))
+    if nxt is not None:
+        ends.append((nxt.t_in, "tried_again"))
+    inactive = next((e for _, e in ctx.active if e > a.t_in + 1e-6), None)
+    if inactive is not None:
+        ends.append((inactive, "hub_went_inactive"))
+    stop = arrive if arrive is not None else len(p.t) - 1
+    lost = next(
+        (
+            k
+            for k in range(int(np.searchsorted(p.t, a.t_out)), stop)
+            if p.t[k + 1] - p.t[k] > BRIDGE_MAX_S + 1e-6
+        ),
+        None,
+    )
+    if lost is not None:
+        ends.append((max(a.t_out, float(p.t[lost])), "track_lost"))
+    t, why = min(ends, key=lambda v: v[0])
+    return t, why, arrive
 
 
 def _crossing_facts(
@@ -1171,15 +1327,13 @@ def _crossing_facts(
 ) -> tuple[list[Fact], list[Fact], list[Fact]]:
     """(crossings, crossings in gaps, turned-back crossings), each in time order. Passes
     folded into a turned-back fact are not emitted as crossings."""
+    p = ctx.path
     passes, in_gap = _passes(ctx)
     attempts = _attempts(ctx, passes, in_gap)
     folded = {ps.id for a in attempts for ps in a.passes}
     crossings: list[Fact] = [
         CrossingFact.model_validate(
-            {
-                **_common(ctx, ps.id, ps.t_in, ps.t_out),
-                "data": ps.crossing(),
-            }
+            {**_common(ctx, ps.id, ps.t_in, ps.t_out), "data": ps.crossing()}
         )
         for ps in passes
         if ps.id not in folded
@@ -1192,43 +1346,73 @@ def _crossing_facts(
     for n, a in enumerate(attempts, 1):
         first = a.passes[0]
         barrier = first.barrier
-        across: Pass | GapPass | None = None
-        for q in [*passes, *in_gap]:
-            if q.t_in < a.t_out - 1e-6 or q.t_in - a.t_out > REROUTE_MAX_S:
-                continue
-            if isinstance(q, Pass):
-                ok = q.id not in folded and q.barrier == barrier and q.outcome == "crossed"
-                ok = ok and q.from_zone == a.side
-            else:
-                ok = q.data.barrier == barrier and q.data.from_zone == a.side
-            if ok and (across is None or q.t_in < across.t_in):
-                across = q
-        t_end = across.t_out if across is not None else a.t_out
+        far: Zone = (
+            ("own" if barrier == ctx.alliance else "opponent") if a.side == "neutral" else "neutral"
+        )
+        home = far == "own" or a.side == "opponent"
+        nxt = next(
+            (
+                q
+                for q in attempts
+                if q.t_in > a.t_in and q.side == a.side and q.passes[0].barrier == barrier
+            ),
+            None,
+        )
+        arrive: int | None = None
+        if home:
+            t_end, why, arrive = _cost_end(ctx, a, far, nxt)
+        else:
+            t_end, why = a.t_out, "came_back"
+        across = next(
+            (
+                q
+                for q in sorted([*passes, *in_gap], key=lambda q: q.t_in)
+                if a.t_out - 1e-6 <= q.t_in
+                and q.t_out <= t_end + 1e-6
+                and (
+                    q.id not in folded and q.barrier == barrier and q.outcome == "crossed"
+                    if isinstance(q, Pass)
+                    else q.data.barrier == barrier
+                )
+                and (q.from_zone if isinstance(q, Pass) else q.data.from_zone) == a.side
+            ),
+            None,
+        )
+        after = _in_span(ctx, a.t_out, t_end)
+        away = [
+            barrier_edge_m(float(p.x[i]), barrier)
+            for i in after.tolist()
+            if ctx.raw_zone(float(p.x[i])) == a.side
+        ]
+        on = _in_span(ctx, a.t_in, a.t_out)
         fidx = _f_span(ctx, a.t_in, a.t_out)
         stopped, _ = _f_still_s(ctx, fidx, STOP_MPS)
-        sp = ctx.path.speed[_in_span(ctx, a.t_in, a.t_out)]
-        near = [d for i in _in_span(ctx, a.t_in, a.t_out).tolist() for d, _ in _nearest(ctx, i)[:1]]
-        seen_across = across if isinstance(across, Pass) else None
-        phase = next((ph for ph in ctx.match.phases if ph.name == _phase_at(ctx, a.t_in)), None)
+        sp = p.speed[on]
+        near = [d for i in on.tolist() for d, _ in _nearest(ctx, i)[:1]]
+        d_min = min(ps.nearest_edge_m for ps in a.passes)
+        reached = float(p.t[arrive]) if arrive is not None else None
         data = CrossingTurnedBackData(
             barrier=barrier,
             lane=first.lane,
             y_m=first.y_m,
             side=a.side,
-            attempts=a.tries,
+            far_side=far,
+            toward_home=home,
+            reach=_reach(first.lane, d_min),
+            nearest_edge_m=_r(d_min),
             reached_far_edge=a.far,
             time_on_barrier_s=_r(a.t_out - a.t_in),
             stopped_s=_r(stopped),
             unseen_s=_r(int((ctx.filled.src[fidx] < 0).sum()) * ctx.dt),
             min_speed_mps=_ro(float(np.nanmin(sp)) if np.isfinite(sp).any() else None),
+            far_side_t=_ro(reached),
+            far_side_after_gap=arrive is not None and arrive > 0 and not bool(p.link[arrive - 1]),
+            seconds_to_far_side=None if reached is None else _r(reached - a.t_in),
             across_id=across.id if across else None,
-            across_lane=seen_across.lane if seen_across else None,
-            across_y_m=seen_across.y_m if seen_across else None,
-            across_seen=None if across is None else seen_across is not None,
-            seconds_to_across=None if across is None else _r(t_end - a.t_in),
-            own_hub_active=None
-            if phase is None or phase.active_hubs is None
-            else ctx.alliance in phase.active_hubs,
+            cost_s=_r(t_end - a.t_in),
+            cost_end=why,
+            own_active_s=_r(ctx.active_s(a.t_in, t_end)),
+            furthest_from_barrier_m=_ro(max(away) if away else None),
             contact_ids=[c.id for c in contacts if c.t_start <= t_end and c.t_end >= a.t_in],
             nearest_tracked_m=_ro(min(near) if near else None),
         )
@@ -1281,8 +1465,8 @@ def _stop_facts(ctx: Ctx) -> list[StopFact]:
         )
         near = [d for i in seen.tolist() for d, _ in _nearest(ctx, i)[:1]]
         xm, ym = float(np.median(p.x[seen])), float(np.median(p.y[seen]))
-        zones: Counter[Zone] = Counter(p.zone[int(i)] for i in seen)
-        on = barrier_at(xm, ym, PERCH_M)
+        barrier = min(ALLIANCES, key=lambda b: barrier_edge_m(xm, b))
+        on = ctx.band(xm, ym)
         unseen = int((src < 0).sum()) * ctx.dt
         data = StopData(
             duration_s=_r(dur),
@@ -1290,11 +1474,12 @@ def _stop_facts(ctx: Ctx) -> list[StopFact]:
             unseen_s=_r(unseen),
             gaps_bridged=len(bridged),
             moved_across_gaps_m=_ro(max(moved) if moved else None),
-            x=_r(xm),
-            y=_r(ym),
-            zone=max(zones, key=lambda z: zones[z]),
+            where=ctx.where(xm, ym),
+            own_active_s=_r(ctx.active_s(float(f.t[a]), float(f.t[b]) + ctx.dt)),
+            barrier=barrier,
+            barrier_edge_m=_r(barrier_edge_m(xm, barrier)),
+            lane=lane_at(ym),
             on_barrier=on[0] if on else None,
-            lane=on[1] if on else None,
             start=start,
             end=end,
             nearest_tracked_m=_ro(min(near) if near else None),
@@ -1312,11 +1497,13 @@ def _stop_facts(ctx: Ctx) -> list[StopFact]:
 # --- trips out while the own hub is active --------------------------------------------
 
 
-def _own_active_spans(ctx: Ctx) -> list[tuple[float, float]]:
-    """Teleop spans with the own hub active (auto is the robot's code), merged."""
+def _own_active_spans(match: MatchInfo) -> list[tuple[float, float]]:
+    """Teleop spans with the target's hub active (auto is the robot's code), merged."""
     out: list[tuple[float, float]] = []
-    for ph in ctx.match.phases:
-        if ph.name == "auto" or ph.active_hubs is None or ctx.alliance not in ph.active_hubs:
+    for ph in match.phases:
+        if ph.name == "auto" or ph.active_hubs is None:
+            continue
+        if match.target_alliance not in ph.active_hubs:
             continue
         if out and abs(out[-1][1] - ph.t_start) < 1e-3:
             out[-1] = (out[-1][0], ph.t_end)
@@ -1331,7 +1518,7 @@ def _trip_facts(ctx: Ctx, stops: Sequence[StopFact]) -> list[Fact]:
     p = ctx.path
     home = [z == "own" and pl_ != "on_barrier" for z, pl_ in zip(p.zone, ctx.place, strict=True)]
     out: list[Fact] = []
-    for sa, sb in _own_active_spans(ctx):
+    for sa, sb in ctx.active:
         i = 0
         while i + 1 < len(p.t):
             if not (home[i] and not home[i + 1] and sa <= p.t[i] < sb):
@@ -1363,14 +1550,8 @@ def _trip_facts(ctx: Ctx, stops: Sequence[StopFact]) -> list[Fact]:
             )
             out_t = p.t[outside]
             fidx = _f_span(ctx, float(out_t[0]), float(out_t[-1]))
-            fx, fy = ctx.filled.x, ctx.filled.y
-            fidx = fidx[
-                [
-                    ctx.raw_zone(float(fx[k])) != "own"
-                    or barrier_at(float(fx[k]), float(fy[k]), PERCH_M) is not None
-                    for k in fidx.tolist()
-                ]
-            ]
+            fx = ctx.filled.x
+            fidx = fidx[[ctx.raw_zone(float(fx[k])) != "own" for k in fidx.tolist()]]
             _, slow = _f_still_s(ctx, fidx, SLOW_MPS)
             tracked = len(_in_span(ctx, t_left, t_end)) * ctx.dt
             at_end = None
@@ -1393,9 +1574,7 @@ def _trip_facts(ctx: Ctx, stops: Sequence[StopFact]) -> list[Fact]:
                 stop_ids=[
                     s.id
                     for s in stops
-                    if s.t_start < t_end
-                    and s.t_end > t_left
-                    and (s.data.zone != "own" or s.data.on_barrier is not None)
+                    if s.t_start < t_end and s.t_end > t_left and s.data.where.zone != "own"
                 ],
                 longest_below_slow_s=_r(slow),
                 path_length_m=_r(_path_length(ctx, _in_span(ctx, t_left, t_end)), 1),
@@ -1427,6 +1606,47 @@ def _window(ctx: Ctx, a: float, b: float) -> SpeedWindow:
         mean_speed_mps=_ro(_mean(p.speed[idx])),
         net_progress_m=_ro(prog),
     )
+
+
+def _position(ctx: Ctx, t: float) -> tuple[float, float, bool] | None:
+    """Target (x, y, seen) at time t: the path sample within half a step, else the straight
+    line across the gap around t (seen False); None outside the path."""
+    p = ctx.path
+    k = int(np.searchsorted(p.t, t))
+    for j in (k - 1, k):
+        if 0 <= j < len(p.t) and abs(p.t[j] - t) <= ctx.dt / 2 + 1e-6:
+            return float(p.x[j]), float(p.y[j]), True
+    if k == 0 or k >= len(p.t):
+        return None
+    f = (t - p.t[k - 1]) / (p.t[k] - p.t[k - 1])
+    xy = (p.x[k - 1] + f * (p.x[k] - p.x[k - 1]), p.y[k - 1] + f * (p.y[k] - p.y[k - 1]))
+    return float(xy[0]), float(xy[1]), bool(p.link[k - 1])
+
+
+def _still(ctx: Ctx, a: float, b: float) -> tuple[float, float, float]:
+    """(still, still unseen, longest still run) seconds in [a, b]: STILL_WINDOW_S windows in
+    which the target moved slower than STILL_MPS, positions inside gaps taken on the straight
+    line across them (such windows count as unseen)."""
+    still = unseen = run = longest = 0.0
+    t = a
+    while t < b - 1e-6:
+        e = min(b, t + STILL_WINDOW_S)
+        u, v = _position(ctx, t), _position(ctx, e)
+        slow = (
+            u is not None
+            and v is not None
+            and e - t >= ctx.dt
+            and math.hypot(v[0] - u[0], v[1] - u[1]) / (e - t) * ctx.rate < STILL_MPS
+        )
+        if slow and u is not None and v is not None:
+            still += e - t
+            unseen += 0.0 if u[2] and v[2] else e - t
+            run += e - t
+            longest = max(longest, run)
+        else:
+            run = 0.0
+        t = e
+    return still, unseen, longest
 
 
 def _contact_end(ctx: Ctx, last: int, tid: int) -> ContactEnd:
@@ -1595,8 +1815,7 @@ def _contact_facts(ctx: Ctx) -> list[ContactFact]:
                     other_speed_during_mps=_ro(_net_speed(ctx, tid, first_t, last_t)),
                 )
             )
-        sp = p.speed[idx]
-        still = _runs(np.nan_to_num(sp, nan=np.inf) < STOP_MPS, lambda i: True)
+        still, still_unseen, longest = _still(ctx, ta, tb + ctx.dt)
         _, lo, hi = _others_range(ctx, ta, tb)
         last = int(idx[-1])
         last_near = min(
@@ -1612,10 +1831,13 @@ def _contact_facts(ctx: Ctx) -> list[ContactFact]:
             unseen_s=_r(span - seen),
             min_distance_m=_r(min(r.min_distance_m for r in robots)),
             target_zone=ctx.place[int(idx[0])],
+            where=ctx.where(float(np.median(p.x[idx])), float(np.median(p.y[idx]))),
             before=_window(ctx, ta - CONTEXT_S, ta - ctx.dt),
             during=_window(ctx, ta, tb),
             after=_window(ctx, tb + ctx.dt, tb + CONTEXT_S),
-            longest_still_s=_r(max(((e - s + 1) * ctx.dt for s, e in still), default=0.0)),
+            still_s=_r(still),
+            still_unseen_s=_r(still_unseen),
+            longest_still_s=_r(longest),
             end=_contact_end(ctx, last, last_near[1]),
             others_tracked_min=lo,
             others_tracked_max=hi,
@@ -1783,14 +2005,22 @@ def _notes(ctx: Ctx, coverage: Coverage, sources: set[str]) -> list[str]:
         "wrong. Unlabelled robots may be partners or opponents. Two robots' centres closer "
         f"than about {SAME_ROBOT_M:g} m are one robot seen twice, not contact. Contact facts "
         "say who was moving toward whom and whose speed dropped, never who was defending.",
-        "`crossing` facts were seen on a bump or trench; `crossing_in_gap` facts only know "
-        "the robot was on one side and later on the other; `crossing_turned_back` facts went "
-        "onto a barrier and came back out the same side, with `seconds_to_across` to the "
-        "crossing that next got it across. Trenches are taken as the strip from each outer "
-        "bump to the guardrail at the bumps' depth.",
+        "The barrier band, used for crossings, barrier stays and stops: the centre within "
+        f"{BAND_MARGIN_M:g} m of a trench's or the opponent barrier's depth; on the neutral "
+        f"face of its own bumps (the climb home) within {CORNER_M:.2f} m, half the robot's "
+        "diagonal, where a turned robot's corner can be on the ramp. A centre inside its own "
+        "zone is never on a barrier, whatever part of the robot reaches over it. Tracks carry "
+        "no heading: `reach` says how close the centre got, and `corner` means only a corner "
+        "could have touched.",
+        "`crossing` facts were seen on the band; `crossing_in_gap` facts only know the robot "
+        "was on one side and later on the other; each `crossing_turned_back` is one attempt "
+        "that came back out the side it came from (attempts are never chained), with "
+        "`cost_s` to where it was going, bounded as `cost_end` says, and `own_active_s` of it "
+        "in own-active time. `excess_s` is time beyond a normal pass. Trenches are taken as "
+        "the strip from each outer bump to the guardrail at the bumps' depth.",
         f"Positions are robot centres, about 0.2 m accurate. Zone lines use the centre with "
-        f"{ZONE_HYST_M} m hysteresis; a robot straddling its zone line may count as either. "
-        "A visit `on_barrier` had part of the robot over a bump or trench.",
+        f"{ZONE_HYST_M} m hysteresis, or {ZONE_DWELL_S:g} s on the other side; `where` "
+        "gives distances to the own hub, own wall and guardrail: describe places from those.",
         f"Speeds are per real second (video speeds x clock rate {ctx.rate:.4f}); times and "
         "durations are video seconds.",
         f"Target identity labels come from identify sources: {', '.join(sorted(sources))}.",
