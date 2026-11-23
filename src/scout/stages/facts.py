@@ -64,6 +64,8 @@ from scout.games.rebuilt2026 import (
 from scout.run import RunDir, Stage
 from scout.schemas.common import ALLIANCES, Alliance
 from scout.schemas.facts import (
+    Arrival,
+    ArrivalBy,
     AutoRouteData,
     AutoRouteFact,
     Barrier,
@@ -202,6 +204,11 @@ NEAR_BARRIER_M = 1.5
 """A gap edge this close to the own barrier's depth counts as at the barrier."""
 OWN_INFER_MIN_S = 2.0
 """Shortest gap read as a trip into the own zone: a turn in front of the barrier is ~1 s."""
+OWN_BOTH_MAX_S = 10.0
+"""Longest gap with both sides in the own zone read as home throughout. On the sixteen
+matches such gaps (bridged ones aside) run 1.0 to 8.8 s, mostly behind the far side of the
+own hub where the bumper is hidden; much longer, a robot can go out, collect and come back
+unseen."""
 
 THRESHOLDS: dict[str, float] = {
     "GAP_S": GAP_S,
@@ -236,6 +243,7 @@ THRESHOLDS: dict[str, float] = {
     "HEADING_MPS": HEADING_MPS,
     "NEAR_BARRIER_M": NEAR_BARRIER_M,
     "OWN_INFER_MIN_S": OWN_INFER_MIN_S,
+    "OWN_BOTH_MAX_S": OWN_BOTH_MAX_S,
 }
 
 CHECK_IMAGE = "facts_check.jpg"
@@ -848,6 +856,8 @@ def _inference(ctx: Ctx, g: GapSpan) -> GapInference | None:
         return None
     if p.bridged[g.before]:
         return "stayed_in_place"
+    if p.zone[g.before] == p.zone[g.after] == "own" and g.b - g.a <= OWN_BOTH_MAX_S + 1e-6:
+        return "own_zone_both_sides"
     if g.b - g.a < OWN_INFER_MIN_S:
         return None
 
@@ -1223,6 +1233,67 @@ def _passes(ctx: Ctx) -> tuple[list[Pass], list[GapPass]]:
     return passes, in_gap
 
 
+def _to_zone_m(ctx: Ctx, x: float, zone: Zone) -> float:
+    """How far along x a centre at `x` still had to go to be in `zone` (0: in it)."""
+    w, d = own_wall_m(x, ctx.alliance), ALLIANCE_ZONE_DEPTH_M
+    if zone == "own":
+        return max(0.0, w - d)
+    if zone == "opponent":
+        return max(0.0, FIELD_LENGTH_M - d - w)
+    return max(0.0, d - w, w - (FIELD_LENGTH_M - d))
+
+
+def _arrival(
+    ctx: Ctx,
+    t: float,
+    there: Callable[[int], bool],
+    zone: Zone,
+    passes: Sequence[Pass],
+    gaps: Sequence[GapSpan],
+) -> tuple[Arrival, int] | None:
+    """The earliest evidence after video time `t` that the target got to `zone` (see
+    `Arrival`), with the path index of its first sample there (`there`); None if never seen
+    there. When that sample follows a gap, the linked run before the gap is searched for a
+    crossing into `zone` as its last pass, then the gap for an inference putting it home;
+    either gives an estimate: the rest of the way from where it was last seen at the speed
+    it was then going that way (at least HEADING_MPS, else no estimate), never later than
+    the sample. `zone` is `own`, or `neutral` coming back from the opponent's zone."""
+    p = ctx.path
+    k = next((k for k in range(int(np.searchsorted(p.t, t + 1e-6)), len(p.t)) if there(k)), None)
+    if k is None:
+        return None
+    tk = _r(float(p.t[k]))
+    if k == 0 or p.link[k - 1]:
+        return Arrival(t=tk, by="seen", fact=None, first_tracked_t=tk), k
+    j = k - 1
+    run0 = j
+    while run0 > 0 and p.link[run0 - 1]:
+        run0 -= 1
+    last = max((ps for ps in passes if run0 <= ps.last <= j), key=lambda ps: ps.last, default=None)
+    gap = next(((n, g) for n, g in enumerate(gaps, 1) if g.before == j), None)
+    by: ArrivalBy = "after_gap"
+    fact: str | None = None
+    if last is not None and last.outcome == "crossed" and last.to_zone == zone:
+        by, fact = "crossing", last.id
+    elif (
+        gap is not None
+        and zone == "own"
+        and _inference(ctx, gap[1])
+        in (
+            "entered_own_zone",
+            "in_own_zone_beyond_barrier",
+        )
+    ):
+        by, fact = "inference", f"gap-{gap[0]:02d}"
+    pace = _heading(ctx, j, True)
+    if pace is None or pace < HEADING_MPS:
+        by, fact = "after_gap", None
+    at = tk
+    if pace is not None and by != "after_gap":
+        at = _r(min(float(p.t[j]) + _to_zone_m(ctx, float(p.x[j]), zone) / pace, tk))
+    return Arrival(t=at, by=by, fact=fact, first_tracked_t=tk), k
+
+
 def _never_cleared(ctx: Ctx, i0: int, i1: int, barrier: Barrier) -> bool:
     """Every sample from i0 to i1 stayed within NEVER_CLEARED_M of `barrier`'s bumps, with
     every gap between bridged: the robot never got off the barrier."""
@@ -1283,28 +1354,39 @@ def _reach(lane: Lane, d: float) -> Reach:
 
 
 def _cost_end(
-    ctx: Ctx, a: Attempt, far: Zone, nxt: Attempt | None
-) -> tuple[float, CostEnd, int | None]:
+    ctx: Ctx,
+    a: Attempt,
+    far: Zone,
+    nxt: Attempt | None,
+    passes: Sequence[Pass],
+    gaps: Sequence[GapSpan],
+) -> tuple[float, CostEnd, Arrival | None]:
     """End of a toward-home attempt's cost window (see `CrossingTurnedBackData.cost_end`),
-    and the path index where it was first tracked on the far side (None if never)."""
+    and when it got to the far side (None if never)."""
     p = ctx.path
-    arrive = next(
-        (
-            k
-            for k in np.flatnonzero(p.t > a.t_out + 1e-6).tolist()
-            if ctx.raw_zone(float(p.x[k])) == far and ctx.band(float(p.x[k]), float(p.y[k])) is None
+    found = _arrival(
+        ctx,
+        a.t_out,
+        lambda k: (
+            ctx.raw_zone(float(p.x[k])) == far and ctx.band(float(p.x[k]), float(p.y[k])) is None
         ),
-        None,
+        far,
+        passes,
+        gaps,
     )
+    arrived = found[0] if found else None
     ends: list[tuple[float, CostEnd]] = [(ctx.t1, "match_end")]
-    if arrive is not None:
-        ends.append((float(p.t[arrive]), "reached_far_side"))
+    if arrived is not None:
+        ends.append((arrived.t, "reached_far_side"))
     if nxt is not None:
         ends.append((nxt.t_in, "tried_again"))
     inactive = next((e for _, e in ctx.active if e > a.t_in + 1e-6), None)
     if inactive is not None:
         ends.append((inactive, "hub_went_inactive"))
-    stop = arrive if arrive is not None else len(p.t) - 1
+    # a gap after the evidence that it crossed is not where tracking lost it
+    stop = len(p.t) - 1
+    if found is not None:
+        stop = found[1] - (found[0].by in ("crossing", "inference"))
     lost = next(
         (
             k
@@ -1316,16 +1398,19 @@ def _cost_end(
     if lost is not None:
         ends.append((max(a.t_out, float(p.t[lost])), "track_lost"))
     t, why = min(ends, key=lambda v: v[0])
-    return t, why, arrive
+    return t, why, arrived
 
 
 def _crossing_facts(
-    ctx: Ctx, contacts: Sequence[ContactFact]
+    ctx: Ctx,
+    contacts: Sequence[ContactFact],
+    passes: list[Pass],
+    in_gap: list[GapPass],
+    spans: Sequence[GapSpan],
 ) -> tuple[list[Fact], list[Fact], list[Fact]]:
     """(crossings, crossings in gaps, turned-back crossings), each in time order. Passes
     folded into a turned-back fact are not emitted as crossings."""
     p = ctx.path
-    passes, in_gap = _passes(ctx)
     attempts = _attempts(ctx, passes, in_gap)
     folded = {ps.id for a in attempts for ps in a.passes}
     crossings: list[Fact] = [
@@ -1355,9 +1440,9 @@ def _crossing_facts(
             ),
             None,
         )
-        arrive: int | None = None
+        arrived: Arrival | None = None
         if home:
-            t_end, why, arrive = _cost_end(ctx, a, far, nxt)
+            t_end, why, arrived = _cost_end(ctx, a, far, nxt, passes, spans)
         else:
             t_end, why = a.t_out, "came_back"
         across = next(
@@ -1388,7 +1473,6 @@ def _crossing_facts(
         sp = p.speed[on]
         near = [d for i in on.tolist() for d, _ in _nearest(ctx, i)[:1]]
         d_min = min(ps.nearest_edge_m for ps in a.passes)
-        reached = float(p.t[arrive]) if arrive is not None else None
         data = CrossingTurnedBackData(
             barrier=barrier,
             lane=first.lane,
@@ -1404,9 +1488,8 @@ def _crossing_facts(
             unseen_s=_r(int((ctx.filled.src[fidx] < 0).sum()) * ctx.dt),
             min_speed_mps=_ro(float(np.nanmin(sp)) if np.isfinite(sp).any() else None),
             slowest_mps=_ro(float(np.nanmin(fsp)) if np.isfinite(fsp).any() else None),
-            far_side_t=_ro(reached),
-            far_side_after_gap=arrive is not None and arrive > 0 and not bool(p.link[arrive - 1]),
-            seconds_to_far_side=None if reached is None else _r(reached - a.t_in),
+            arrived=arrived,
+            seconds_to_far_side=None if arrived is None else _r(arrived.t - a.t_in),
             across_id=across.id if across else None,
             cost_s=_r(t_end - a.t_in),
             cost_end=why,
@@ -1511,22 +1594,28 @@ def _own_active_spans(match: MatchInfo) -> list[tuple[float, float]]:
     return out
 
 
-def _trip_facts(ctx: Ctx, stops: Sequence[StopFact]) -> list[Fact]:
-    """Each time the target left its own zone during own-active time, until it was back
-    or that time ended. A robot perched on its barrier is not home."""
+def _trip_facts(
+    ctx: Ctx, stops: Sequence[StopFact], passes: Sequence[Pass], gaps: Sequence[GapSpan]
+) -> list[Fact]:
+    """Each time the target left its own zone during own-active time, until it got home
+    (`_arrival`) or that time ended. A robot perched on its barrier is not home. When it left
+    unseen (across a gap: a lost label looks the same as a lost track), the trip starts at the
+    first position seen outside, so a trip never starts at the edge of a gap."""
     p = ctx.path
     home = [z == "own" and pl_ != "on_barrier" for z, pl_ in zip(p.zone, ctx.place, strict=True)]
     out: list[Fact] = []
     for sa, sb in ctx.active:
         i = 0
         while i + 1 < len(p.t):
-            if not (home[i] and not home[i + 1] and sa <= p.t[i] < sb):
+            start = i if p.link[i] else i + 1
+            if not (home[i] and not home[i + 1] and sa <= p.t[start] < sb):
                 i += 1
                 continue
-            back_i = next((k for k in range(i + 1, len(p.t)) if home[k]), None)
-            back = back_i is not None and p.t[back_i] <= sb
-            t_end = float(p.t[back_i]) if back and back_i is not None else sb
-            t_left = float(p.t[i])
+            t_left = float(p.t[start])
+            found = _arrival(ctx, t_left, lambda k: home[k], "own", passes, gaps)
+            back_i = found[1] if found else None
+            back = found is not None and found[0].t <= sb
+            t_end = found[0].t if back and found else sb
             nxt = back_i if back_i is not None else len(p.t)
             if t_end - t_left < TRIP_MIN_S - 1e-6:
                 i = nxt
@@ -1562,6 +1651,7 @@ def _trip_facts(ctx: Ctx, stops: Sequence[StopFact]) -> list[Fact]:
                 left_unseen_s=_r(0.0 if p.link[i] else p.t[i + 1] - p.t[i]),
                 own_active_left_s=_r(sb - t_left),
                 back=ctx.seen(back_i) if back and back_i is not None else None,
+                home=found[0] if back and found else None,
                 at_active_end=at_end,
                 duration_s=_r(t_end - t_left),
                 unseen_s=_r(max(0.0, t_end - t_left + ctx.dt - tracked)),
@@ -1850,9 +1940,11 @@ def _contact_facts(ctx: Ctx) -> list[ContactFact]:
 # --- hub turning on -------------------------------------------------------------------
 
 
-def _hub_on_facts(ctx: Ctx) -> list[Fact]:
+def _hub_on_facts(ctx: Ctx, passes: Sequence[Pass], gaps: Sequence[GapSpan]) -> list[Fact]:
     """One fact per real turn-on of the own hub: a shift or endgame with it active after a
-    phase with it inactive (or unknown)."""
+    phase with it inactive (or unknown). When not tracked in its own zone then, its arrival
+    there comes from `_arrival` (a crossing or a gap's inference can put it home before the
+    activation: 0 s late)."""
     p = ctx.path
     out: list[Fact] = []
     phases = ctx.match.phases
@@ -1879,14 +1971,10 @@ def _hub_on_facts(ctx: Ctx) -> list[Fact]:
                 s -= 1
             since = t - float(p.t[s])
             since_gap = s == 0 or not p.link[s - 1]
-        reached = None
-        reached_gap = False
+        arrival = None
         if not in_own:
-            after = [i for i in range(j, len(p.t)) if p.t[i] < ph.t_end and p.zone[i] == "own"]
-            if after:
-                reached = float(p.t[after[0]]) - t
-                start = last_i if last_i is not None else after[0]
-                reached_gap = bool((~p.link[start : after[0]]).any()) or at is None
+            found = _arrival(ctx, t - 1e-3, lambda i: p.zone[i] == "own", "own", passes, gaps)
+            arrival = found[0] if found and found[0].first_tracked_t < ph.t_end else None
         from_wall = (
             None
             if at is None
@@ -1904,8 +1992,8 @@ def _hub_on_facts(ctx: Ctx) -> list[Fact]:
             in_own_zone=in_own,
             own_zone_since_s=_ro(since),
             since_after_gap=bool(since_gap),
-            reached_own_zone_after_s=_ro(reached),
-            reached_after_gap=reached_gap,
+            reached_own_zone_after_s=None if arrival is None else _r(max(0.0, arrival.t - t)),
+            reached=arrival,
         )
         out.append(
             HubOnFact.model_validate({**_common(ctx, f"hubon-{ph.name}", t, t), "data": data})
@@ -2016,7 +2104,10 @@ def _notes(ctx: Ctx, coverage: Coverage, sources: set[str]) -> list[str]:
         "that came back out the side it came from (attempts are never chained), with "
         "`cost_s` to where it was going, bounded as `cost_end` says, and `own_active_s` of it "
         "in own-active time. `excess_s` is time beyond a normal pass. Trenches are taken as "
-        "the strip from each outer bump to the guardrail at the bumps' depth.",
+        "the strip from each outer bump to the guardrail at the bumps' depth. Arrivals home "
+        "(`arrived`, a trip's `home`, a hub_on's `reached`) first seen after a gap are "
+        "estimated when a crossing or a gap's inference shows the robot going there; else they "
+        "are upper bounds (`after_gap`). Trips that left inside a gap start where first seen out.",
         f"Positions are robot centres, about 0.2 m accurate. Zone lines use the centre with "
         f"{ZONE_HYST_M} m hysteresis, or {ZONE_DWELL_S:g} s on the other side; `where` "
         "gives distances to the own hub, own wall and guardrail: describe places from those.",
@@ -2033,7 +2124,8 @@ def build(run: RunDir) -> tuple[Facts, Ctx]:
     gap_facts = _gap_facts(ctx, gaps)
     contacts = _contact_facts(ctx)
     stops = _stop_facts(ctx)
-    crossings, in_gap, turned = _crossing_facts(ctx, contacts)
+    passes, in_gap_passes = _passes(ctx)
+    crossings, in_gap, turned = _crossing_facts(ctx, contacts, passes, in_gap_passes, gaps)
     facts: list[Fact] = [
         *_phase_facts(ctx, gaps),
         *gap_facts,
@@ -2042,9 +2134,9 @@ def build(run: RunDir) -> tuple[Facts, Ctx]:
         *in_gap,
         *turned,
         *stops,
-        *_trip_facts(ctx, stops),
+        *_trip_facts(ctx, stops, passes, gaps),
         *contacts,
-        *_hub_on_facts(ctx),
+        *_hub_on_facts(ctx, passes, gaps),
         _auto_fact(ctx, gaps, gap_facts, [*crossings, *in_gap, *turned]),
     ]
     facts.sort(key=lambda f: (f.t_start, f.kind != "phase", f.id))

@@ -27,6 +27,10 @@ it matters, read the hoppers, judge the defense episodes, and write.
       `charged_s` = seconds from the line's start (readiness: the activation) to that tile.
     - `not_home` (a readiness line cleared by a gap inference): a tile within a second of the
       activation shows the target outside its own zone.
+    - `home` or `not_home` (a `not_judged` readiness line: it was untracked then): a tile within
+      a second of the activation where you read the target's bumper number (`corner_bumper`)
+      shows it in, or out of, its own zone. With `not_home`, `charged_s` may give the seconds to
+      a cited tile that shows it home.
     A different reading of what the robot meant to do is never grounds: not "it chose another
     lane", "it was not an attempt", "it drove past". The checker refuses such words in an
     overrule.
@@ -50,8 +54,8 @@ it matters, read the hoppers, judge the defense episodes, and write.
 - `skills`: for each skill, a two or three sentence summary of what drove it (code computes the
   score from the rulings).
 - `notes`: 5 to 9 short timestamped notes on the moments that matter, and the `auto` report
-  (where the robot started, went and ended in auto, and whether it stayed behind the centre
-  line as far as positions show; never scored).
+  (where the robot was tracked in auto and for how much of it; never scored). When it was
+  tracked for less than half of auto, say how much and do not say where it was in the rest.
 
 # The checker
 
@@ -77,6 +81,21 @@ the first time:
   episodes must match where the target was tracked over what the item cites. "Beside its hub"
   needs the centre within 2 m of its hub's base, "at its wall" or "at the guardrail" within
   1.5 m; a cited stop or contact counts by its `where`.
+- Nothing about unseen time as if seen. "What was seen" in the task lists the untracked
+  stretches. A sentence that claims absence, a count or staying put ("no trip out", "the one
+  trip", "every crossing", "two stalls", "stayed behind the centre line", "never left") over
+  time with an untracked stretch must say it is what was seen or tracked ("no trip out was
+  seen in its tracked active time"). Below half tracked, such a claim is refused outright.
+  Notes cover what they cite, a skill summary covers its own active time
+  (handling_defense: teleop), the auto report covers auto.
+- A stop or hold partly inferred across a gap: quoting its seconds (`duration_s`, `still_s`)
+  needs its inferred part quoted too (`unseen_s`, `still_unseen_s`), said as inferred.
+- "Stall", "stuck", "wedged" over a turned-back attempt need it measured stopped on the band
+  (`slowest_mps` under 0.3 m/s, or `stopped_s` plus `unseen_s` a second or more); otherwise say
+  what its line's `why` says fired: it slowed to `slowest_mps`, or went
+  `furthest_from_barrier_m` back.
+- A stop in its own zone in its own active time is where it shoots: no `went_wrong` note on it
+  unless a line is charged there, and no "lost time", "wasted" or "idle".
 - One stretch, one reading. Words that call a stretch fine ("clean", "smooth", "staging", "kept
   moving", "played through") are refused over a charged line or a pin that costs, and need a
   tile anyway; words that call it a fault ("stalled", "backed off", "wasted") are refused over a
@@ -112,8 +131,8 @@ Plan your sheets before you judge and ask for several in one turn:
 3. Every defense item of a second or more (the checker requires it), and shorter ones where
    the target was still, in its own zone, or tracking ended. Group neighbouring items onto one
    sheet: four tiles 1.5 s apart cover a 6 s stretch.
-4. Readiness lines whose time is a bound: the corner view of its own end, to see if it was home
-   sooner.
+4. Readiness lines whose time is a bound, and `not_judged` lines: the corner view of its own
+   end at the activation, to see where it was (read its bumper number).
 
 Look at who is where on each tile. An unlabelled box or an unboxed robot is unidentified until
 you read its bumper number or a clear red or blue bumper. A partner beside the target is not a
@@ -128,6 +147,8 @@ going where. Broadcast frames are low resolution; write what you see, not what y
   matches or teams. No claims about points.
 - Kinds: `went_well`, `went_wrong`, `played_through_defense` (needs a tile),
   `outside_driver_control` (a defender, a partner, the field), `observation`.
+- A `not_judged` readiness line was not judged: say so, and say nothing about where the robot
+  was at that activation unless your call settled it.
 - Quote numbers only through references, so they match the facts. Describe an inferred stop
   as inferred unless a tile shows it. Say what a tile shows only for the tiles you opened.
 - Finish by returning the structured answer. Do not write anything to files.
