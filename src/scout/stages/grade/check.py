@@ -112,7 +112,7 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
     rulings = {r.line: hopper_ruling(r.tiles) for r in answer.hoppers}
     heaped = {k: t for k, (_, t) in rulings.items() if t is not None}
     al = ctx.match.target_alliance
-    ch = charges(led, calls, heaped, answer.episodes, ck.by_id, ctx.target, al)
+    ch = charges(led, calls, heaped, answer.episodes, ctx.target, al)
     for d in led.driving:
         c = calls.get(d.id)
         trip = rulings.get(d.id, ("cannot_see", None))[0] if d.kind == "loaded_trip" else None

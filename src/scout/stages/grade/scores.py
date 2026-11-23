@@ -148,7 +148,6 @@ def charges(
     calls: dict[str, LineCall],
     heaped: dict[str, float],
     episodes: Sequence[DefenseEpisode],
-    by_id: dict[str, Fact],
     target: Target,
     alliance: Alliance,
 ) -> Charges:
@@ -157,16 +156,14 @@ def charges(
     nothing. Of that, the line's `split` seconds (less any time `home_earlier` took off) go to
     the episode holding the split's contact instead, when the split applies
     (`split_applies`). Heaped trips (`heaped`: trip line to its `heaped_at`,
-    `check_calls.hopper_ruling`): from `heaped_at` to the end of the trip, less barrier lines and
-    opponent episodes inside it, the time to get home from there (`tracks.home_allow`) and
-    TRIP_GRACE_S. Readiness: `late_s` when charged by default or called `not_home`, `charged_s`
-    when `home_earlier` (or `not_home` with it), else 0; a `not_judged` line no call settled is
-    not scored."""
-    opp = [
-        (k, s)
-        for k, e in enumerate(episodes)
-        if e.verdict == "opponent_on_target" and (s := episode_span(e, by_id)) is not None
-    ]
+    `check_calls.hopper_ruling`): from `heaped_at` to the end of the trip, less barrier lines
+    inside it and its `opponent_contacts` (time a robot not known to be a partner was within
+    contact distance: what that robot cost cannot be told from wandering, so it is not charged,
+    whatever verdict the grader gives the contact), the time to get home from there
+    (`tracks.home_allow`) and TRIP_GRACE_S. Readiness: `late_s` when charged by default or
+    called `not_home`, `charged_s` when `home_earlier` (or `not_home` with it), else 0; a
+    `not_judged` line no call settled is not scored."""
+    item_span = {i.fact: (i.t_start, i.t_end) for i in led.items}
     taken = [0.0] * len(episodes)
     moved: dict[str, tuple[float, float]] = {}
     out: dict[str, float] = {}
@@ -205,7 +202,8 @@ def charges(
             out[d.id] = 0.0
             continue
         a = max(d.t_start, h)
-        excused = union_s(a, d.t_end, [*held, *(s for _, s in opp)])
+        near = [item_span[f] for f in d.opponent_contacts if f in item_span]
+        excused = union_s(a, d.t_end, [*held, *near])
         allow = home_allow(target, alliance, a) + TRIP_GRACE_S
         out[d.id] = max(0.0, d.t_end - a - excused - allow)
     unjudged: list[str] = []
