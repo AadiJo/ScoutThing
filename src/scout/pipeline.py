@@ -3,7 +3,18 @@
 from __future__ import annotations
 
 from scout.run import Stage
-from scout.stages import calibrate, detect, facts, grade, identify, match, probe, render, track
+from scout.stages import (
+    calibrate,
+    corners,
+    detect,
+    facts,
+    grade,
+    identify,
+    match,
+    probe,
+    render,
+    track,
+)
 
 STAGES: tuple[Stage, ...] = (
     probe.STAGE,
@@ -12,6 +23,7 @@ STAGES: tuple[Stage, ...] = (
     detect.STAGE,
     track.STAGE,
     identify.STAGE,
+    corners.STAGE,
     facts.STAGE,
     render.STAGE,
     grade.STAGE,

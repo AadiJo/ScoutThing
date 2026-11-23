@@ -27,7 +27,7 @@ from typing import Literal
 from pydantic import ValidationError
 
 from scout.assets import ROOT, asset_hashes
-from scout.schemas.calibration import Calibration
+from scout.schemas.calibration import CORNER_CALIBRATION_FILE, Calibration, CornerCalibrations
 from scout.schemas.common import SchemaError, atomic_write
 from scout.schemas.detections import read_detections
 from scout.schemas.facts import Facts
@@ -76,6 +76,7 @@ class RunDir:
         self.video_json = path / "video.json"
         self.match_json = path / "match.json"
         self.calibration_json = path / "calibration.json"
+        self.corner_calibration_json = path / CORNER_CALIBRATION_FILE
         self.detections = path / "detections.parquet"
         self.tracks = path / "tracks.parquet"
         self.identity_json = path / "identity.json"
@@ -260,6 +261,7 @@ def schema_checks(run: RunDir) -> list[tuple[Path, Callable[[Path], object]]]:
         (run.video_json, VideoInfo.load),
         (run.match_json, MatchInfo.load),
         (run.calibration_json, Calibration.load),
+        (run.corner_calibration_json, CornerCalibrations.load),
         (run.detections, read_detections),
         (run.tracks, read_tracks),
         (run.identity_json, Identity.load),

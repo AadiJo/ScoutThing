@@ -44,15 +44,17 @@ For each camera panel in `match.json`:
    the error in metres. The tags-and-lines fit is kept when it passes every gate, else
    the tags-only fit (`_pick`).
 
-The main view must pass every gate or the stage raises `NeedsInput`. A corner view that
-cannot be calibrated is left out. `calibration_check.jpg` shows the field lines and tag
+Tag geometry, decoding and the quarter medians are shared with the corners stage
+(`scout.field_tags`). The main view must pass every gate or the stage raises `NeedsInput`.
+A corner view that cannot be calibrated is left out: CapCity's fisheye corner panels never
+can be from tags alone (at most one tag decodes), and the corners stage calibrates them later
+from robots seen in both views. `calibration_check.jpg` shows the field lines and tag
 outlines drawn through each calibration on the full-match median image, and the ridge
 points the main fit used (red).
 """
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass, replace
 from typing import cast
@@ -60,12 +62,22 @@ from typing import cast
 import cv2
 import numpy as np
 from numpy.typing import NDArray
-from pupil_apriltags import Detection, Detector  # pyright: ignore[reportMissingTypeStubs]
+from pupil_apriltags import Detector  # pyright: ignore[reportMissingTypeStubs]
 from pydantic import BaseModel, ConfigDict
 from scipy.optimize import least_squares  # pyright: ignore[reportMissingTypeStubs]
 
-from scout.assets import asset
 from scout.camera import Camera, reach_radius
+from scout.field_tags import (
+    Hits,
+    Tag,
+    clusters,
+    decode_view,
+    detector,
+    faces,
+    merge,
+    tag_corners,
+    window_medians,
+)
 from scout.games.rebuilt2026 import (
     ALLIANCE_ZONE_DEPTH_M,
     BUMPS,
@@ -85,18 +97,10 @@ from scout.schemas.calibration import (
 )
 from scout.schemas.common import VIEW_NAMES, PixelRect, ViewName
 from scout.schemas.video import VideoInfo
-from scout.video import THREADS, frames
 
 F64 = NDArray[np.float64]
 U8 = NDArray[np.uint8]
 
-SAMPLE_HZ = 0.5
-WINDOWS = 4
-MIN_WINDOWS = 2
-SCALES = (2, 3, 4)
-MIN_MARGIN = 15.0
-AGREE_PX = 2.0
-TAG_SIZE_M = 0.1651  # black square side (6.5 in); fits rule out the 0.2064 m outer size
 GROUP_M = 1.0
 STRUCTURE_M = 0.6
 # A wider search (60 px) found Hopper's far tags but also took neighbouring frames for
@@ -253,21 +257,6 @@ class View:
 
 
 @dataclass(frozen=True)
-class Tag:
-    """One tag seen in a view: image points (N, 2) in full-frame pixels and the field
-    points (N, 3) they show. Decoded tags give 4 corners, located tags their centre."""
-
-    id: int
-    img: F64
-    obj: F64
-    located: bool
-
-
-Hits = dict[int, list[tuple[int, F64]]]
-"""Per tag id, (window index, image points) of every sighting."""
-
-
-@dataclass(frozen=True)
 class Fit:
     """One solved camera for a set of tags."""
 
@@ -386,62 +375,6 @@ class ViewResult:
 # --- field geometry ------------------------------------------------------------
 
 
-def tag_corners() -> dict[int, F64]:
-    """Every field tag's black-square corners (4, 3) in field metres. Order: bottom-left,
-    bottom-right, top-right, top-left seen from the front, matching pupil_apriltags."""
-    data = json.loads(asset("field_tags").read_text())
-    s = TAG_SIZE_M / 2
-    local = np.array([[0.0, -s, -s], [0.0, s, -s], [0.0, s, s], [0.0, -s, s]])
-    out: dict[int, F64] = {}
-    for t in data["tags"]:
-        p = t["pose"]["translation"]
-        q = t["pose"]["rotation"]["quaternion"]
-        r = _quat_matrix(float(q["W"]), float(q["X"]), float(q["Y"]), float(q["Z"]))
-        out[int(t["ID"])] = local @ r.T + np.array([p["x"], p["y"], p["z"]], np.float64)
-    return out
-
-
-def _quat_matrix(w: float, x: float, y: float, z: float) -> F64:
-    return np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ]
-    )
-
-
-def _normal(c: F64) -> F64:
-    """Outward normal of a tag from its corners (front face)."""
-    n = np.cross(c[1] - c[0], c[3] - c[0])
-    return n / np.linalg.norm(n)
-
-
-def _faces(c: F64, cam: Camera) -> bool:
-    return bool(_normal(c) @ (cam.center - c.mean(0)) > 0)
-
-
-def _clusters(
-    ids: list[int], corners: dict[int, F64], dist_m: float, same_facing: bool
-) -> list[list[int]]:
-    """Tags whose centres lie within `dist_m` of each other, transitively; with
-    `same_facing`, only tags facing the same way join."""
-    groups: list[list[int]] = []
-    for t in sorted(ids):
-        c, n = corners[t].mean(0), _normal(corners[t])
-        near = [
-            g
-            for g in groups
-            if any(
-                np.linalg.norm(corners[u].mean(0) - c) < dist_m
-                and (not same_facing or _normal(corners[u]) @ n > 0.95)
-                for u in g
-            )
-        ]
-        groups = [g for g in groups if g not in near] + [sorted([t, *(u for g in near for u in g)])]
-    return sorted(groups)
-
-
 def _spread(ids: list[int], corners: dict[int, F64]) -> float:
     pts = np.array([corners[t].mean(0)[:2] for t in ids])
     if len(pts) < 2:
@@ -450,51 +383,6 @@ def _spread(ids: list[int], corners: dict[int, F64]) -> float:
 
 
 # --- finding tags --------------------------------------------------------------
-
-
-def _detector() -> Detector:
-    return Detector(
-        families="tag36h11",
-        nthreads=THREADS,
-        quad_decimate=1.0,
-        quad_sigma=0.0,
-        refine_edges=1,
-        decode_sharpening=0.25,
-    )
-
-
-def _decode_view(det: Detector, medians: list[U8], rect: PixelRect) -> Hits:
-    """Every tag decoded in each window median of the panel at each of SCALES."""
-    hits: Hits = {}
-    off = np.array([rect.x, rect.y], np.float64)
-    for w, med in enumerate(medians):
-        crop = med[rect.y : rect.y + rect.h, rect.x : rect.x + rect.w]
-        for s in SCALES:
-            up = np.asarray(
-                cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC), np.uint8
-            )
-            # The bindings annotate detect() as one Detection and decision_margin as None.
-            for d in cast(list[Detection], det.detect(up)):
-                if d.hamming <= 1 and cast(float, d.decision_margin) > MIN_MARGIN:
-                    corners = np.asarray(d.corners, np.float64) / s + off
-                    hits.setdefault(int(d.tag_id), []).append((w, corners))
-    return hits
-
-
-def _merge(hits: Hits, obj: dict[int, F64], located: bool) -> tuple[dict[int, Tag], list[int]]:
-    """Trusted tags (seen in MIN_WINDOWS windows with agreeing points) and suspect ids."""
-    tags: dict[int, Tag] = {}
-    suspect: list[int] = []
-    for tid, hs in hits.items():
-        stack = np.stack([p for _, p in hs])
-        med = np.median(stack, 0)
-        good = np.max(np.linalg.norm(stack - med, axis=2), axis=1) <= AGREE_PX
-        windows = len({w for (w, _), g in zip(hs, good, strict=True) if g})
-        if windows >= MIN_WINDOWS and tid in obj:
-            tags[tid] = Tag(tid, np.median(stack[good], 0), obj[tid], located)
-        else:
-            suspect.append(tid)
-    return tags, sorted(suspect)
 
 
 def _frames(img: U8, x0: int, y0: int, x1: int, y1: int, min_area: float) -> F64:
@@ -548,12 +436,12 @@ def _locate(
             rect.x + 4 <= ctr[0] < rect.x + rect.w - 4
             and rect.y + 4 <= ctr[1] < rect.y + rect.h - 4
         )
-        if tid in skip or not _faces(c3, cam) or not np.all(np.isfinite(uv)) or not inside:
+        if tid in skip or not faces(c3, cam) or not np.all(np.isfinite(uv)) or not inside:
             continue
         pred[tid] = ctr
         side[tid] = float(np.mean(np.linalg.norm(uv - np.roll(uv, 1, 0), axis=1)))
     hits: Hits = {}
-    for group in _clusters(list(pred), corners, STRUCTURE_M, same_facing=True):
+    for group in clusters(list(pred), corners, STRUCTURE_M, same_facing=True):
         p = np.stack([pred[t] for t in group])
         px = min(side[t] for t in group)
         if px < 4:
@@ -790,7 +678,7 @@ def _plausible(fit: Fit, corners: dict[int, F64], obj: F64) -> str | None:
     centre = np.array([FIELD_LENGTH_M / 2, FIELD_WIDTH_M / 2, 0.0])
     if not on_field and (cam.r @ centre + cam.t)[2] <= 0:
         return "the field centre is behind the camera"
-    away = [t for t in fit.tags if not _faces(corners[t], cam)]
+    away = [t for t in fit.tags if not faces(corners[t], cam)]
     if 2 * len(away) > len(fit.tags):
         return f"tags {away} would be seen from behind"
     return None
@@ -816,7 +704,7 @@ def _holdout(fit: Fit, tags: dict[int, Tag], corners: dict[int, F64]) -> dict[in
     cast the held-out points, e.g. its lens folds before reaching them). The refit keeps
     the fit's field lines."""
     out: dict[int, float] = {}
-    for group in _clusters(list(fit.tags), corners, GROUP_M, same_facing=False):
+    for group in clusters(list(fit.tags), corners, GROUP_M, same_facing=False):
         rest = tuple(t for t in fit.tags if t not in group)
         if len(rest) < 3:
             out.update(dict.fromkeys(group, math.inf))
@@ -942,7 +830,7 @@ def _relocate(
     The located tag worst off the refit is dropped while it is past MAX_RESID_PX: it was
     matched to the wrong frame."""
     centres = {t: c.mean(0)[None] for t, c in corners.items()}
-    located, _ = _merge(_locate(medians, view.rect, fit, corners, skip), centres, located=True)
+    located, _ = merge(_locate(medians, view.rect, fit, corners, skip), centres, located=True)
     while True:
         tags = decoded | located
         ids = tuple(sorted(tags))
@@ -964,8 +852,8 @@ def _calibrate_view(
 ) -> tuple[ViewResult, dict[int, Tag], set[int]]:
     """The tags-only result, plus the decoded tags and every decoded id (for `_line_path`)."""
     rect = view.rect
-    decoded_hits = _decode_view(det, medians, rect)
-    decoded, suspect = _merge(decoded_hits, corners, located=False)
+    decoded_hits = decode_view(det, medians, rect)
+    decoded, suspect = merge(decoded_hits, corners, located=False)
     tags = decoded
     fit, holdout, problems = _solve(tags, corners, view)
     for _ in range(LOCATE_ROUNDS):
@@ -1216,37 +1104,11 @@ def _to_schema(
 
 
 def _medians(run: RunDir, info: VideoInfo, layout: _Layout) -> tuple[list[U8], U8]:
-    """Grey full-frame medians of each quarter of the match (auto start to teleop end)
-    and of the whole match. Outside the match an official broadcast shows intro cards,
-    results and other cameras, so a median over the whole file is not the field. Only
-    the rows holding camera panels are decoded; the rest stay black."""
-    views = layout.views
-    y0 = min(r.y for r in views.values())
-    y1 = max(r.y + r.h for r in views.values())
-    band = PixelRect(x=0, y=y0, w=info.width, h=y1 - y0)
-    grey = [
-        cv2.cvtColor(f.image, cv2.COLOR_BGR2GRAY)
-        for f in frames(
-            run.video,
-            info,
-            sample_hz=SAMPLE_HZ,
-            crop=band,
-            start=max(0.0, layout.auto_start_t),
-            end=min(info.duration_s, layout.teleop_end_t),
-        )
-    ]
-    stack = np.stack(grey)
-    n = len(stack)
-
-    def full(img: NDArray[np.floating]) -> U8:
-        out = np.zeros((info.height, info.width), np.uint8)
-        out[y0:y1] = img.astype(np.uint8)
-        return out
-
-    quarters = [
-        full(np.median(stack[i * n // WINDOWS : (i + 1) * n // WINDOWS], 0)) for i in range(WINDOWS)
-    ]
-    return quarters, full(np.median(stack, 0))
+    """Quarter and whole-match medians (`window_medians`) of the rows holding the views, over
+    the match (auto start to teleop end)."""
+    return window_medians(
+        run.video, info, layout.views.values(), layout.auto_start_t, layout.teleop_end_t
+    )
 
 
 Colour = tuple[int, int, int]
@@ -1314,7 +1176,7 @@ def _draw_view(img: U8, rect: PixelRect, res: ViewResult, corners: dict[int, F64
         uv = cam.project(c3)
         ctr = uv.mean(0) - off
         visible = np.all(np.isfinite(uv)) and 0 <= ctr[0] < rect.w and 0 <= ctr[1] < rect.h
-        if not visible or not _faces(c3, cam):
+        if not visible or not faces(c3, cam):
             continue
         colour = GREEN if tid in res.fit.tags else ORANGE
         poly(uv, colour, True)
@@ -1380,7 +1242,7 @@ def calibrate(run: RunDir) -> None:
     layout = _Layout.model_validate_json(run.match_json.read_bytes())
     corners = tag_corners()
     quarters, median = _medians(run, info, layout)
-    det = _detector()
+    det = detector()
     results: dict[ViewName, ViewResult] = {}
     for name in VIEW_NAMES:
         if name not in layout.views:

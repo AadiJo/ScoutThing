@@ -1,6 +1,7 @@
 """Move between full-frame pixels and WPILib field metres through one calibrated view.
 
     cam = Camera.load(run.calibration_json, "main")
+    left = Camera.load(run.calibration_json, "corner_left")  # from corner_calibration.json
     uv = cam.project(xyz)              # (..., 3) field metres -> (..., 2) full-frame pixels
     xy = cam.to_field(uv, z=0.08)      # (..., 2) pixels -> (..., 2) field (x, y) on plane z
 
@@ -41,7 +42,13 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from scout.schemas.calibration import FISHEYE_MODELS, Calibration, CameraCalibration
+from scout.schemas.calibration import (
+    CORNER_CALIBRATION_FILE,
+    FISHEYE_MODELS,
+    Calibration,
+    CameraCalibration,
+    CornerCalibrations,
+)
 from scout.schemas.common import ViewName
 
 F64 = NDArray[np.float64]
@@ -146,8 +153,18 @@ class Camera:
 
     @classmethod
     def load(cls, calibration_json: Path, view: ViewName = "main") -> Camera:
-        """The camera of `view` in a calibration.json; KeyError if it was not calibrated."""
-        return cls.from_calibration(Calibration.load(calibration_json).views[view])
+        """The camera of `view` in a calibration.json, or, for a corner view it lacks, in the
+        corner_calibration.json beside it (corners stage; check that file's `trusted_m`
+        before placing a robot). KeyError if neither has the view."""
+        views = Calibration.load(calibration_json).views
+        if view in views:
+            return cls.from_calibration(views[view])
+        corner = calibration_json.with_name(CORNER_CALIBRATION_FILE)
+        if corner.exists():
+            found = CornerCalibrations.load(corner).views.get(view)
+            if found is not None:
+                return cls.from_calibration(found.camera)
+        raise KeyError(view)
 
     @property
     def center(self) -> F64:

@@ -1,4 +1,6 @@
-"""`calibration.json`, written by the calibrate stage: one pinhole camera per view.
+"""`calibration.json`, written by the calibrate stage: one pinhole camera per view; and
+`corner_calibration.json`, written by the corners stage: the corner views the calibrate stage
+could not calibrate from tags alone, fitted to robots seen in both a corner and the main view.
 
 Intrinsics are in full-frame pixels, so `cv2.projectPoints(field_xyz, rvec, tvec, K, dist)`
 gives full-frame pixel coordinates directly. The pose maps WPILib field metres to the
@@ -97,3 +99,63 @@ class Calibration(StageFile):
 
     schema_version: Literal[1] = 1
     views: dict[ViewName, CameraCalibration]
+
+
+CORNER_CALIBRATION_FILE = "corner_calibration.json"
+"""File name of `CornerCalibrations` in a run folder, beside `calibration.json`."""
+
+
+class RangeError(BaseModel):
+    """Held-out error of a corner calibration over robots within one range of distances from
+    the camera (horizontal metres to the main-view robot position)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    near_m: float
+    far_m: float
+    n: int
+    """Held-out pairs in the range."""
+    median_m: float | None
+    """Median field distance between the corner box cast to the field and the main-view
+    position (None when `n` is 0; a box the camera cannot cast counts as 100 m)."""
+    p90_m: float | None
+    median_px: float | None
+    """Median pixel distance between the main-view position projected into the corner
+    panel and the corner box centre."""
+    p90_px: float | None
+
+
+class CornerCalibration(BaseModel):
+    """One corner camera, fitted to robots and field tags, with its held-out robot error."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    camera: CameraCalibration
+    """The camera (`model` is the fisheye `c_kb3`; `tags`, `located`, `rms_px` and `max_px`
+    describe the field tags fitted with the robots; `holdout_m` is empty: the robots held out
+    by time are the check, see `test`)."""
+    face_m: float
+    """A corner bumper box centre is on the robot's near bumper face; the robot centre is this
+    far behind it, away from the camera. Push a cast box centre this far along the
+    horizontal ray to place the robot."""
+    fit_pairs: int
+    """Robot pairs (corner box with a team read, main-view position of that team at the same
+    frame) the camera was fitted to: those in even `split_s` blocks of the match."""
+    test_pairs: int
+    """Pairs in odd blocks, held out of the fit and used only for `test`."""
+    split_s: float
+    test: list[RangeError]
+    """Held-out error by distance from the camera."""
+    trusted_m: tuple[float, float]
+    """Distances from the camera (near, far, horizontal metres) within which every range of
+    `test` holding enough pairs has a median error within the trust bound: place a robot
+    with this camera only there."""
+
+
+class CornerCalibrations(StageFile):
+    """Corner views calibrated by the corners stage. A corner view missing from `views` could
+    not be calibrated; `rejected` says why."""
+
+    schema_version: Literal[1] = 1
+    views: dict[ViewName, CornerCalibration]
+    rejected: dict[ViewName, str] = Field(default_factory=dict)
