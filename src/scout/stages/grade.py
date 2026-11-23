@@ -9,8 +9,9 @@ every contact sheet served, the frame log and each session's stream.
 
 Steps:
 
-1. Code builds the driving ledger, the readiness ledger and the list of defense items from
-   the facts (`ledgers`), so the grader decides per line instead of doing arithmetic.
+1. Code builds the driving ledger (barrier lines and trips out of its own zone in its own
+   active time), the readiness ledger and the list of defense items from the facts
+   (`ledgers`), so the grader decides per line instead of doing arithmetic.
 2. Build the prompt from files: `grade_system.md` and `grade_task.md` beside this module
    (game-independent), and the game guide, limits and rubric under
    `scout/games/rebuilt2026_grade/`. The task carries the match timeline, the ledgers, the
@@ -19,15 +20,17 @@ Steps:
    settings files, skills or other MCP servers, and one MCP tool, `frames`, served by
    `python -m scout.stages.grade <run>` (`serve_frames` below). The tool crops the main camera
    around the target, rings it, boxes every other tracked robot with its team and partner or
-   opponent (or "unlabelled"), tiles up to four moments with the match clock, lists the facts
-   overlapping them, logs every sheet to `grade_work/frames.jsonl` and refuses past IMAGE_CAP
-   sheets. The session's init message is checked so a leak fails the stage.
-4. Check the structured answer (`check_answer`): citations, one call per ledger line,
-   episodes covering every defense item with the evidence each verdict needs, numbers only
-   as references to fact fields, team names only when labelled or read, no purpose words,
-   places that agree with where the target was, and each score inside the band the rubric
-   computes from the calls. On failure the session is resumed with the exact errors, up to
-   ATTEMPTS answers in all; then the stage fails.
+   opponent (or "unlabelled"), or shows a corner camera panel unmarked; it tiles up to four
+   moments with the match clock, lists the facts overlapping them, logs every sheet to
+   `grade_work/frames.jsonl` and refuses past IMAGE_CAP sheets. The session's init message is
+   checked so a leak fails the stage.
+4. Check the structured answer (`check_answer`): citations, one call per ledger line with
+   the evidence each call needs, episodes covering every defense item, numbers only as
+   references to fact fields, team names only when labelled or read, no purpose words, places
+   that agree with where the target was, no text reading a stretch against its ledger call,
+   and each score inside the band the rubric computes from the charged seconds and episode
+   costs (`charges`, `episode_costs`). On failure the session is resumed with the exact
+   errors, up to ATTEMPTS answers in all; then the stage fails.
 """
 
 from __future__ import annotations
@@ -54,7 +57,19 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from scout.camera import Camera
-from scout.games.rebuilt2026 import BARRIER_X, CENTER_LINE_X_M, ROBOT_FOOTPRINT_M, zone_of
+from scout.games.rebuilt2026 import (
+    ALLIANCE_ZONE_DEPTH_M,
+    BARRIER_X,
+    CENTER_LINE_X_M,
+    FIELD_LENGTH_M,
+    FIELD_WIDTH_M,
+    HUBS,
+    ROBOT_FOOTPRINT_M,
+    guardrail_m,
+    own_wall_m,
+    rect_distance_m,
+    zone_of,
+)
 from scout.run import RunDir, Stage
 from scout.schemas.common import Alliance
 from scout.schemas.facts import (
@@ -69,10 +84,12 @@ from scout.schemas.facts import (
     OtherRobot,
     PhaseFact,
     StopFact,
+    TripFact,
     ZoneVisitFact,
 )
 from scout.schemas.grade import (
     SKILLS,
+    Call,
     DefenseEpisode,
     DefenseItem,
     DrivingKind,
@@ -84,9 +101,12 @@ from scout.schemas.grade import (
     Note,
     ReadinessLine,
     RunRecord,
+    ScoredCall,
+    ScoredEpisode,
     ScoredSkill,
     SkillName,
     TileRecord,
+    View,
 )
 from scout.schemas.identity import Identity
 from scout.schemas.match import MatchInfo
@@ -99,12 +119,13 @@ I64 = NDArray[np.int64]
 Image = NDArray[np.uint8]
 JSON = dict[str, object]
 Band = tuple[int, int]
+Corner = Literal["corner_left", "corner_right"]
 
 GAME_DIR = "rebuilt2026_grade"
 """Folder under `scout.games` with the game guide, limits and rubric for this game."""
 IMAGE_CAP = 20
 EFFORT = "medium"
-"""Claude Code effort level. Medium keeps a grade between 40 and 110 s on Opus."""
+"""Claude Code effort level. Medium keeps a grade between 40 and 120 s on Opus."""
 MAX_BUDGET_USD = 8.0
 """Stops a runaway session; one grade lists at about 0.3 to 1 USD."""
 TIMEOUT_S = 600.0
@@ -121,18 +142,37 @@ NOTE_REACH_S = 5.0
 FRAME_MATCH_S = 0.051
 SPAN_PAD_S = 2.0
 """A frame this close to an episode or ledger line counts as evidence for it."""
-SLOW_CROSS_STOPPED_S = 1.0
-SLOW_CROSS_S = 2.5
-"""A seen crossing stopped this long, or this long on the barrier, is a driving line (a
-clean one takes 0.5 to 1 s)."""
 MIN_TRACKED_SHARE = 0.5
 """Below this share of teleop tracked, driving may be null."""
 CENTRE_NEAR_M = 1.5
 BARRIER_NEAR_M = 2.5
 """A place word is supported when the target was this close to the centre line, or to a
-barrier's bumps (people say "at the hub" for a robot a metre or two in front of it)."""
+barrier's bumps (people say "at the red hub" for a robot a metre or two in front of it)."""
+HUB_NEAR_M = 2.0
+WALL_NEAR_M = 1.5
+""""Beside its hub" needs the centre this close to its own hub's base; "at its wall" or "at the
+guardrail" this close to that wall."""
 MIN_LOST_S = 1.0
-"""Shorter barrier moments are touches, not ledger lines."""
+"""Barrier lines costing less active time than this are touches, not ledger lines."""
+TRIP_ALLOW_S = 3.0
+HOME_CROSS_S = 1.2
+HOME_MPS = 2.0
+"""Seconds a heaped robot out of its own zone is allowed to get home before the rest of its
+trip is charged: a normal crossing plus its distance outside its zone at HOME_MPS (robots
+drive home at 2 to 2.5 m/s), and never less than TRIP_ALLOW_S."""
+LOOK_TILES = 4
+LOOK_FIRST_S = 1.0
+"""Hopper tiles of a trip: up to LOOK_TILES, from LOOK_FIRST_S after it left to TRIP_ALLOW_S
+before it ended (heaped any later costs nothing)."""
+PIN_ALLOW_S = 3.0
+"""Still seconds beside an opponent an episode may hold before they cost (pinning longer
+than 3 s is a foul in this game)."""
+PIN_GAP_S = 2.0
+"""Opponent episodes this close in time are one hold: they share one allowance."""
+TOUCH_M = 1.0
+"""Centre distance under which two robots (0.95 m bumpers) were very probably touching."""
+APART_STILL_S = 1.0
+"""A contact with the target still this long cannot be called `apart`."""
 
 NEAR_BOX_M = 2.5
 """A boxed robot this close to the target can be the defender or partner a text names."""
@@ -143,6 +183,9 @@ NEARBY_S = 5.0
 CROP_W, CROP_H = 800, 450
 TILE_W = 640
 FULL_W = 960
+CORNER_SCALE = 2
+CORNER_MAX_TILES = 2
+"""Corner panels are small (652 x 344): they are served at twice their size, two per sheet."""
 HEADER_H = 26
 LEGEND_H = 24
 RING: tuple[int, int, int] = (0, 225, 255)
@@ -156,6 +199,9 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 LEGEND = (
     "Yellow ring: target. Boxes: robots the tool tracked (team PARTNER/OPP, or 'unlabelled'). "
     "A robot with NO box was not tracked."
+)
+CORNER_LEGEND = (
+    "CORNER camera, uncalibrated: no ring and no boxes. Find the target by its bumper number."
 )
 
 ENV_KEEP = (
@@ -226,6 +272,15 @@ def _relation(match: MatchInfo, team: int) -> Literal["partner", "opponent", "un
     if slot is None:
         return "unknown"
     return "partner" if slot.alliance == match.target_alliance else "opponent"
+
+
+def _home_view(cam: Camera, match: MatchInfo) -> Corner:
+    """The corner panel showing the target's own end: the side of the main view its own
+    zone projects to."""
+    x = 2.0 if match.target_alliance == "blue" else FIELD_LENGTH_M - 2.0
+    u = float(cam.project(np.array([[x, FIELD_WIDTH_M / 2, 0.0]]))[0, 0])
+    main = match.views["main"]
+    return "corner_left" if u < main.x + main.w / 2 else "corner_right"
 
 
 # --- tracks -----------------------------------------------------------------------------
@@ -321,6 +376,20 @@ def _overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
     return a0 <= b1 + 1e-6 and b0 <= a1 + 1e-6
 
 
+def _overlap_s(a0: float, a1: float, b0: float, b1: float) -> float:
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def _union_s(a: float, b: float, spans: Iterable[tuple[float, float]]) -> float:
+    """Seconds of [a, b] covered by the union of `spans`."""
+    total, at = 0.0, a
+    for s0, s1 in sorted((max(a, s0), min(b, s1)) for s0, s1 in spans):
+        if s1 > at and s1 > s0:
+            total += s1 - max(at, s0)
+            at = s1
+    return total
+
+
 def _in_spans(t: float, spans: Sequence[tuple[float, float]]) -> bool:
     return any(a - 1e-6 <= t < b for a, b in spans)
 
@@ -357,7 +426,35 @@ def _end_text(end: str) -> str:
         "unknown_other_track_lost": "tracking of the other robot ended: how it ended is unknown",
         "unknown_target_track_lost": "tracking of the target ended: how it ended is unknown",
         "match_end": "the match ended",
+        "reached_far_side": "it reached the far side",
+        "tried_again": "its next attempt on this barrier began",
+        "hub_went_inactive": "its hub went inactive",
+        "track_lost": "tracking lost it (it took at least this long)",
     }.get(end, end)
+
+
+def _look_times(a: float, b: float) -> list[float]:
+    """Hopper tile times for a trip from a to b, evenly spaced, at most 5 s apart."""
+    first, last = a + LOOK_FIRST_S, max(a + LOOK_FIRST_S, b - TRIP_ALLOW_S)
+    n = max(1, min(LOOK_TILES, 1 + math.floor((last - first) / 1.5)))
+    step = min(5.0, round((last - first) / (n - 1), 1)) if n > 1 else 0.0
+    return [round(first + k * step, 1) for k in range(n)]
+
+
+@dataclass(frozen=True)
+class _Raw:
+    """A driving line before numbering."""
+
+    a: float
+    b: float
+    kind: DrivingKind
+    facts: list[str]
+    lost: float
+    unseen: float
+    text: str
+    bound: bool = False
+    corner: bool = False
+    look: tuple[float, ...] = ()
 
 
 def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
@@ -366,51 +463,51 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
     teleop = match.teleop_start_t - 1e-6
     active = _own_active(match)
     contact_m = facts.thresholds.get("CONTACT_M", 1.6)
-    raw: list[tuple[float, float, DrivingKind, list[str], float, float, bool | None, str]] = []
+    raw: list[_Raw] = []
 
     def taken(a: float, b: float) -> bool:
-        return any(_overlap(a, b, r[0], r[1]) for r in raw)
-
-    def hub(t: float) -> bool | None:
-        ph = next((p for p in match.phases if p.t_start <= t < p.t_end), None)
-        if ph is None or ph.active_hubs is None:
-            return None
-        return match.target_alliance in ph.active_hubs
+        return any(_overlap(a, b, r.a, r.b) for r in raw)
 
     for f in fs:
-        if isinstance(f, CrossingTurnedBackFact) and f.t_start >= teleop:
-            d = f.data
-            folded = [
-                s.id
-                for s in fs
-                if isinstance(s, StopFact)
-                and s.data.on_barrier is not None
-                and _overlap(s.t_start, s.t_end, f.t_start, f.t_end)
-            ]
-            lost = d.seconds_to_across if d.seconds_to_across is not None else d.time_on_barrier_s
-            how = (
-                f"got across by {d.across_id} ({d.across_lane or 'route unseen'}) "
-                f"{_fmt(lost)} s after first touching it"
-                if d.seconds_to_across is not None
-                else "did not get across within 8 s"
+        if not (isinstance(f, CrossingTurnedBackFact) and f.t_start >= teleop):
+            continue
+        d = f.data
+        if not d.toward_home:
+            continue
+        folded = [
+            s
+            for s in fs
+            if isinstance(s, StopFact)
+            and _overlap(s.t_start, s.t_end, f.t_start, f.t_end)
+            and s.data.barrier_edge_m <= ROBOT_FOOTPRINT_M
+        ]
+        arrive = (
+            f"first tracked in the {d.far_side} zone {_fmt(d.seconds_to_far_side)} s after "
+            "entering" + (" (after a gap: at most that)" if d.far_side_after_gap else "")
+            if d.seconds_to_far_side is not None
+            else f"never tracked in the {d.far_side} zone after it"
+        )
+        stops = "".join(
+            f"; {s.id}: stopped {_fmt(s.data.duration_s)} s ({_fmt(s.data.unseen_s)} s inferred "
+            f"across gaps), {_fmt(s.data.barrier_edge_m)} m from the bumps' depth"
+            for s in folded
+        )
+        text = (
+            f"onto the {d.barrier} {d.lane} from the {d.side} zone toward the {d.far_side} zone "
+            f"and back out (reach {d.reach}, centre {_fmt(d.nearest_edge_m)} m from the bumps' "
+            f"depth at nearest); on the barrier {_fmt(d.time_on_barrier_s)} s, stopped "
+            f"{_fmt(d.stopped_s)} s, {_fmt(d.unseen_s)} s unseen; {arrive}; costed "
+            f"{_fmt(d.cost_s)} s until {_end_text(d.cost_end)}, {_fmt(d.own_active_s)} s of it in "
+            f"its own active time{stops}"
+        )
+        raw.append(
+            _Raw(
+                f.t_start, f.t_end, "turned_back", [f.id, *(s.id for s in folded)],
+                d.own_active_s, d.unseen_s, text,
+                bound=d.far_side_after_gap and d.cost_end == "reached_far_side",
+                corner=d.reach == "corner",
             )
-            stops = "; ".join(
-                f"{s.id}: stopped {_fmt(s.data.duration_s)} s, {_fmt(s.data.seen_s)} s seen and "
-                f"{_fmt(s.data.unseen_s)} s inferred across gaps (start {s.data.start}, end "
-                f"{s.data.end})"
-                for s in fs
-                if isinstance(s, StopFact) and s.id in folded
-            )
-            text = (
-                f"went onto the {d.barrier} {d.lane} from the {d.side} zone and came back "
-                f"({d.attempts} attempt{'s' if d.attempts > 1 else ''}), then {how}; on the "
-                f"barrier {_fmt(d.time_on_barrier_s)} s, stopped {_fmt(d.stopped_s)} s, "
-                f"{_fmt(d.unseen_s)} s unseen" + (f"; {stops}" if stops else "")
-            )
-            raw.append(
-                (f.t_start, f.t_end, "turned_back", [f.id, *folded], lost, d.unseen_s,
-                 d.own_hub_active, text)
-            )  # fmt: skip
+        )  # fmt: skip
     for f in fs:
         if (
             isinstance(f, StopFact)
@@ -420,14 +517,13 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
         ):
             d = f.data
             text = (
-                f"stopped on the {d.on_barrier} {d.lane} {_fmt(d.duration_s)} s: "
-                f"{_fmt(d.seen_s)} s seen, {_fmt(d.unseen_s)} s inferred across gaps "
-                f"(start {d.start}, end {d.end})"
+                f"stopped on the {d.on_barrier} {d.lane or 'barrier'} {_fmt(d.duration_s)} s: "
+                f"{_fmt(d.seen_s)} s seen, {_fmt(d.unseen_s)} s inferred across gaps (start "
+                f"{d.start}, end {d.end}); {_fmt(d.own_active_s)} s in its own active time"
             )
             raw.append(
-                (f.t_start, f.t_end, "barrier_stop", [f.id], d.duration_s, d.unseen_s,
-                 hub(f.t_start), text)
-            )  # fmt: skip
+                _Raw(f.t_start, f.t_end, "barrier_stop", [f.id], d.own_active_s, d.unseen_s, text)
+            )
     for f in fs:
         if (
             isinstance(f, ZoneVisitFact)
@@ -436,45 +532,71 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
             and not taken(f.t_start, f.t_end)
         ):
             d = f.data
+            excess = d.excess_s or 0.0
             text = (
                 f"stayed on the {d.barrier} {d.lane} {_fmt(d.duration_s)} s "
-                f"({_fmt(d.untracked_s)} s untracked), from {d.came_from} to {d.went_to}"
+                f"({_fmt(d.untracked_s)} s untracked), from {d.came_from} to {d.went_to}: "
+                f"{_fmt(excess)} s beyond a normal crossing, {_fmt(d.own_active_s)} s in its own "
+                "active time"
             )
             raw.append(
-                (f.t_start, f.t_end, "barrier_stay", [f.id], d.duration_s, d.untracked_s,
-                 hub(f.t_start), text)
+                _Raw(f.t_start, f.t_end, "barrier_stay", [f.id], min(excess, d.own_active_s),
+                     d.untracked_s, text)
             )  # fmt: skip
     for f in fs:
-        if not isinstance(f, CrossingFact) or f.t_start < teleop:
+        if not isinstance(f, CrossingFact) or f.t_start < teleop or taken(f.t_start, f.t_end):
             continue
         d = f.data
         on = d.time_on_barrier_s if d.time_on_barrier_s is not None else d.observed_s
-        if (d.stopped_s >= SLOW_CROSS_STOPPED_S or on >= SLOW_CROSS_S) and not taken(
-            f.t_start, f.t_end
+        text = (
+            f"crossed the {d.barrier} {d.lane} from {d.from_zone} to {d.to_zone} in {_fmt(on)} s, "
+            f"stopped {_fmt(d.stopped_s)} s: {_fmt(d.excess_s)} s beyond a normal crossing, "
+            f"{_fmt(d.own_active_s)} s in its own active time"
+        )
+        raw.append(
+            _Raw(f.t_start, f.t_end, "slow_crossing", [f.id], min(d.excess_s, d.own_active_s),
+                 0.0, text)
+        )  # fmt: skip
+    raw = [r for r in raw if r.lost >= MIN_LOST_S]
+    for f in fs:
+        if (
+            not isinstance(f, TripFact)
+            or f.data.duration_s < LOOK_FIRST_S + TRIP_ALLOW_S + MIN_LOST_S
         ):
-            text = (
-                f"crossed the {d.barrier} {d.lane} from {d.from_zone} to {d.to_zone} in "
-                f"{_fmt(on)} s, stopped {_fmt(d.stopped_s)} s"
-            )
-            raw.append((f.t_start, f.t_end, "slow_crossing", [f.id], on, 0.0, hub(f.t_start), text))
-    raw = sorted((r for r in raw if r[4] >= MIN_LOST_S), key=lambda r: r[0])
+            continue
+        d = f.data
+        past = d.past_centre_line_m
+        text = (
+            f"out of its own zone in its own active time {_fmt(d.duration_s)} s "
+            f"({_fmt(d.unseen_s)} s unseen), furthest {_fmt(abs(past))} m "
+            f"{'past' if past >= 0 else 'short of'} the centre line, "
+            + ("then back home" if d.back is not None else "not back before its active time ended")
+            + (f"; stops out: {', '.join(d.stop_ids)}" if d.stop_ids else "")
+        )
+        look = tuple(_look_times(f.t_start, f.t_end))
+        raw.append(
+            _Raw(f.t_start, f.t_end, "loaded_trip", [f.id], d.duration_s, d.unseen_s, text,
+                 look=look)
+        )  # fmt: skip
     driving: list[DrivingLine] = []
-    for n, (a, b, kind, ids, lost, unseen, own, text) in enumerate(raw, 1):
-        opp, partner = _contacts_in(fs, a, b)
+    for n, r in enumerate(sorted(raw, key=lambda r: r.a), 1):
+        opp, partner = _contacts_in(fs, r.a, r.b)
         driving.append(
             DrivingLine(
                 id=f"D{n}",
-                kind=kind,
-                facts=ids,
-                t_start=a,
-                t_end=b,
-                phase=_phase(match, a),
-                own_hub_active=own,
-                lost_s=round(lost, 2),
-                unseen_s=round(unseen, 2),
+                kind=r.kind,
+                facts=r.facts,
+                t_start=r.a,
+                t_end=r.b,
+                phase=_phase(match, r.a),
+                lost_s=round(r.lost, 2),
+                bound=r.bound,
+                unseen_s=round(r.unseen, 2),
+                corner_reach=r.corner,
+                look_at=list(r.look),
                 opponent_contacts=opp,
                 partner_contacts=partner,
-                text=text,
+                text=r.text,
             )
         )
 
@@ -545,15 +667,21 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
                 for o in _per_team(d.others)
             )
             text = (
-                f"contact, target {d.target_zone}, own hub "
-                f"{'active' if in_active else 'inactive'}; "
-                f"{who}; {_fmt(d.seen_s)} s seen, {_fmt(d.unseen_s)} s unseen, target still "
-                f"{_fmt(d.longest_still_s)} s; end: {_end_text(d.end)}"
+                f"contact, target {d.target_zone} ({_fmt(d.where.own_hub_m)} m from its hub, "
+                f"{_fmt(d.where.own_wall_m)} m from its wall), own hub "
+                f"{'active' if in_active else 'inactive'}; {who}; {_fmt(d.seen_s)} s seen, "
+                f"{_fmt(d.unseen_s)} s unseen; target nearly still {_fmt(d.still_s)} s "
+                f"({_fmt(d.still_unseen_s)} s of it inferred across gaps, longest run "
+                f"{_fmt(d.longest_still_s)} s); end: {_end_text(d.end)}"
             )
-            home = in_active and d.target_zone == "own"
             items.append(
                 DefenseItem(
-                    fact=f.id, t_start=f.t_start, t_end=f.t_end, home_active=home, text=text
+                    fact=f.id,
+                    t_start=f.t_start,
+                    t_end=f.t_end,
+                    home_active=in_active and d.target_zone == "own",
+                    pin_s=round(d.still_s - d.still_unseen_s / 2, 2),
+                    text=text,
                 )
             )
         elif isinstance(f, GapFact) and any(
@@ -580,9 +708,10 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
             home = bool(d.before and d.after and d.before.zone == d.after.zone == "own")
             items.append(
                 DefenseItem(
-                    fact=f.id, t_start=f.t_start, t_end=f.t_end, home_active=home, text=text
+                    fact=f.id, t_start=f.t_start, t_end=f.t_end, home_active=home, pin_s=0.0,
+                    text=text,
                 )
-            )
+            )  # fmt: skip
         elif (
             isinstance(f, StopFact)
             and f.data.unseen_s > 0
@@ -592,102 +721,239 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
         ):
             d = f.data
             text = (
-                f"stop {_fmt(d.duration_s)} s in the {d.zone} zone, {_fmt(d.unseen_s)} s inferred "
-                f"across gaps; nearest tracked robot {_fmt(d.nearest_tracked_m or 0.0)} m"
+                f"stop {_fmt(d.duration_s)} s in the {d.where.zone} zone, {_fmt(d.unseen_s)} s "
+                f"inferred across gaps; nearest tracked robot {_fmt(d.nearest_tracked_m or 0.0)} m"
             )
-            home = d.zone == "own" and d.on_barrier is None
             items.append(
                 DefenseItem(
-                    fact=f.id, t_start=f.t_start, t_end=f.t_end, home_active=home, text=text
+                    fact=f.id,
+                    t_start=f.t_start,
+                    t_end=f.t_end,
+                    home_active=d.where.zone == "own" and d.on_barrier is None,
+                    pin_s=round(d.seen_s + d.unseen_s / 2, 2),
+                    text=text,
                 )
             )
     return Ledgers(driving, readiness, items)
 
 
-def _ledger_text(led: Ledgers, match: MatchInfo) -> tuple[str, str, str]:
-    """The driving ledger, readiness ledger and defense items as prompt text."""
+def _ledger_text(led: Ledgers, match: MatchInfo, home: Corner) -> tuple[str, str, str]:
+    """The driving ledger, readiness ledger and defense items as prompt text. Lines that
+    depend on a moment the target was untracked point at the corner view of its own end."""
 
     def span(a: float, b: float) -> str:
         return f"{a:.1f}-{b:.1f} s ({_clock(match, a)[1]}, {_phase(match, a)})"
 
-    drive = "\n".join(
-        f"- {d.id} {d.kind} {span(d.t_start, d.t_end)}, own hub active: {d.own_hub_active}; "
-        f"lost_s {_fmt(d.lost_s)}, unseen_s {_fmt(d.unseen_s)}; facts {', '.join(d.facts)}; "
-        f"{d.text}; contacts with opponent or unlabelled robots: "
-        f"{', '.join(d.opponent_contacts) or 'none'}; with partners only: "
-        f"{', '.join(d.partner_contacts) or 'none'}"
-        for d in led.driving
-    )
+    corner = f"untracked for part of it: look in the {home} view (its own end) too"
+
+    def drive_line(d: DrivingLine) -> str:
+        flags = [
+            *(["lost_s is an upper bound"] if d.bound else []),
+            *(["corner reach only: may be a drive past with no stall"] if d.corner_reach else []),
+            *([corner] if d.unseen_s >= 1.0 or d.bound else []),
+        ]
+        look = (
+            f"; HOPPER TILES: frames t={d.look_at[0]:.1f} count {len(d.look_at)} step_s "
+            f"{(d.look_at[1] - d.look_at[0]) if len(d.look_at) > 1 else 1.0:.1f} zoom 2"
+            if d.look_at
+            else ""
+        )
+        return (
+            f"- {d.id} {d.kind} {span(d.t_start, d.t_end)}: lost_s {_fmt(d.lost_s)}, unseen_s "
+            f"{_fmt(d.unseen_s)}{''.join(f' ({x})' for x in flags)}; facts {', '.join(d.facts)}; "
+            f"{d.text}; contacts with opponent or unlabelled robots: "
+            f"{', '.join(d.opponent_contacts) or 'none'}; with partners only: "
+            f"{', '.join(d.partner_contacts) or 'none'}{look}"
+        )
+
+    drive = "\n".join(drive_line(d) for d in led.driving)
     ready = "\n".join(
         f"- {r.id} {r.fact} at {r.t:.1f} s ({_clock(match, r.t)[1]}): late_s {_fmt(r.late_s)}"
         f"{' (bound)' if r.late_is_bound else ''}; {r.text}"
+        + (f" ({corner})" if r.in_zone is None or r.late_is_bound else "")
         for r in led.readiness
     )
     items = "\n".join(
-        f"- {i.fact} {span(i.t_start, i.t_end)}{', HOME IN ACTIVE TIME' if i.home_active else ''}: "
-        f"{i.text}"
+        f"- {i.fact} {span(i.t_start, i.t_end)}{', HOME IN ACTIVE TIME' if i.home_active else ''}"
+        f"{f', pin_s {_fmt(i.pin_s)}' if i.pin_s > 0 else ''}: {i.text}"
         for i in led.items
     )
     return drive or "(no lines)", ready or "(no lines)", items or "(no items)"
 
 
-# --- bands ------------------------------------------------------------------------------
+# --- costs and bands --------------------------------------------------------------------
 
 
 def _band_of(x: float, edges: Sequence[float]) -> Band:
     """9-10 at or below edges[0], then one band lower past each edge."""
-    k = sum(x > e for e in edges)
+    k = sum(x > e + 1e-9 for e in edges)
     return (9 - 2 * k, 10 - 2 * k)
 
 
-def driving_band(lines: Sequence[DrivingLine], calls: dict[str, LineCall]) -> Band:
-    """From charged seconds, with uncertain lines counted half."""
-    total = 0.0
-    for d in lines:
-        c = calls.get(d.id)
-        if c is None:
+DRIVING_EDGES = (0.5, 3.0, 6.0, 12.0)
+READINESS_EDGES = (1.0, 3.0, 8.0)
+DEFENSE_EDGES = (1.0, 4.0, 8.0, 15.0)
+"""Band edges in seconds: 9-10 at or under the first, one band lower past each. Set from the
+spread of charged seconds over the development matches (see rubric.md)."""
+HELD_SHARE: dict[str, float] = {"not_shooting": 1.0, "cannot_see": 0.5, "shooting": 0.0}
+
+
+def _episode_span(e: DefenseEpisode, by_id: dict[str, Fact]) -> tuple[float, float] | None:
+    spans = [(f.t_start, f.t_end) for i in e.facts if (f := by_id.get(i)) is not None]
+    if not spans:
+        return None
+    return (min(a for a, _ in spans), max(b for _, b in spans))
+
+
+@dataclass(frozen=True)
+class _Cost:
+    """One episode's cost: still seconds beyond the allowance, the pin cost (those scaled by
+    `while_held`) and the total the defense score counts."""
+
+    held: float
+    pin: float
+    total: float
+
+
+def episode_costs(episodes: Sequence[DefenseEpisode], items: Sequence[DefenseItem]) -> list[_Cost]:
+    """Cost per episode. For `opponent_on_target`: its items' still seconds (a stop item
+    overlapping a contact in the same episode counted once) beyond PIN_ALLOW_S, scaled by
+    `while_held`; the total is the larger of that and the grader's `cost_s`. Episodes that
+    follow each other within PIN_GAP_S share one allowance, so splitting a hold costs the same."""
+    by_fact = {i.fact: i for i in items}
+    out: dict[int, _Cost] = {}
+    held: list[tuple[float, float, int, float]] = []
+    for k, e in enumerate(episodes):
+        mine = [by_fact[f] for f in e.facts if f in by_fact]
+        if e.verdict != "opponent_on_target" or not mine:
+            out[k] = _Cost(0.0, 0.0, 0.0)
             continue
-        if c.call == "charged":
-            total += c.charged_s if c.charged_s is not None else d.lost_s
-        elif c.call == "uncertain":
-            total += d.lost_s / 2
-    return _band_of(total, (0.0, 3.0, 6.0, 10.0)) if total > 0 else (9, 10)
+        contacts = [i for i in mine if i.fact.startswith("contact")]
+        still = sum(
+            i.pin_s
+            for i in mine
+            if i in contacts
+            or not any(_overlap(i.t_start, i.t_end, c.t_start, c.t_end) for c in contacts)
+        )
+        held.append((min(i.t_start for i in mine), max(i.t_end for i in mine), k, still))
+    left, last = PIN_ALLOW_S, -math.inf
+    for a, b, k, still in sorted(held):
+        if a - last > PIN_GAP_S:
+            left = PIN_ALLOW_S
+        beyond = max(0.0, still - left)
+        left, last = max(0.0, left - still), max(last, b)
+        pin = beyond * HELD_SHARE.get(episodes[k].while_held or "", 0.0)
+        out[k] = _Cost(round(beyond, 2), round(pin, 2), round(max(episodes[k].cost_s, pin), 2))
+    return [out[k] for k in range(len(episodes))]
 
 
-def readiness_band(lines: Sequence[ReadinessLine], calls: dict[str, LineCall]) -> Band | None:
-    """From the latest charged activation, with uncertain ones counted half."""
+@dataclass(frozen=True)
+class Charges:
+    """What code charges from the calls and episodes."""
+
+    line: dict[str, float]
+    """Seconds per driving line, lateness per readiness line."""
+    driving_s: float
+    blind: bool
+    """A trip's hopper could not be seen: the driving score is held to its band's lower end."""
+    episode: list[_Cost]
+
+
+def _home_allow(target: _Target, alliance: Alliance, t: float) -> float:
+    """Seconds a heaped robot at video time `t` needs to get home (see TRIP_ALLOW_S)."""
+    near = target.near(t - 1.0, t + 1.0)
+    if not len(near):
+        return TRIP_ALLOW_S
+    out_m = max(0.0, own_wall_m(float(np.median(near[:, 0])), alliance) - ALLIANCE_ZONE_DEPTH_M)
+    return max(TRIP_ALLOW_S, HOME_CROSS_S + out_m / HOME_MPS)
+
+
+def charges(
+    led: Ledgers,
+    calls: dict[str, LineCall],
+    episodes: Sequence[DefenseEpisode],
+    by_id: dict[str, Fact],
+    target: _Target,
+    alliance: Alliance,
+) -> Charges:
+    """Charged seconds per line. Barrier lines: lost_s (or a tile-backed charged_s) less
+    the time opponent episodes cost inside them, half when uncertain. Heaped trips: the time
+    from `heaped_at` to the end of the trip, less charged or excused barrier lines and
+    opponent episodes inside it, less the time to get home from there (`_home_allow`).
+    Readiness: late_s, half when uncertain."""
+    costs = episode_costs(episodes, led.items)
+    opp = [
+        (s, cost.total)
+        for e, cost in zip(episodes, costs, strict=True)
+        if e.verdict == "opponent_on_target" and (s := _episode_span(e, by_id)) is not None
+    ]
+    out: dict[str, float] = {}
+    held: list[tuple[float, float]] = []
+    for d in led.driving:
+        c = calls.get(d.id)
+        if d.kind == "loaded_trip" or c is None:
+            continue
+        cut = sum(min(_overlap_s(d.t_start, d.t_end, s0, s1), t) for (s0, s1), t in opp)
+        base = max(0.0, (c.charged_s if c.charged_s is not None else d.lost_s) - cut)
+        out[d.id] = base if c.call == "charged" else base / 2 if c.call == "uncertain" else 0.0
+        if c.call in ("charged", "uncertain", "opponent", "partner"):
+            held.append((d.t_start, d.t_end))
+    blind = False
+    for d in led.driving:
+        c = calls.get(d.id)
+        if d.kind != "loaded_trip" or c is None:
+            continue
+        blind |= c.call == "cannot_see"
+        if c.call != "heaped" or c.heaped_at is None:
+            out[d.id] = 0.0
+            continue
+        a = max(d.t_start, c.heaped_at)
+        excused = _union_s(a, d.t_end, [*held, *(s for s, _ in opp)])
+        out[d.id] = max(0.0, d.t_end - a - excused - _home_allow(target, alliance, a))
+    for r in led.readiness:
+        c = calls.get(r.id)
+        if c is not None:
+            out[r.id] = (
+                r.late_s if c.call == "charged" else r.late_s / 2 if c.call == "uncertain" else 0.0
+            )
+    out = {k: round(v, 2) for k, v in out.items()}
+    total = sum(out[d.id] for d in led.driving if d.id in out)
+    return Charges(out, round(total, 2), blind, costs)
+
+
+def driving_band(ch: Charges) -> Band:
+    """From the charged seconds; held to its lower end when a hopper could not be seen."""
+    lo, hi = _band_of(ch.driving_s, DRIVING_EDGES)
+    return (lo, lo) if ch.blind else (lo, hi)
+
+
+def readiness_band(
+    lines: Sequence[ReadinessLine], calls: dict[str, LineCall], ch: Charges
+) -> Band | None:
+    """From the latest charged activation; two late ones cap it at 5-6."""
     if not lines:
         return None
-    late: list[float] = []
     for r in lines:
         c = calls.get(r.id)
-        if c is None:
-            continue
-        if c.call == "charged" and r.never_home:
+        if c is not None and c.call == "charged" and r.never_home:
             return (1, 2)
-        late.append(
-            r.late_s if c.call == "charged" else r.late_s / 2 if c.call == "uncertain" else 0.0
-        )
-    band = _band_of(max(late, default=0.0), (1.0, 3.0, 8.0))
-    if sum(x > 1.0 for x in late) >= 2:
+    late = [ch.line.get(r.id, 0.0) for r in lines]
+    band = _band_of(max(late, default=0.0), READINESS_EDGES)
+    if sum(x > READINESS_EDGES[0] for x in late) >= 2:
         band = min(band, (5, 6))
     return band
 
 
-def defense_band(episodes: Sequence[DefenseEpisode]) -> Band | None:
-    """From the cost of each `opponent_on_target` episode; None when there is none."""
-    costs = [e.cost_s for e in episodes if e.verdict == "opponent_on_target"]
+def defense_band(episodes: Sequence[DefenseEpisode], ch: Charges) -> Band | None:
+    """From the summed cost of the `opponent_on_target` episodes; None when there is none."""
+    costs = [
+        c.total
+        for e, c in zip(episodes, ch.episode, strict=True)
+        if e.verdict == "opponent_on_target"
+    ]
     if not costs:
         return None
-    if sum(costs) > 30:
-        return (1, 2)
-    if max(costs) > 8 or (len(costs) >= 2 and sum(c > 3 for c in costs) > len(costs) / 2):
-        return (3, 4)
-    if max(costs) > 5 or sum(c > 2 for c in costs) >= 2:
-        return (5, 6)
-    if max(costs) > 2:
-        return (7, 8)
-    return (9, 10)
+    return _band_of(sum(costs), DEFENSE_EDGES)
 
 
 # --- the frame tool ---------------------------------------------------------------------
@@ -708,16 +974,22 @@ class FrameRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     t: float = Field(ge=0.0, description="Video seconds of the first tile.")
-    count: int = Field(default=4, ge=1, le=4, description="Tiles, one per moment.")
+    count: int = Field(
+        default=4, ge=1, le=4, description="Tiles, one per moment (corner views: at most 2)."
+    )
     step_s: float = Field(
         default=1.0, ge=0.2, le=5.0, description="Seconds between consecutive tiles."
     )
-    view: Literal["target", "full"] = Field(
+    view: View = Field(
         default="target",
-        description="'target': crop around the target robot. 'full': the whole main camera.",
+        description="'target': crop around the target robot. 'full': the whole main camera. "
+        "'corner_left' / 'corner_right': a corner camera panel, uncalibrated (no ring, no "
+        "boxes), to find a target hidden from the main camera and read its bumper.",
     )
     zoom: Literal[1, 2] = Field(
-        default=1, description="2: a crop half as wide around the target, to read bumpers."
+        default=1,
+        description="target view: 2 crops half as wide around the target, to read bumpers and "
+        "the hopper.",
     )
 
 
@@ -875,16 +1147,18 @@ def _bar(width: int, height: int, text: str, scale: float = 0.55) -> Image:
     return bar
 
 
-def _sheet(tiles: list[Image], view: Literal["target", "full"]) -> Image:
-    """Tiles in a 2-wide grid for crops, one column for full views, with the legend."""
-    if view == "full" or len(tiles) == 1:
+def _sheet(tiles: list[Image], view: View) -> Image:
+    """Tiles in a 2-wide grid for crops, one column for full and corner views, with the
+    legend."""
+    if view != "target" or len(tiles) == 1:
         grid = np.vstack(tiles)
     else:
         h, w = tiles[0].shape[:2]
         while len(tiles) % 2:
             tiles = [*tiles, np.zeros((h, w, 3), np.uint8)]
         grid = np.vstack([np.hstack(tiles[i : i + 2]) for i in range(0, len(tiles), 2)])
-    return np.vstack([grid, _bar(grid.shape[1], LEGEND_H, LEGEND, 0.5)])
+    legend = CORNER_LEGEND if view.startswith("corner") else LEGEND
+    return np.vstack([grid, _bar(grid.shape[1], LEGEND_H, legend, 0.5)])
 
 
 FACT_KINDS_LISTED = frozenset(
@@ -904,6 +1178,7 @@ class _FrameServer:
         self.target, self.others = _load_tracks(run, self.match)
         self.facts = Facts.load(run.facts_json)
         self.same_m = self.facts.thresholds.get("SAME_ROBOT_M", 0.7)
+        self.home = _home_view(self.cam, self.match)
         m = self.match.views["main"]
         self.panel = (m.x, m.y, m.w, m.h)
 
@@ -913,6 +1188,9 @@ class _FrameServer:
         done = len(_served(self.run))
         if done >= IMAGE_CAP:
             return f"Refused: the image budget of {IMAGE_CAP} sheets is used up.", None
+        corner = req.view in ("corner_left", "corner_right")
+        if corner and req.count > CORNER_MAX_TILES:
+            return f"Refused: corner views show at most {CORNER_MAX_TILES} tiles per sheet.", None
         fps = self.info.fps
         last = (self.info.frame_count - 1) / fps
         start, step = round(req.t, 1), round(req.step_s, 1)
@@ -920,16 +1198,35 @@ class _FrameServer:
         times = [t for t in times if 0.0 <= t <= last]
         if not times:
             return f"Refused: t must be between 0 and {last:.1f} video seconds.", None
-        main = self.match.views["main"]
         tiles: list[Image] = []
         lines: list[str] = []
         records: list[TileRecord] = []
         for t in times:
-            frame = frame_at(self.run.video, self.info, t + 0.5 / fps, crop=main)
-            spot = _spot(self.target, self.cam, t)
-            marks = _marks(self.others, self.match, spot, t, self.same_m)
             period, clock = _clock(self.match, t)
             phase = _phase(self.match, t)
+            if req.view == "corner_left" or req.view == "corner_right":
+                frame = frame_at(
+                    self.run.video, self.info, t + 0.5 / fps, crop=self.match.views[req.view]
+                )
+                h, w = frame.image.shape[:2]
+                size = (w * CORNER_SCALE, h * CORNER_SCALE)
+                image = np.asarray(
+                    cv2.resize(frame.image, size, interpolation=cv2.INTER_CUBIC), np.uint8
+                )
+                label = f"t={t:.1f}s  {clock} {period} {phase}  {req.view} (uncalibrated)"
+                tiles.append(np.vstack([_bar(image.shape[1], HEADER_H, label), image]))
+                lines.append(f"- frame:{t:.1f}  clock {clock} ({period}, {phase}), {req.view}")
+                records.append(
+                    TileRecord(
+                        t=t, tracked=False, teams_marked=[], teams_near=[], unlabelled_marked=0
+                    )
+                )
+                continue
+            frame = frame_at(
+                self.run.video, self.info, t + 0.5 / fps, crop=self.match.views["main"]
+            )
+            spot = _spot(self.target, self.cam, t)
+            marks = _marks(self.others, self.match, spot, t, self.same_m)
             label = f"t={t:.1f}s  {clock} {period} {phase}  target {spot.status}"
             image, marks = _tile(frame.image, req.view, req.zoom, spot, marks, self.panel)
             tiles.append(np.vstack([_bar(image.shape[1], HEADER_H, label), image]))
@@ -946,6 +1243,7 @@ class _FrameServer:
             records.append(
                 TileRecord(
                     t=t,
+                    tracked=spot.box is not None,
                     teams_marked=sorted({m.team for m in marks if m.team is not None}),
                     teams_near=sorted(
                         {
@@ -972,14 +1270,23 @@ class _FrameServer:
             if f.kind in FACT_KINDS_LISTED
             and _overlap(f.t_start, f.t_end, times[0] - 0.5, times[-1] + 0.5)
         ]
-        text = (
-            f"Sheet {n} of at most {IMAGE_CAP} ({rel}). Tiles, citable as written:\n"
-            + "\n".join(lines)
-            + f"\nFacts overlapping these tiles: {', '.join(near) or 'none'}."
-            + "\nYellow ring: the target's measured box; orange ring: its position estimated "
+        end = "the target's own end" if req.view == self.home else "the opponents' end"
+        how = (
+            f"{req.view} is a corner camera showing {end}. "
+            "It is not calibrated: the tool cannot ring the target or box robots there. Name the "
+            "target only where you read its bumper number, and give that number as "
+            "corner_bumper in any call that cites these tiles."
+            if corner
+            else "Yellow ring: the target's measured box; orange ring: its position estimated "
             "between detections. Boxes are the other robots the tool tracked: team and "
             "PARTNER/OPP from the roster, or 'unlabelled' when the tool does not know the team. "
             "A robot with no box was NOT tracked: no fact knows about it."
+        )
+        text = (
+            f"Sheet {n} of at most {IMAGE_CAP} ({rel}). Tiles, citable as written:\n"
+            + "\n".join(lines)
+            + f"\nFacts overlapping these tiles: {', '.join(near) or 'none'}.\n"
+            + how
         )
         return text, sheet
 
@@ -994,8 +1301,9 @@ def serve_frames(run_path: Path) -> None:
         "description": (
             "Show the main broadcast camera at up to four consecutive moments, cropped around "
             "the target robot (ringed) or the whole view, labelled with video time and match "
-            "clock. Other tracked robots are boxed with their team and partner/opponent, or "
-            f"'unlabelled'. At most {IMAGE_CAP} sheets per grade."
+            "clock; other tracked robots are boxed with their team and partner/opponent, or "
+            "'unlabelled'. Or show a corner camera panel (unmarked) at up to two moments. "
+            f"At most {IMAGE_CAP} sheets per grade."
         ),
         "inputSchema": FrameRequest.model_json_schema(),
     }
@@ -1069,7 +1377,7 @@ def _rubric_version(rubric: str) -> str:
     return value.strip()
 
 
-def _prompts(match: MatchInfo, facts_json: str, led: Ledgers) -> tuple[str, str]:
+def _prompts(match: MatchInfo, facts_json: str, led: Ledgers, home: Corner) -> tuple[str, str]:
     """System prompt (rules, game, limits, rubric) and task (match, ledgers and facts)."""
     system = "\n\n".join(
         [
@@ -1094,7 +1402,7 @@ def _prompts(match: MatchInfo, facts_json: str, led: Ledgers) -> tuple[str, str]
         for p in match.phases
         if p.active_hubs is not None and match.target_alliance in p.active_hubs
     ]
-    drive, ready, items = _ledger_text(led, match)
+    drive, ready, items = _ledger_text(led, match, home)
     compact = json.dumps(json.loads(facts_json), separators=(",", ":"))
     fill = {
         "team": str(match.target_team),
@@ -1103,6 +1411,7 @@ def _prompts(match: MatchInfo, facts_json: str, led: Ledgers) -> tuple[str, str]
         "auto_winner": match.auto_winner or "unknown",
         "phases": phases,
         "own_active": ", ".join(own),
+        "home_view": home,
         "driving_ledger": drive,
         "readiness_ledger": ready,
         "defense_items": items,
@@ -1265,9 +1574,21 @@ MOTIVE_WORD = re.compile(
     re.IGNORECASE,
 )
 FUEL_WORD = re.compile(
-    r"\b(fuel|balls?|hopper|loaded|shots?|shoot\w*|fir(?:e|es|ed|ing)|volleys?|scored|scoring)\b",
+    r"\b(fuel|balls?|hopper|heaped|loaded|shots?|shoot\w*|fir(?:e|es|ed|ing)|volleys?|scored|"
+    r"scoring)\b",
     re.IGNORECASE,
 )
+CLEAN_WORD = re.compile(
+    r"\b(clean(?:ly)?|smooth(?:ly)?|no hesitation|unhindered|staging|staged|kept moving|"
+    r"keeps moving|kept working|kept its route|played through|free(?:d)? itself)\b",
+    re.IGNORECASE,
+)
+"""Words reading a stretch as fine: rejected over a charged line or a costed pin."""
+FAULT_WORD = re.compile(
+    r"\b(stall\w*|stuck|hesitat\w*|backed off|backing off|abort\w*|wasted|beached|wedged)\b",
+    re.IGNORECASE,
+)
+"""Words reading a stretch as a driving fault: rejected over a line a tile cleared."""
 PLACE_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bcent(?:re|er)[ -]?line\b|\bmidfield\b", re.I), "centre line"),
     (re.compile(r"\bred (?:hub|bump|ramp|trench)", re.I), "red barrier"),
@@ -1275,9 +1596,28 @@ PLACE_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:own|its|alliance) zone\b", re.I), "own zone"),
     (re.compile(r"\bneutral zone\b", re.I), "neutral zone"),
 )
+POINT_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"\b(?:beside|next to|by|at|against|near|under|in front of|up to) "
+            r"(?:its |the |their )?(?:own )?hub\b",
+            re.I,
+        ),
+        "beside its hub",
+    ),
+    (re.compile(r"\b(?:alliance|driver[- ]station|its own|its|back) wall\b", re.I), "at its wall"),
+    (re.compile(r"\bguard ?rail\b|\bside wall\b", re.I), "at the guardrail"),
+)
+"""Place words checked against distances: the cited stop's or contact's `where`, else the
+target's tracked positions over what the item cites."""
 ATTACK = frozenset({"opponent_on_target", "target_on_opponent"})
-NEEDS_FRAME_FOR_PASS = 1.0
-"""A pass may be dismissed from facts alone when the target was never still this long."""
+BARRIER_CALLS: frozenset[Call] = frozenset(
+    {"charged", "opponent", "partner", "frame_contradicts", "uncertain"}
+)
+TRIP_CALLS: frozenset[Call] = frozenset({"heaped", "not_heaped", "cannot_see", "frame_contradicts"})
+READINESS_CALLS: frozenset[Call] = frozenset(
+    {"charged", "opponent", "frame_contradicts", "uncertain"}
+)
 
 
 @dataclass(frozen=True)
@@ -1318,19 +1658,37 @@ class _Item:
     """Check role words and places (notes, calls, episodes)."""
 
 
+@dataclass(frozen=True)
+class _At:
+    """What was served at one cited moment: the main-camera tile, and whether a corner
+    panel was shown then too."""
+
+    main: TileRecord | None
+    corner: bool
+
+
 class _Checker:
     """Collects problems while checking one answer."""
 
     def __init__(self, ctx: GradeContext, sheets: list[FrameSheet]) -> None:
         self.ctx = ctx
         self.by_id = ctx.by_id
-        self.tiles = {round(tile.t, 1): tile for s in sheets for tile in s.tiles}
+        self.tiles: dict[float, _At] = {}
+        for s in sheets:
+            for tile in s.tiles:
+                t = round(tile.t, 1)
+                was = self.tiles.get(t, _At(None, False))
+                corner = s.view.startswith("corner")
+                self.tiles[t] = _At(was.main if corner else tile, was.corner or corner)
         self.problems: list[str] = []
         self.lines: dict[str, DrivingLine | ReadinessLine] = {
             **{d.id: d for d in ctx.led.driving},
             **{r.id: r for r in ctx.led.readiness},
         }
         self.episodes: list[DefenseEpisode] = []
+        self.charged_lines: list[DrivingLine] = []
+        self.cleared_lines: list[tuple[DrivingLine, str]] = []
+        self.pinned: list[tuple[float, float]] = []
 
     def bad(self, msg: str) -> None:
         self.problems.append(msg)
@@ -1356,13 +1714,19 @@ class _Checker:
             return None
         return (f.t_start, f.t_end)
 
-    def frames_in(self, cites: Iterable[str], a: float, b: float) -> list[float]:
+    def frames_in(
+        self, cites: Iterable[str], a: float, b: float, pad: float = SPAN_PAD_S
+    ) -> list[float]:
         out: list[float] = []
         for c in cites:
             t = self.frame_t(c) if c.startswith("frame:") else None
-            if t is not None and a - SPAN_PAD_S <= t <= b + SPAN_PAD_S:
+            if t is not None and a - pad <= t <= b + pad:
                 out.append(t)
         return out
+
+    def corner_only(self, t: float) -> bool:
+        at = self.tiles[t]
+        return at.corner and at.main is None
 
     # who is who
 
@@ -1373,8 +1737,8 @@ class _Checker:
         for c in cites:
             if c.startswith("frame:"):
                 t = self.frame_t(c)
-                if t is not None:
-                    tile = self.tiles[t]
+                tile = self.tiles[t].main if t is not None else None
+                if tile is not None:
                     out |= set(tile.teams_near if near_only else tile.teams_marked)
                 continue
             f = self.by_id.get(c)
@@ -1384,12 +1748,15 @@ class _Checker:
                 out |= {o.team for o in f.data.others_near if o.team is not None}
         return out
 
+    def spans_of(self, cites: Iterable[str]) -> list[tuple[float, float]]:
+        return [s for c in cites if (s := self._quiet_span(c)) is not None]
+
     def episode_roles(self, cites: Iterable[str]) -> set[str]:
         """Verdicts of episodes overlapping the cited spans."""
-        spans = [s for c in cites if (s := self._quiet_span(c)) is not None]
+        spans = self.spans_of(cites)
         out: set[str] = set()
         for e in self.episodes:
-            es = self._episode_span(e)
+            es = _episode_span(e, self.by_id)
             if es is not None and any(_overlap(a, b, es[0], es[1]) for a, b in spans):
                 out.add(e.verdict)
         return out
@@ -1400,12 +1767,6 @@ class _Checker:
             return None if t is None else (t, t)
         f = self.by_id.get(cite)
         return None if f is None else (f.t_start, f.t_end)
-
-    def _episode_span(self, e: DefenseEpisode) -> tuple[float, float] | None:
-        spans = [(f.t_start, f.t_end) for i in e.facts if (f := self.by_id.get(i)) is not None]
-        if not spans:
-            return None
-        return (min(a for a, _ in spans), max(b for _, b in spans))
 
     # text
 
@@ -1492,10 +1853,45 @@ class _Checker:
                 f"{at}: {m.group(0)!r} is about fuel or shooting, which positions cannot show; "
                 "cite the tile that shows it or remove it"
             )
+        self.readings(item, bare, has_frame)
         if item.roles:
             self.roles(item, bare)
             self.places(item, bare)
         return out
+
+    def readings(self, item: _Item, bare: str, has_frame: bool) -> None:
+        """One stretch, one reading: no text calls fine what the ledger charged, or a fault
+        what a tile cleared; and a claim that it kept moving needs a tile."""
+        spans = self.spans_of(item.cites)
+
+        def hits(a: float, b: float) -> bool:
+            return any(_overlap(a, b, s0, s1) for s0, s1 in spans)
+
+        charged = [d.id for d in self.charged_lines if hits(d.t_start, d.t_end)]
+        pinned = any(hits(a, b) for a, b in self.pinned)
+        for m in CLEAN_WORD.finditer(bare):
+            if NEGATED.search(bare[: m.start()]):
+                continue
+            if charged or pinned:
+                what = f"line {', '.join(charged)} is charged" if charged else "a pin is costed"
+                self.bad(
+                    f"{item.at}: {m.group(0)!r} reads the stretch it cites as fine, but {what} "
+                    "there; describe it as the ledger calls it, or cite only what you mean"
+                )
+                return
+            if not has_frame:
+                self.bad(f"{item.at}: {m.group(0)!r} needs a cited tile that shows it")
+                return
+        cleared = [(d.id, why) for d, why in self.cleared_lines if hits(d.t_start, d.t_end)]
+        if cleared and not charged:
+            for m in FAULT_WORD.finditer(bare):
+                if NEGATED.search(bare[: m.start()]):
+                    continue
+                self.bad(
+                    f"{item.at}: {m.group(0)!r} reads the stretch as a driving fault, but "
+                    + ", ".join(f"{i} was called {why}" for i, why in cleared)
+                )
+                return
 
     def roles(self, item: _Item, bare: str) -> None:
         near = self.labelled(item.cites, near_only=True) | set(item.bumpers_read)
@@ -1517,24 +1913,32 @@ class _Checker:
 
     def places(self, item: _Item, bare: str) -> None:
         claims = [name for pat, name in PLACE_WORDS if pat.search(bare)]
-        if not claims:
+        points = [name for pat, name in POINT_WORDS if pat.search(bare)]
+        if not claims and not points:
             return
+        alliance: Alliance = self.ctx.match.target_alliance
         xs: list[float] = []
+        xy: list[tuple[float, float]] = []
+        near = set[str]()
         for c in item.cites:
             s = self._quiet_span(c)
             if s is None:
                 continue
+            f = self.by_id.get(c)
+            if f is not None:
+                data = f.model_dump().get("data")
+                near |= _declared_places(data)
+                where = getattr(f.data, "where", None)
+                if where is not None:
+                    xy.append((float(where.x), float(where.y)))
+                    xs.append(float(where.x))
+                    continue
             pad = 0.5 if c.startswith("frame:") else SPAN_PAD_S
             got = self.ctx.target.near(s[0] - pad, s[1] + pad)
             if c.startswith("frame:") and not len(got):
                 return
             xs += [float(v) for v in got[:, 0]]
-        alliance: Alliance = self.ctx.match.target_alliance
-        near = set[str]()
-        for c in item.cites:
-            f = self.by_id.get(c)
-            if f is not None:
-                near |= _declared_places(f.model_dump().get("data"))
+            xy += [(float(p[0]), float(p[1])) for p in got]
         if not xs and not near:
             return
         for x in xs:
@@ -1545,6 +1949,13 @@ class _Checker:
             for colour, (x0, x1) in BARRIER_X.items():
                 if x0 - BARRIER_NEAR_M <= x <= x1 + BARRIER_NEAR_M:
                     near.add(f"{colour} barrier")
+        for x, y in xy:
+            if rect_distance_m(HUBS[alliance], x, y) <= HUB_NEAR_M:
+                near.add("beside its hub")
+            if own_wall_m(x, alliance) <= WALL_NEAR_M:
+                near.add("at its wall")
+            if guardrail_m(y) <= WALL_NEAR_M:
+                near.add("at the guardrail")
         span = f"tracked at x {min(xs):.1f}-{max(xs):.1f} m" if xs else "not tracked"
         for claim in claims:
             if claim not in near:
@@ -1552,6 +1963,19 @@ class _Checker:
                     f"{item.at}: says {claim!r}, but the target was {span} over what it cites "
                     f"and those facts name only: {', '.join(sorted(near)) or 'nothing'}; fix "
                     "the place or cite the tile that shows it"
+                )
+        if not xy:
+            return
+        hub = min(rect_distance_m(HUBS[alliance], x, y) for x, y in xy)
+        wall = min(own_wall_m(x, alliance) for x, _ in xy)
+        rail = min(guardrail_m(y) for _, y in xy)
+        for claim in points:
+            if claim not in near:
+                self.bad(
+                    f"{item.at}: says {claim!r}, but over what it cites the target's centre was "
+                    f"at least {_fmt(hub)} m from its hub, {_fmt(wall)} m from its wall and "
+                    f"{_fmt(rail)} m from a guardrail (a stop or contact counts by its `where`); "
+                    "say where it was from those distances"
                 )
 
 
@@ -1578,29 +2002,23 @@ def _declared_places(data: object) -> set[str]:
     return out
 
 
-def check_answer(
-    raw: object, ctx: GradeContext, sheets: list[FrameSheet]
-) -> tuple[GradeAnswer | None, list[str], dict[SkillName, Band | None], dict[str, str]]:
-    """Validate the agent's answer. Returns the answer when it passes, every problem found,
-    each skill's band, and every text field resolved (keyed by its location)."""
-    try:
-        answer = GradeAnswer.model_validate(raw)
-    except ValidationError as e:
-        problems = [
-            f"schema: {'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()
-        ]
-        return None, problems, {}, {}
-    ck = _Checker(ctx, sheets)
-    led = ctx.led
-    resolved: dict[str, str] = {}
+@dataclass(frozen=True)
+class Checked:
+    """A checked answer: the answer when it passed, every problem, the bands, the charges
+    and every text field resolved (keyed by its location)."""
 
-    def text(
-        at: str, value: str, cites: list[str], bumpers: list[int] | None = None, roles: bool = True
-    ) -> None:
-        resolved[at] = ck.resolve(_Item(at, value, cites, bumpers or [], roles))
+    answer: GradeAnswer | None
+    problems: list[str]
+    bands: dict[SkillName, Band | None]
+    charges: Charges | None
+    resolved: dict[str, str]
 
-    # episodes first: role words elsewhere lean on them
-    items = {i.fact: i for i in led.items}
+
+def _check_episodes(ck: _Checker, answer: GradeAnswer, sheets: list[FrameSheet]) -> None:
+    ctx = ck.ctx
+    items = {i.fact: i for i in ctx.led.items}
+    driving_spans = [(d.t_start, d.t_end) for d in ctx.led.driving if d.kind != "loaded_trip"]
+    costs = episode_costs(answer.episodes, ctx.led.items)
     covered: set[str] = set()
     for k, e in enumerate(answer.episodes):
         at = f"episode {k + 1} ({', '.join(e.facts)})"
@@ -1611,7 +2029,7 @@ def check_answer(
             ck.bad(f"{at}: {bad_ids} are not fact ids")
             continue
         covered |= set(e.facts)
-        span = ck._episode_span(e)  # pyright: ignore[reportPrivateUsage]
+        span = _episode_span(e, ck.by_id)
         assert span is not None
         frames = ck.frames_in(e.cites, *span)
         team = e.other_team
@@ -1646,11 +2064,9 @@ def check_answer(
                 )
         elif team is not None:
             ck.bad(f"{at}: identified_by none but other_team is set")
+        contacts = [f for i in e.facts if isinstance(f := ck.by_id[i], ContactFact)]
         if e.identified_by != "none":
-            for i in e.facts:
-                f = ck.by_id[i]
-                if not isinstance(f, ContactFact):
-                    continue
+            for f in contacts:
                 teams = {o.team for o in f.data.others}
                 rels = {o.relation for o in f.data.others if o.team is not None}
                 boxed = {
@@ -1658,7 +2074,8 @@ def check_answer(
                     for c in e.cites
                     if (t := ck.frame_t(c) if c.startswith("frame:") else None) is not None
                     and f.t_start - SPAN_PAD_S <= t <= f.t_end + SPAN_PAD_S
-                    for m in ck.tiles[t].teams_near
+                    and (tile := ck.tiles[t].main) is not None
+                    for m in tile.teams_near
                 }
                 fits = (
                     team in teams or rel in rels or (None in teams and team in boxed)
@@ -1669,7 +2086,7 @@ def check_answer(
                 )
                 if not fits:
                     ck.bad(
-                        f"{at}: no robot in {i} can be {team or e.identified_by} (its robots "
+                        f"{at}: no robot in {f.id} can be {team or e.identified_by} (its robots "
                         f"are {sorted(str(t or 'unlabelled') for t in teams)}); give it its own "
                         "episode"
                     )
@@ -1683,7 +2100,7 @@ def check_answer(
                 f"{at}: {e.verdict} needs the other robot established as {need[e.verdict]} "
                 f"(it is {rel}: from {e.identified_by}); otherwise use could_not_tell"
             )
-        if e.verdict in need and not frames:
+        if e.verdict != "could_not_tell" and not frames:
             ck.bad(f"{at}: {e.verdict} needs a cited tile within {SPAN_PAD_S:g} s of the episode")
         long = [i.fact for i in (items.get(x) for x in e.facts) if i and i.t_end - i.t_start >= 1.0]
         if long and not frames and len(sheets) < IMAGE_CAP:
@@ -1692,19 +2109,27 @@ def check_answer(
                 f"{SPAN_PAD_S:g} s of it before deciding (could_not_tell without a tile is only "
                 "allowed once the sheet budget is used up)"
             )
-        if e.verdict == "pass_no_holdup" and not frames:
-            for i in e.facts:
-                f = ck.by_id[i]
-                if not (
-                    isinstance(f, ContactFact)
-                    and f.data.unseen_s == 0
-                    and f.data.longest_still_s < NEEDS_FRAME_FOR_PASS
-                    and f.data.end != "unknown_target_track_lost"
-                ):
+        if e.verdict == "apart" or (e.verdict == "could_not_tell" and len(sheets) < IMAGE_CAP):
+            for f in contacts:
+                d = f.data
+                if not (rel == "opponent" or any(o.relation == "opponent" for o in d.others)):
+                    continue
+                why = (
+                    "the target was in its own zone"
+                    if d.target_zone == "own" or d.where.zone == "own"
+                    else f"they came within {_fmt(d.min_distance_m)} m (touching)"
+                    if d.min_distance_m < TOUCH_M
+                    else f"the target was still {_fmt(d.longest_still_s)} s beside it"
+                    if d.longest_still_s >= APART_STILL_S
+                    else "it happened during a driving ledger line"
+                    if any(_overlap(f.t_start, f.t_end, a, b) for a, b in driving_spans)
+                    else None
+                )
+                if why is not None:
                     ck.bad(
-                        f"{at}: {i} cannot be dismissed as a pass from the facts alone (only a "
-                        "fully seen contact with the target never still for a second and tracked "
-                        "after can); cite a tile or use could_not_tell"
+                        f"{at}: {f.id} cannot be {e.verdict}: an opponent is established in it and "
+                        f"{why}. An opponent there is on the target: open a tile and use "
+                        "opponent_on_target (cost_s 0 when it cost nothing) or target_on_opponent"
                     )
         if e.verdict != "opponent_on_target" and e.cost_s:
             ck.bad(f"{at}: cost_s must be 0 unless the verdict is opponent_on_target")
@@ -1712,34 +2137,162 @@ def check_answer(
         away = [i for i in mine if not i.home_active]
         if e.cost_s and mine and not away:
             ck.bad(
-                f"{at}: cost_s must be 0: the target was home in its own active time, where being "
-                "pressed is playing through (rubric)"
+                f"{at}: cost_s must be 0: the target was home in its own active time, where only "
+                "its pin time costs (code computes it from pin_s and while_held)"
             )
         elif away and len(away) < len(mine):
             most = sum(i.t_end - i.t_start for i in away)
             if e.cost_s > most + 1e-6:
                 ck.bad(
                     f"{at}: cost_s {e.cost_s:g} is more than the {_fmt(most)} s of its items away "
-                    "from home or outside its active time; home time in its active time costs 0"
+                    "from home or outside its active time"
                 )
         if e.cost_s > span[1] - span[0] + SPAN_PAD_S:
             ck.bad(f"{at}: cost_s {e.cost_s:g} is longer than the episode's facts span")
+        if costs[k].held > 0 and e.while_held is None:
+            ck.bad(
+                f"{at}: its items hold {_fmt(costs[k].held)} s still beyond the allowance; set "
+                "while_held from the tiles "
+                "across the still stretch (not_shooting, shooting or cannot_see)"
+            )
     ck.episodes = list(answer.episodes)
-    missing = [i.fact for i in led.items if i.fact not in covered]
+    missing = [i.fact for i in ctx.led.items if i.fact not in covered]
     if missing:
         ck.bad(
             f"episodes: these defense items are not accounted for: {', '.join(missing)}; put each "
             "in an episode (could_not_tell is allowed)"
         )
-    for k, e in enumerate(answer.episodes):
-        text(
-            f"episode {k + 1} ({', '.join(e.facts)})",
-            e.text,
-            [*e.facts, *e.cites],
-            [e.other_team] if e.identified_by == "bumper_number" and e.other_team else [],
-        )
 
-    # ledger calls
+
+def _check_call(
+    ck: _Checker,
+    c: LineCall,
+    line: DrivingLine | ReadinessLine,
+    opp_spans: list[tuple[float, float]],
+    sheets: list[FrameSheet],
+) -> None:
+    at = f"line call {c.line}"
+    ctx = ck.ctx
+    for x in c.cites:
+        ck.span(x, at)
+    trip = isinstance(line, DrivingLine) and line.kind == "loaded_trip"
+    allowed = (
+        TRIP_CALLS if trip else BARRIER_CALLS if isinstance(line, DrivingLine) else READINESS_CALLS
+    )
+    if c.call not in allowed:
+        ck.bad(f"{at}: {c.call} is not a call for this line; use one of {sorted(allowed)}")
+        return
+    a, b = (
+        (line.t_start, line.t_end)
+        if isinstance(line, DrivingLine)
+        else (line.t, line.t + line.late_s)
+    )
+    frames = ck.frames_in(c.cites, a, b, pad=0.05 if trip else SPAN_PAD_S)
+    corner = [t for t in ck.frames_in(c.cites, a, b) if ck.corner_only(t)]
+    if corner and c.corner_bumper != ctx.match.target_team:
+        ck.bad(
+            f"{at}: it cites corner tile(s) {', '.join(f'frame:{t:.1f}' for t in corner)}; a "
+            "corner tile counts only where you read the target's bumper number there: set "
+            f"corner_bumper to {ctx.match.target_team} if you read it, else do not rely on it"
+        )
+    if c.heaped_at is not None and c.call != "heaped":
+        ck.bad(f"{at}: heaped_at is only for heaped")
+    if c.charged_s is not None and (trip or not isinstance(line, DrivingLine)):
+        ck.bad(f"{at}: charged_s is only for charged barrier lines")
+    if isinstance(line, DrivingLine) and trip:
+        seen = [
+            t
+            for t in frames
+            if ((m := ck.tiles[t].main) is not None and m.tracked) or ck.corner_only(t)
+        ]
+        if c.call == "heaped":
+            t = c.heaped_at
+            if t is None or not any(abs(t - s) <= FRAME_MATCH_S for s in seen):
+                ck.bad(
+                    f"{at}: heaped needs heaped_at = the time of a cited tile inside the trip "
+                    f"({a:.1f}-{b:.1f} s) where the target is ringed (or read on a corner tile) "
+                    "and its hopper is heaped"
+                )
+        elif c.call == "not_heaped":
+            late = line.look_at[-1] - 1.0
+            if not any(t >= late for t in seen):
+                ck.bad(
+                    f"{at}: not_heaped needs a cited tile with the target ringed at or after "
+                    f"{late:.1f} s (its last hopper tile is {line.look_at[-1]:.1f} s): a robot "
+                    "can fill up out there. If no late tile shows the hopper, say cannot_see"
+                )
+        elif c.call == "cannot_see" and not frames and len(sheets) < IMAGE_CAP:
+            ck.bad(f"{at}: cannot_see needs the hopper tiles you looked at cited (inside the trip)")
+        elif c.call == "frame_contradicts" and not frames:
+            ck.bad(f"{at}: frame_contradicts needs a cited tile inside the trip")
+        return
+    if c.call == "partner" and isinstance(line, DrivingLine):
+        stops = [
+            (f.t_start, f.t_end) for i in line.facts if isinstance(f := ck.by_id.get(i), StopFact)
+        ] or [(line.t_start, line.t_end)]
+        held = [
+            i
+            for i in line.partner_contacts
+            if any(_overlap(ck.by_id[i].t_start, ck.by_id[i].t_end, a0, b0) for a0, b0 in stops)
+        ]
+        if not held:
+            ck.bad(
+                f"{at}: partner needs a partner contact fact while it was stopped "
+                f"({', '.join(f'{a0:.1f}-{b0:.1f}' for a0, b0 in stops)} s); a partner nearby "
+                "is not in the way"
+            )
+    if c.call in ("partner", "frame_contradicts") and not frames:
+        ck.bad(f"{at}: {c.call} needs a cited tile within {SPAN_PAD_S:g} s of {a:.1f}-{b:.1f} s")
+    if c.call == "opponent" and not any(
+        _overlap(a - SPAN_PAD_S, b + SPAN_PAD_S, s0, s1) for s0, s1 in opp_spans
+    ):
+        ck.bad(f"{at}: opponent needs an opponent_on_target episode overlapping the line")
+    if c.call == "charged" and isinstance(line, DrivingLine) and not frames:
+        why = [
+            *([f"partly inferred ({_fmt(line.unseen_s)} s unseen)"] if line.unseen_s > 0 else []),
+            *(["an upper bound"] if line.bound else []),
+            *(["a corner reach only"] if line.corner_reach else []),
+        ]
+        if why:
+            ck.bad(
+                f"{at}: {line.id} is {' and '.join(why)}; charge it only with a cited tile in its "
+                "span that shows the stall, else call it uncertain (or frame_contradicts)"
+            )
+    if c.charged_s is not None and isinstance(line, DrivingLine):
+        if c.call != "charged":
+            ck.bad(f"{at}: charged_s is only for charged lines")
+        elif (
+            not line.bound
+            or c.charged_s > line.lost_s
+            or not any(abs(t - line.t_start - c.charged_s) <= 0.6 for t in frames)
+        ):
+            ck.bad(
+                f"{at}: charged_s is only for a line whose cost is an upper bound (arrival first "
+                "seen after a gap): the seconds from the line's start to a cited tile that shows "
+                f"the target home, at most lost_s ({_fmt(line.lost_s)}). Otherwise charge the "
+                "line in full, or call it uncertain"
+            )
+
+
+def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Checked:
+    """Validate the agent's answer and compute the charges and bands it implies."""
+    try:
+        answer = GradeAnswer.model_validate(raw)
+    except ValidationError as e:
+        problems = [
+            f"schema: {'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()
+        ]
+        return Checked(None, problems, {}, None, {})
+    ck = _Checker(ctx, sheets)
+    led = ctx.led
+    resolved: dict[str, str] = {}
+
+    def text(
+        at: str, value: str, cites: list[str], bumpers: list[int] | None = None, roles: bool = True
+    ) -> None:
+        resolved[at] = ck.resolve(_Item(at, value, cites, bumpers or [], roles))
+
+    _check_episodes(ck, answer, sheets)
     calls: dict[str, LineCall] = {}
     for c in answer.line_calls:
         if c.line in calls:
@@ -1750,83 +2303,47 @@ def check_answer(
             ck.bad(f"line_calls: ledger line {line_id} has no call")
     opp_spans = [
         s for e in answer.episodes if e.verdict == "opponent_on_target"
-        if (s := ck._episode_span(e)) is not None  # pyright: ignore[reportPrivateUsage]
+        if (s := _episode_span(e, ck.by_id)) is not None
     ]  # fmt: skip
     for c in answer.line_calls:
-        at = f"line call {c.line}"
         line = ck.lines.get(c.line)
         if line is None:
-            ck.bad(f"{at}: no ledger line {c.line}")
+            ck.bad(f"line call {c.line}: no ledger line {c.line}")
             continue
-        for x in c.cites:
-            ck.span(x, at)
-        a, b = (
-            (line.t_start, line.t_end)
-            if isinstance(line, DrivingLine)
-            else (line.t, line.t + line.late_s)
-        )
-        frames = ck.frames_in(c.cites, a, b)
-        driving = isinstance(line, DrivingLine)
-        if c.call in ("hub_inactive", "partner") and not driving:
-            ck.bad(f"{at}: {c.call} is for driving lines only")
-        if (
-            c.call == "hub_inactive"
-            and isinstance(line, DrivingLine)
-            and line.own_hub_active is not False
-        ):
-            ck.bad(f"{at}: hub_inactive needs own_hub_active false; it is {line.own_hub_active}")
-        if c.call == "partner" and isinstance(line, DrivingLine):
-            stops = [
-                (f.t_start, f.t_end)
-                for i in line.facts
-                if isinstance(f := ck.by_id.get(i), StopFact)
-            ] or [(line.t_start, line.t_end)]
-            held = [
-                i
-                for i in line.partner_contacts
-                if any(_overlap(ck.by_id[i].t_start, ck.by_id[i].t_end, a0, b0) for a0, b0 in stops)
-            ]
-            if not held:
-                ck.bad(
-                    f"{at}: partner needs a partner contact fact while it was stopped "
-                    f"({', '.join(f'{a0:.1f}-{b0:.1f}' for a0, b0 in stops)} s); a partner nearby "
-                    "is not in the way"
-                )
-        if c.call in ("partner", "frame_contradicts") and not frames:
-            ck.bad(
-                f"{at}: {c.call} needs a cited tile within {SPAN_PAD_S:g} s of {a:.1f}-{b:.1f} s"
-            )
-        if c.call == "opponent" and not any(
-            _overlap(a - SPAN_PAD_S, b + SPAN_PAD_S, s0, s1) for s0, s1 in opp_spans
-        ):
-            ck.bad(f"{at}: opponent needs an opponent_on_target episode overlapping the line")
-        if (
-            c.call == "charged"
-            and isinstance(line, DrivingLine)
-            and line.unseen_s > 0
-            and not frames
-        ):
-            ck.bad(
-                f"{at}: {line.id} is partly inferred ({_fmt(line.unseen_s)} s unseen); charge it "
-                "only with a cited tile in its span that shows it, else call it uncertain"
-            )
-        if c.charged_s is not None:
-            if not isinstance(line, DrivingLine) or c.call != "charged":
-                ck.bad(f"{at}: charged_s is only for charged driving lines")
-            elif c.charged_s > line.lost_s or not frames:
-                ck.bad(
-                    f"{at}: charged_s must be at most lost_s ({_fmt(line.lost_s)}) and backed "
-                    "by a cited tile in the line's span"
-                )
-        text(
-            at, c.text, [*c.cites, *(line.facts if isinstance(line, DrivingLine) else [line.fact])]
-        )
+        _check_call(ck, c, line, opp_spans, sheets)
 
-    # skills
+    # what code charges, then the text checks that lean on it
+    ch = charges(led, calls, answer.episodes, ck.by_id, ctx.target, ctx.match.target_alliance)
+    for d in led.driving:
+        c = calls.get(d.id)
+        if c is None:
+            continue
+        if ch.line.get(d.id, 0.0) > 0:
+            ck.charged_lines.append(d)
+        elif c.call in ("frame_contradicts", "not_heaped"):
+            ck.cleared_lines.append((d, c.call))
+    ck.pinned = [
+        s
+        for e, cost in zip(answer.episodes, ch.episode, strict=True)
+        if cost.pin > 0 and (s := _episode_span(e, ck.by_id)) is not None
+    ]
+    for k, e in enumerate(answer.episodes):
+        text(
+            f"episode {k + 1} ({', '.join(e.facts)})",
+            e.text,
+            [*e.facts, *e.cites],
+            [e.other_team] if e.identified_by == "bumper_number" and e.other_team else [],
+        )
+    for c in answer.line_calls:
+        line = ck.lines.get(c.line)
+        if line is not None:
+            own = line.facts if isinstance(line, DrivingLine) else [line.fact]
+            text(f"line call {c.line}", c.text, [*c.cites, *own])
+
     bands: dict[SkillName, Band | None] = {
-        "driving": driving_band(led.driving, calls),
-        "shift_readiness": readiness_band(led.readiness, calls),
-        "handling_defense": defense_band(answer.episodes),
+        "driving": driving_band(ch),
+        "shift_readiness": readiness_band(led.readiness, calls, ch),
+        "handling_defense": defense_band(answer.episodes, ch),
     }
     names = [g.skill for g in answer.skills]
     if sorted(names) != sorted(SKILLS):
@@ -1856,6 +2373,17 @@ def check_answer(
             ck.bad(
                 f"{at}: score {g.score} is outside the band {band[0]}-{band[1]} the rubric "
                 "gives for your calls and episodes"
+                + (
+                    f" ({_fmt(ch.driving_s)} charged s"
+                    + (
+                        "; a hopper you could not see holds it to the lower score"
+                        if ch.blind
+                        else ""
+                    )
+                    + ")"
+                    if g.skill == "driving"
+                    else ""
+                )
             )
         text(f"{at} summary", g.summary, g.cites, roles=False)
         if g.null_reason is not None:
@@ -1870,9 +2398,24 @@ def check_answer(
             ck.bad(f"{at}: t is more than {NOTE_REACH_S:g} s from everything it cites")
         if n.kind == "played_through_defense" and not any(c.startswith("frame:") for c in n.cites):
             ck.bad(f"{at}: played_through_defense needs a frame citation")
+        spans = [s for c in n.cites if (s := ck._quiet_span(c)) is not None]  # pyright: ignore[reportPrivateUsage]
+        hit = [
+            d.id
+            for d in ck.charged_lines
+            if any(_overlap(d.t_start, d.t_end, a, b) for a, b in spans)
+        ]
+        if n.kind in ("went_well", "played_through_defense") and hit:
+            ck.bad(f"{at}: kind {n.kind} over {', '.join(hit)}, which is charged")
+        cleared = [
+            i.id
+            for i, _ in ck.cleared_lines
+            if any(_overlap(i.t_start, i.t_end, a, b) for a, b in spans)
+        ]
+        if n.kind == "went_wrong" and cleared and not hit:
+            ck.bad(f"{at}: kind went_wrong over {', '.join(cleared)}, which a tile cleared")
         text(at, n.text, n.cites, n.bumpers_read)
     problems = ck.problems
-    return (answer if not problems else None), problems, bands, resolved
+    return Checked(answer if not problems else None, problems, bands, ch, resolved)
 
 
 def _retry_prompt(problems: list[str]) -> str:
@@ -1918,7 +2461,8 @@ def grade(run: RunDir) -> None:
     work = _work(run)
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir()
-    system, task = _prompts(match, run.facts_json.read_text(), ctx.led)
+    home = _home_view(Camera.load(run.calibration_json, "main"), match)
+    system, task = _prompts(match, run.facts_json.read_text(), ctx.led, home)
     (work / "system_prompt.md").write_text(system)
     (work / "task_prompt.md").write_text(task)
     start = time.perf_counter()
@@ -1931,27 +2475,29 @@ def grade(run: RunDir) -> None:
     rejection: list[str] | None = None
     for attempt in range(1, ATTEMPTS + 1):
         sheets = _served(run)
-        answer, problems, bands, resolved = check_answer(session.answer, ctx, sheets)
-        if answer is not None:
+        checked = check_answer(session.answer, ctx, sheets)
+        if checked.answer is not None:
             break
-        rejection = rejection or problems
+        rejection = rejection or checked.problems
         (work / f"rejection-{attempt}.json").write_text(
-            json.dumps({"answer": session.answer, "problems": problems}, indent=2)
+            json.dumps({"answer": session.answer, "problems": checked.problems}, indent=2)
         )
         if attempt == ATTEMPTS:
             raise RuntimeError(
                 f"grader answer rejected {ATTEMPTS} times; no grade written:\n"
-                + "\n".join(problems)
+                + "\n".join(checked.problems)
             )
         session = _run_claude(
             _command(exe, model, run, system, session.session_id),
-            _retry_prompt(problems),
+            _retry_prompt(checked.problems),
             run.path,
             work / f"session-{attempt + 1}.jsonl",
         )
         results.append(session.result)
     else:
         raise AssertionError("unreachable")
+    answer, resolved, ch = checked.answer, checked.resolved, checked.charges
+    assert ch is not None
 
     ins, outs, reads, writes, cost, turns, models = _usage(results)
     notes: list[Note] = []
@@ -1968,7 +2514,7 @@ def grade(run: RunDir) -> None:
             | {
                 "summary": resolved[f"skill {g.skill} summary"],
                 "null_reason": resolved.get(f"skill {g.skill} null_reason"),
-                "band": bands[g.skill],
+                "band": checked.bands[g.skill],
             }
         )
         for g in sorted(answer.skills, key=lambda g: SKILLS.index(g.skill))
@@ -1981,12 +2527,25 @@ def grade(run: RunDir) -> None:
         readiness_ledger=ctx.led.readiness,
         defense_items=ctx.led.items,
         line_calls=[
-            c.model_copy(update={"text": resolved[f"line call {c.line}"]})
+            ScoredCall.model_validate(
+                c.model_dump()
+                | {
+                    "text": resolved[f"line call {c.line}"],
+                    "charged_total_s": ch.line.get(c.line, 0.0),
+                }
+            )
             for c in answer.line_calls
         ],
         episodes=[
-            e.model_copy(update={"text": resolved[f"episode {k + 1} ({', '.join(e.facts)})"]})
-            for k, e in enumerate(answer.episodes)
+            ScoredEpisode.model_validate(
+                e.model_dump()
+                | {
+                    "text": resolved[f"episode {k + 1} ({', '.join(e.facts)})"],
+                    "pin_cost_s": cost.pin,
+                    "total_cost_s": cost.total,
+                }
+            )
+            for k, (e, cost) in enumerate(zip(answer.episodes, ch.episode, strict=True))
         ],
         notes=notes,
         auto=answer.auto.model_copy(update={"text": resolved["auto"]}),
@@ -2038,7 +2597,7 @@ def render_md(g: Grade, facts: Facts) -> str:
         f"# Driving grade: team {g.team}",
         "",
         f"Rubric `{g.rubric_version}`. Scores are absolute, 1 to 10, inside the band the rubric "
-        "gives from the ledger calls and defense episodes. Auto is reported, not scored.",
+        "gives from the charged seconds and episode costs. Auto is reported, not scored.",
         "",
         "| Skill | Score | Band |",
         "|---|---|---|",
@@ -2058,14 +2617,15 @@ def render_md(g: Grade, facts: Facts) -> str:
         "",
         "## Driving ledger",
         "",
-        "| Line | Time | Lost (s) | Call | Why |",
-        "|---|---|---|---|---|",
+        "| Line | Time | Lost (s) | Call | Charged (s) | Why |",
+        "|---|---|---|---|---|---|",
     ]
     for d in g.driving_ledger:
         c = calls.get(d.id)
         lines.append(
             f"| {d.id} {d.kind} | {d.t_start:.1f}-{d.t_end:.1f} | {_fmt(d.lost_s)} | "
-            f"{c.call if c else '-'} | {cell(c.text) if c else ''} |"
+            f"{c.call if c else '-'} | {_fmt(c.charged_total_s) if c else '-'} | "
+            f"{cell(c.text) if c else ''} |"
         )
     lines += [
         "",
@@ -2090,7 +2650,7 @@ def render_md(g: Grade, facts: Facts) -> str:
     for e in g.episodes:
         who = f"{e.other_team or '?'} ({e.identified_by})"
         lines.append(
-            f"| {', '.join(e.facts)} | {e.verdict} | {who} | {e.cost_s:g} | {cell(e.text)} |"
+            f"| {', '.join(e.facts)} | {e.verdict} | {who} | {e.total_cost_s:g} | {cell(e.text)} |"
         )
     lines += [
         "",
