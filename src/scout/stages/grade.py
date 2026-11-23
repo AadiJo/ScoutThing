@@ -12,8 +12,9 @@ Steps:
 1. Code builds the driving ledger (barrier lines and trips out of its own zone in its own
    active time), the readiness ledger and the list of defense items from the facts
    (`ledgers`). Each barrier and readiness line gets a default ruling computed from measured
-   features (`_turned_back_default`, `_readiness`), so a line is decided the same way on
-   every run.
+   features (`_turned_back_default`, `_readiness`), and a charged barrier line the part a
+   robot standing on its way home cost (`_split`), so a line is decided the same way on every
+   run.
 2. Build the prompt from files: `grade_system.md` and `grade_task.md` beside this module
    (game-independent), and the game guide, limits and rubric under
    `scout/games/rebuilt2026_grade/`. The task carries the match timeline, the ledgers, the
@@ -106,6 +107,7 @@ from scout.schemas.grade import (
     GradeAnswer,
     LineCall,
     Note,
+    OpponentSplit,
     PhaseCoverage,
     ReadinessLine,
     ReadinessRuling,
@@ -187,6 +189,18 @@ STALLED_S = 1.0
 its slowest speed under the facts' STOP_MPS, or stopped (or unseen, so possibly stopped) this
 long. The audit's frame-checked turn-away without a stall read 0.46 m/s and 0 s stopped; the
 human's stalls read 0.01 to 0.36 m/s (one, at 0.36, also stopped 1.1 s)."""
+AHEAD_M = 0.5
+"""A robot in a contact inside a charged barrier line is in the target's way when, while within
+the facts' CONTACT_M, its centre came at least this much nearer the target's own wall than the
+target's (half a robot: it stood on the target's way home, not beside or behind it). Its split
+(`_split`) is the line's time after it came close beyond the time to get home from there
+(`_home_allow`), at most the contact's length; all of it from then when it came close before
+the target left the barrier. On the sixteen matches four charged lines had contacts with a
+robot not known to be a partner: the opponent the film study shows cutting in on the way home
+read 1.51 m (split 3.2 s); an opponent that met it as it reached home 0.30 m, an opponent
+behind it -0.22 m, unlabelled robots 0.65 m (0.1 s long) and 1.57 m (0.4 s before it got
+home). All but the first cost 0 s through the time home or the contact's length anyway, so
+the threshold has a 1.0 m margin to the one positive and is not pinned from below."""
 HOME_INFERENCES: frozenset[GapInference] = frozenset(
     {"in_own_zone_beyond_barrier", "entered_own_zone", "own_zone_both_sides"}
 )
@@ -509,6 +523,85 @@ class _Raw:
     why: str = "on the barrier in its own active time"
     bound: bool = False
     look: tuple[float, ...] = ()
+    left: float | None = None
+    """turned_back: when it left the barrier back to its own side; other barrier lines are on
+    the barrier throughout."""
+
+
+@dataclass(frozen=True)
+class _Tracks:
+    """What `_split` measures positions on."""
+
+    target: _Target
+    others: _Others
+    alliance: Alliance
+    near_m: float
+    """The facts' CONTACT_M."""
+
+    def ahead_m(self, f: ContactFact, o: OtherRobot) -> float | None:
+        """How much nearer the target's own wall than the target's the other robot's centre
+        came while within `near_m` of it in contact `f` (negative: never level with it); None
+        when the two were never tracked together that close."""
+        tg, ot, al = self.target, self.others, self.alliance
+        sel = (ot.track == o.track_id) & (ot.t >= f.t_start - 1e-6) & (ot.t <= f.t_end + 1e-6)
+        best: float | None = None
+        for t, xy in zip(ot.t[sel], ot.xy[sel], strict=True):
+            if not len(tg.t):
+                break
+            k = int(np.argmin(np.abs(tg.t - t)))
+            p = tg.xy[k]
+            if abs(tg.t[k] - t) > TRACKED_WITHIN_S or float(np.hypot(*(xy - p))) > self.near_m:
+                continue
+            ahead = own_wall_m(float(p[0]), al) - own_wall_m(float(xy[0]), al)
+            best = ahead if best is None else max(best, ahead)
+        return best
+
+
+def _split(r: _Raw, fs: Sequence[Fact], tr: _Tracks) -> OpponentSplit | None:
+    """The part of a charged barrier line a robot in its way cost (see AHEAD_M): from the
+    earliest contact inside the line with a robot not known to be a partner that came AHEAD_M
+    nearer its own wall than the target, the line's time beyond what getting home from there
+    takes (`_home_allow`), at most the contact's length; when it came close before the target
+    left the barrier, all of the line from then. A labelled opponent's split is preferred over
+    an unlabelled robot's; splits of no seconds are dropped."""
+    left = r.b if r.left is None else r.left
+    found: list[tuple[bool, float, OpponentSplit]] = []
+    for f in fs:
+        if not (isinstance(f, ContactFact) and _overlap(f.t_start, f.t_end, r.a, r.b)):
+            continue
+        for o in f.data.others:
+            if o.relation == "partner":
+                continue
+            ahead = tr.ahead_m(f, o)
+            t = max(r.a, o.first_close_t)
+            if ahead is None or ahead < AHEAD_M or t >= r.b:
+                continue
+            who = (
+                f"{o.team} {o.relation}" if o.team is not None else f"unlabelled track {o.track_id}"
+            )
+            if t < left:
+                secs = r.b - t
+                how = "before it left the barrier: all of the line from then"
+            else:
+                allow = _home_allow(tr.target, tr.alliance, t)
+                secs = min(r.b - t - allow, f.t_end - t)
+                how = (
+                    f"after it left the barrier: the line's {_fmt(r.b - t)} s from then less "
+                    f"{_fmt(allow)} s to get home from there, at most the contact's "
+                    f"{_fmt(f.t_end - t)} s"
+                )
+            secs = round(min(secs, r.lost), 2)
+            if secs <= 0:
+                continue
+            opp = o.relation == "opponent"
+            why = (
+                f"{f.id}: {who} came {_fmt(ahead)} m nearer its own wall than the target (in its "
+                f"way at {AHEAD_M:g} m or more) at {t:.1f} s, {how}: {_fmt(secs)} s"
+            )
+            found.append((not opp, t, OpponentSplit(
+                contact=f.id, team=o.team if opp else None, t=round(t, 2), seconds=secs, why=why
+            )))  # fmt: skip
+    return min(found, key=lambda x: (x[0], x[1]))[2] if found else None
 
 
 def _stalled(d: CrossingTurnedBackData, stop_mps: float) -> bool:
@@ -651,8 +744,9 @@ def _readiness(fs: Sequence[Fact], match: MatchInfo) -> list[ReadinessLine]:
     return out
 
 
-def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
-    """The driving and readiness ledgers and the defense items, from the facts alone."""
+def ledgers(facts: Facts, match: MatchInfo, target: _Target, others: _Others) -> Ledgers:
+    """The driving and readiness ledgers and the defense items, from the facts; the tracks
+    only place a robot in a contact against the target's way home (`_split`)."""
     fs = facts.facts
     teleop = match.teleop_start_t - 1e-6
     active = _own_active(match)
@@ -710,6 +804,7 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
                 active_s(d.own_active_s, f.t_start, f.t_end), d.unseen_s, text, default, why,
                 bound=bool(d.arrived and d.arrived.by == "after_gap")
                 and d.cost_end == "reached_far_side",
+                left=f.t_start + d.time_on_barrier_s,
             )
         )  # fmt: skip
     for f in fs:
@@ -779,8 +874,12 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
                  "cleared", "no hopper reading yet", look=look)
         )  # fmt: skip
     driving: list[DrivingLine] = []
+    tracks = _Tracks(target, others, match.target_alliance, contact_m)
     for n, r in enumerate(sorted(raw, key=lambda r: r.a), 1):
         opp, partner = _contacts_in(fs, r.a, r.b)
+        split = (
+            _split(r, fs, tracks) if r.kind != "loaded_trip" and r.default == "charged" else None
+        )
         driving.append(
             DrivingLine(
                 id=f"D{n}",
@@ -796,6 +895,7 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
                 why=r.why,
                 look_at=list(r.look),
                 opponent_contacts=opp,
+                split=split,
                 partner_contacts=partner,
                 text=r.text,
             )
@@ -918,6 +1018,16 @@ def _ledger_text(
             if d.look_at
             else f"DEFAULT {d.default} ({d.why})"
         )
+        s = d.split
+        if s is not None:
+            rule += (
+                f"; OPPONENT SPLIT {_fmt(s.seconds)} s of it count against handling_defense "
+                f"({s.why}): {s.contact}'s episode is opponent_on_target"
+                if s.team is not None
+                else f"; UNLABELLED SPLIT {_fmt(s.seconds)} s ({s.why}): they count against "
+                f"handling_defense only if a tile identifies that robot as an opponent (call "
+                f"opponent)"
+            )
         return (
             f"- {d.id} {d.kind} {span(d.t_start, d.t_end)}: {rule}; lost_s {_fmt(d.lost_s)}, "
             f"unseen_s {_fmt(d.unseen_s)}{''.join(f' ({x})' for x in flags)}; facts "
@@ -997,20 +1107,34 @@ class Charges:
     pin: list[float]
     """Held cost per episode."""
     taken: list[float]
-    """Seconds of barrier lines called `opponent`, per episode."""
+    """Split seconds of barrier lines (`OpponentSplit`) that apply, per episode."""
 
     @property
     def defense_s(self) -> float:
         return round(sum(self.pin) + sum(self.taken), 2)
 
 
-def _pins(episodes: Sequence[DefenseEpisode], items: Sequence[DefenseItem]) -> list[float]:
+def _pins(
+    episodes: Sequence[DefenseEpisode],
+    items: Sequence[DefenseItem],
+    moved: dict[str, tuple[float, float]],
+) -> list[float]:
     """Held cost per episode: the `pin_s` of items in `opponent_on_target` episodes, joined into
     holds of items within PIN_GAP_S of each other (a stop item overlapping a contact in the same
     hold counted once), each hold's still time beyond PIN_ALLOW_S times PIN_SHARE. A hold's
     cost goes to the episode of its longest item. Grouping is code's, so how the grader splits
-    episodes changes nothing."""
-    by_fact = {i.fact: i for i in items}
+    episodes changes nothing. A contact whose seconds a split already moved (`moved`: contact
+    to the moved span) keeps only the share of its `pin_s` outside that span, so no second is
+    costed twice."""
+
+    def pin(i: DefenseItem) -> float:
+        span = moved.get(i.fact)
+        if span is None or i.t_end <= i.t_start:
+            return i.pin_s
+        inside = max(0.0, min(i.t_end, span[1]) - max(i.t_start, span[0]))
+        return i.pin_s * (1.0 - inside / (i.t_end - i.t_start))
+
+    by_fact = {i.fact: i.model_copy(update={"pin_s": pin(i)}) for i in items}
     owner: dict[str, int] = {}
     for k, e in enumerate(episodes):
         if e.verdict == "opponent_on_target":
@@ -1054,20 +1178,21 @@ def charges(
     alliance: Alliance,
 ) -> Charges:
     """Charged seconds per line. Barrier lines: `lost_s` when charged by default, unless the
-    grader overruled it: `home_earlier` charges its `charged_s`; `opponent` keeps the seconds
-    before the opponent's first contact in the line and moves the rest to that opponent's
-    episode. Heaped trips: from `heaped_at` to the end of the trip, less barrier lines and
-    opponent episodes inside it, the time to get home from there (`_home_allow`) and
-    TRIP_GRACE_S. Readiness: `late_s` when charged by default or called `not_home`,
-    `charged_s` when `home_earlier` (or `not_home` with it), else 0; a `not_judged` line no
-    call settled is not scored."""
+    grader overruled it: `home_earlier` charges its `charged_s`, `partner` and `misplaced`
+    nothing. Of that, the line's `split` seconds (less any time `home_earlier` took off) go to
+    the episode holding the split's contact instead, when the split applies
+    (`_split_applies`). Heaped trips: from
+    `heaped_at` to the end of the trip, less barrier lines and opponent episodes inside it, the
+    time to get home from there (`_home_allow`) and TRIP_GRACE_S. Readiness: `late_s` when
+    charged by default or called `not_home`, `charged_s` when `home_earlier` (or `not_home`
+    with it), else 0; a `not_judged` line no call settled is not scored."""
     opp = [
         (k, s)
         for k, e in enumerate(episodes)
         if e.verdict == "opponent_on_target" and (s := _episode_span(e, by_id)) is not None
     ]
-    touches = _opponent_contacts(episodes, by_id)
     taken = [0.0] * len(episodes)
+    moved: dict[str, tuple[float, float]] = {}
     out: dict[str, float] = {}
     held: list[tuple[float, float]] = []
     for d in led.driving:
@@ -1079,15 +1204,23 @@ def charges(
             (c.charged_s or 0.0)
             if c is not None and call == "home_earlier"
             else d.lost_s
-            if call is None and d.default == "charged"
+            if call in (None, "opponent", "no_opponent") and d.default == "charged"
             else 0.0
         )
-        hit = [(a, k) for k, a, b in touches if _overlap(d.t_start, d.t_end, a, b)]
-        if call == "opponent" and hit and d.default == "charged":
-            a, k = min(hit)
-            out[d.id] = min(d.lost_s, max(0.0, a - d.t_start))
-            taken[k] += d.lost_s - out[d.id]
-        if out[d.id] > 0 or call in ("opponent", "partner"):
+        s, secs = d.split, 0.0
+        if s is not None and _split_applies(d, call):
+            k = next(
+                (k for k, e in enumerate(episodes)
+                 if e.verdict == "opponent_on_target" and s.contact in e.facts),
+                None,
+            )  # fmt: skip
+            if k is not None:
+                # a split is the line's tail: time `home_earlier` takes off comes off it first
+                secs = max(0.0, min(s.seconds - (d.lost_s - out[d.id]), out[d.id]))
+                out[d.id] -= secs
+                taken[k] += secs
+                moved[s.contact] = (s.t, s.t + secs)
+        if out[d.id] > 0 or secs > 0 or call == "partner":
             held.append((d.t_start, d.t_end))
     for d in led.driving:
         c = calls.get(d.id)
@@ -1114,22 +1247,16 @@ def charges(
             unjudged.append(r.id)
     out = {k: round(v, 2) for k, v in out.items()}
     total = sum(out[d.id] for d in led.driving)
-    pins = _pins(episodes, led.items)
+    pins = _pins(episodes, led.items, moved)
     return Charges(out, unjudged, round(total, 2), pins, [round(x, 2) for x in taken])
 
 
-def _opponent_contacts(
-    episodes: Sequence[DefenseEpisode], by_id: dict[str, Fact]
-) -> list[tuple[int, float, float]]:
-    """(episode index, start, end) of each contact fact in an `opponent_on_target` episode:
-    where an opponent was measured against the target."""
-    return [
-        (k, f.t_start, f.t_end)
-        for k, e in enumerate(episodes)
-        if e.verdict == "opponent_on_target"
-        for i in e.facts
-        if isinstance(f := by_id.get(i), ContactFact)
-    ]
+def _split_applies(d: DrivingLine, call: Call | None) -> bool:
+    """A labelled opponent's split applies unless the grader called `no_opponent`, `partner`
+    or `misplaced`; an unlabelled robot's only when it called `opponent`."""
+    if d.split is None or d.default != "charged":
+        return False
+    return call in (None, "home_earlier") if d.split.team is not None else call == "opponent"
 
 
 @dataclass(frozen=True)
@@ -2001,7 +2128,9 @@ POINT_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
 """Place words checked against distances: the cited stop's or contact's `where`, else the
 target's tracked positions over what the item cites."""
 ATTACK = frozenset({"opponent_on_target", "target_on_opponent"})
-BARRIER_CALLS: frozenset[Call] = frozenset({"opponent", "partner", "misplaced", "home_earlier"})
+BARRIER_CALLS: frozenset[Call] = frozenset(
+    {"opponent", "no_opponent", "partner", "misplaced", "home_earlier"}
+)
 TRIP_CALLS: frozenset[Call] = frozenset({"heaped", "not_heaped", "cannot_see"})
 READINESS_CALLS: frozenset[Call] = frozenset({"opponent", "home_earlier", "home", "not_home"})
 
@@ -2025,8 +2154,8 @@ def grade_context(run: RunDir) -> GradeContext:
     """Load what the checker needs from a run folder."""
     match = MatchInfo.load(run.match_json)
     facts = Facts.load(run.facts_json)
-    target, _ = _load_tracks(run, match)
-    led = ledgers(facts, match)
+    target, others = _load_tracks(run, match)
+    led = ledgers(facts, match, target, others)
     return GradeContext(facts, match, led, target, coverage(facts, match, led))
 
 
@@ -2503,7 +2632,12 @@ def _pressed(f: ContactFact, driving_spans: Sequence[tuple[float, float]]) -> st
     )
 
 
-def _check_episodes(ck: _Checker, answer: GradeAnswer, sheets: list[FrameSheet]) -> None:
+def _check_episodes(
+    ck: _Checker, answer: GradeAnswer, sheets: list[FrameSheet], reread: dict[str, int]
+) -> None:
+    """Episodes: identification, verdicts that need an established robot, tiles, and every
+    defense item covered. `reread`: contacts whose labelled robot a `no_opponent` call read as
+    another team (checked there); that team fits them."""
     ctx = ck.ctx
     items = {i.fact: i for i in ctx.led.items}
     driving_spans = [(d.t_start, d.t_end) for d in ctx.led.driving if d.kind != "loaded_trip"]
@@ -2568,7 +2702,7 @@ def _check_episodes(ck: _Checker, answer: GradeAnswer, sheets: list[FrameSheet])
                 fits = (
                     team in teams or rel in rels or (None in teams and team in boxed)
                     if e.identified_by == "track_label"
-                    else None in teams or team in teams
+                    else None in teams or team in teams or reread.get(f.id) == team
                     if e.identified_by == "bumper_number"
                     else None in teams or rel in rels
                 )
@@ -2618,11 +2752,64 @@ def _check_episodes(ck: _Checker, answer: GradeAnswer, sheets: list[FrameSheet])
         )
 
 
+def _check_split_call(ck: _Checker, c: LineCall, line: DrivingLine, at: str) -> None:
+    """`opponent` applies an unlabelled robot's split once its episode establishes it as an
+    opponent; `no_opponent` drops a labelled one's when the grader read a partner's number on
+    the robot boxed with that label beside the target (`other_bumper`, also its episode's
+    team). Either needs the call to cite a tile in that contact. Where the robot was is
+    measured, so whether it was in the way is never grounds."""
+    s = line.split
+    want = "opponent" if c.call == "opponent" else "no_opponent"
+    if s is None or line.default != "charged" or (s.team is None) != (want == "opponent"):
+        ck.bad(
+            f"{at}: {want} "
+            + (
+                "applies an UNLABELLED split only: this line has none"
+                if want == "opponent"
+                else "drops a labelled OPPONENT SPLIT only: this line has none"
+            )
+            + "; where the other robots were is measured, so whether one was in its way is not "
+            "an overrule"
+        )
+        return
+    f = ck.by_id[s.contact]
+    e = next((e for e in ck.episodes if s.contact in e.facts), None)
+    tiles = ck.frames_in(c.cites, f.t_start, f.t_end)
+    match = ck.ctx.match
+    if want == "opponent":
+        ok = e is not None and e.verdict == "opponent_on_target"
+        need = (
+            f"the episode holding {s.contact} to be opponent_on_target, the robot identified "
+            "as an opponent there by its bumper number or colour on a cited tile"
+        )
+    else:
+        read = c.other_bumper
+        boxed = [t for t in tiles if (m := ck.tiles[t].main) is not None and s.team in m.teams_near]
+        ok = (
+            read is not None
+            and read != match.target_team
+            and _relation(match, read) == "partner"
+            and bool(boxed)
+            and e is not None
+            and e.identified_by == "bumper_number"
+            and e.other_team == read
+        )
+        need = (
+            f"other_bumper = the partner number you read on the robot boxed {s.team} beside the "
+            f"target on a cited tile, and the episode holding {s.contact} identified by that "
+            "bumper_number"
+        )
+    if not ok or not tiles:
+        ck.bad(
+            f"{at}: {want} needs {need}, and this call to cite a tile within {SPAN_PAD_S:g} s of "
+            f"{s.contact} ({f.t_start:.1f}-{f.t_end:.1f} s)"
+        )
+
+
 def _check_call(
     ck: _Checker,
     c: LineCall,
     line: DrivingLine | ReadinessLine,
-    opp_spans: list[tuple[float, float]],
     sheets: list[FrameSheet],
 ) -> None:
     """A trip call needs its hopper tiles; an overrule needs the contradiction its call names,
@@ -2648,6 +2835,8 @@ def _check_call(
         )
     if c.heaped_at is not None and c.call != "heaped":
         ck.bad(f"{at}: heaped_at is only for heaped")
+    if c.other_bumper is not None and c.call != "no_opponent":
+        ck.bad(f"{at}: other_bumper is only for no_opponent")
     if c.charged_s is not None and c.call not in ("home_earlier", "not_home"):
         ck.bad(f"{at}: charged_s is only for home_earlier and not_home")
     if isinstance(line, DrivingLine) and trip:
@@ -2680,10 +2869,19 @@ def _check_call(
             f"{at}: {m.group(0)!r} reads what the robot meant; an overrule stands only on what a "
             "tile shows (where the target was, who held it, when it was home)"
         )
-    if c.call == "opponent" and not any(_overlap(a, b, s0, s1) for s0, s1 in opp_spans):
+    if c.call in ("opponent", "no_opponent") and isinstance(line, DrivingLine):
+        _check_split_call(ck, c, line, at)
+    elif c.call == "opponent" and not any(
+        e.verdict == "opponent_on_target"
+        and any(
+            isinstance(f := ck.by_id.get(i), ContactFact) and _overlap(a, b, f.t_start, f.t_end)
+            for i in e.facts
+        )
+        for e in ck.episodes
+    ):
         ck.bad(
-            f"{at}: opponent needs a contact fact inside the line ({a:.1f}-{b:.1f} s) in an "
-            "opponent_on_target episode: it moves only the line's time from that contact on"
+            f"{at}: opponent needs a contact fact in {a:.1f}-{b:.1f} s in an "
+            "opponent_on_target episode"
         )
     elif c.call == "partner" and isinstance(line, DrivingLine):
         stops = [
@@ -2779,22 +2977,41 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
         "handling_defense": [(m.teleop_start_t, m.teleop_end_t)],
     }
 
-    _check_episodes(ck, answer, sheets)
     calls: dict[str, LineCall] = {}
     for c in answer.line_calls:
         if c.line in calls:
             ck.bad(f"line_calls: {c.line} has more than one call")
         calls[c.line] = c
+    reread = {
+        d.split.contact: c.other_bumper
+        for d in led.driving
+        if d.split is not None
+        and (c := calls.get(d.id)) is not None
+        and c.call == "no_opponent"
+        and c.other_bumper is not None
+    }
+    _check_episodes(ck, answer, sheets, reread)
     for d in led.driving:
         if d.kind == "loaded_trip" and d.id not in calls:
             ck.bad(f"line_calls: trip line {d.id} has no hopper call")
-    opp_spans = [(a, b) for _, a, b in _opponent_contacts(answer.episodes, ck.by_id)]
     for c in answer.line_calls:
         line = ck.lines.get(c.line)
         if line is None:
             ck.bad(f"line call {c.line}: no ledger line {c.line}")
             continue
-        _check_call(ck, c, line, opp_spans, sheets)
+        _check_call(ck, c, line, sheets)
+    for d in led.driving:
+        c = calls.get(d.id)
+        s = d.split
+        if s is None or not _split_applies(d, c.call if c else None):
+            continue
+        holding = [e for e in answer.episodes if s.contact in e.facts]
+        if not holding or any(e.verdict != "opponent_on_target" for e in holding):
+            ck.bad(
+                f"episodes: {s.contact} carries {d.id}'s OPPONENT SPLIT (a robot between the "
+                "target and its own wall, measured): its episode must be opponent_on_target"
+                + ("" if s.team is None else f", unless you call no_opponent on {d.id}")
+            )
 
     # what code charges, then the text checks that lean on it
     ch = charges(led, calls, answer.episodes, ck.by_id, ctx.target, ctx.match.target_alliance)
@@ -2823,7 +3040,8 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
         line = ck.lines.get(c.line)
         if line is not None:
             own = line.facts if isinstance(line, DrivingLine) else [line.fact]
-            text(f"line call {c.line}", c.text, [*c.cites, *own], claims=False)
+            read = [c.other_bumper] if c.other_bumper is not None else []
+            text(f"line call {c.line}", c.text, [*c.cites, *own], read, claims=False)
     names = [g.skill for g in answer.skills]
     if sorted(names) != sorted(SKILLS):
         ck.bad(f"skills: need exactly one each of {list(SKILLS)}, got {names}")
@@ -2998,7 +3216,16 @@ def grade(run: RunDir) -> None:
                 charged_s=c.charged_s if c else None,
                 heaped_at=c.heaped_at if c else None,
                 corner_bumper=c.corner_bumper if c else None,
-                text=resolved[f"line call {line.id}"] if c else line.why,
+                text=resolved[f"line call {line.id}"]
+                if c
+                else line.why
+                + (
+                    f"; {line.split.why} count against handling_defense"
+                    if isinstance(line, DrivingLine)
+                    and line.split is not None
+                    and _split_applies(line, None)
+                    else ""
+                ),
                 cites=c.cites if c else [],
             )
         )

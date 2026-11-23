@@ -1,4 +1,4 @@
-Rubric version: draft-5
+Rubric version: draft-6
 
 # The three skills and the scale
 
@@ -21,9 +21,16 @@ Barrier lines (`turned_back`, `barrier_stop`, `barrier_stay`, `slow_crossing`) c
   Time after its hub turned on that a readiness line already charges as lateness is not charged
   here again.
 - Stops, stays and slow crossings on a barrier in its own active time are `charged`.
-A default changes only on a tile that contradicts it: an opponent held it (`opponent`, with an
-episode holding a contact inside the line: the seconds from that contact on count against
-handling_defense instead, the seconds before it stay here), its partner was in the way
+Opponent split. When a robot in a contact inside a charged barrier line came half a metre or
+more nearer the target's own wall than the target (it stood on its way home), part of the line
+counts against handling_defense instead: when it came close before the target left the
+barrier, all of the line from then; after, the line's time from then beyond what getting home
+from there takes (1.2 s plus half a second per metre outside its zone, at least 3 s), at most
+the contact's length. A robot that met it as it reached home cost nothing, and a stall and the
+back-off before the contact stay here. A labelled opponent's split applies by default; an
+unlabelled robot's only when a tile identifies it as an opponent (`opponent`), and a labelled
+one's is dropped when a bumper read shows it is not an opponent (`no_opponent`).
+A default changes only on a tile that contradicts it: those two, its partner was in the way
 (`partner`), the facts had the target somewhere else (`misplaced`), or it was home before an
 upper-bound time (`home_earlier`).
 
@@ -76,7 +83,8 @@ stood between it and where it was driving, even when that cost nothing. Code com
 - held time: items within 2 s of each other form one hold; a hold's `pin_s` (seconds nearly
   still, inferred time counted half) beyond 3 s, counted half (whether it kept shooting while
   held is rarely readable);
-- plus the seconds of barrier lines called `opponent`, from the opponent's first contact on.
+- plus the opponent split seconds of barrier lines (see driving), counted once: held still time
+  inside those seconds is not counted again.
 Time it spent defending an opponent (`target_on_opponent`) is not part of this score.
 
 D = the summed cost.
