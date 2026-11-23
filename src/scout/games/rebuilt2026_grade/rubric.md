@@ -1,4 +1,4 @@
-Rubric version: draft-6
+Rubric version: draft-7
 
 # The three skills and the scale
 
@@ -35,13 +35,19 @@ A default changes only on a tile that contradicts it: those two, its partner was
 upper-bound time (`home_earlier`).
 
 Loaded trips (`loaded_trip`, a trip out of its own zone in its own active time): read the
-hopper on the HOPPER TILES. A robot out of its zone with a heaped hopper should be going home.
-- `heaped`: `heaped_at` is the first hopper tile from which every later tile shows a heaped
-  hopper. Code charges the trip from then to its end, less any time a barrier line or an
+hopper on each HOPPER TILE. A robot out of its zone with a heaped hopper should be going home.
+The tiles span only the part of the trip from which a heaped hopper could still cost a second
+(below); a trip with no such part is not a ledger line.
+- Each tile: `heaped` (yellow balls piled above the rim), `not_heaped` (empty or part full) or
+  `cannot_see`.
+- Code rules the trip `heaped` from the earliest readable tile from which every later readable
+  tile is heaped, when that is at least two readable tiles (one heaped tile is one doubtful
+  reading); otherwise `not_heaped`, or `cannot_see` when no tile is readable. A tile that
+  cannot be read changes nothing.
+- A heaped trip is charged from that tile to its end, less any time a barrier line or an
   `opponent_on_target` episode already covers, less the time to get home from where it was
   (1.2 s plus half a second per metre outside its zone, at least 3 s), less 3 s more for the
-  doubt in one hopper reading.
-- `not_heaped` (empty or part full up to its late tiles) and `cannot_see`: not charged.
+  doubt in one hopper reading. `not_heaped` and `cannot_see`: not charged.
 
 Charged seconds T = charged barrier lines + heaped trips as above.
 - 9-10: T at most 0.5 s.

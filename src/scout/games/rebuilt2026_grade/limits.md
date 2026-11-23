@@ -63,7 +63,9 @@ The facts were computed by plain code from robot tracks. Read these limits befor
 ## What tiles can and cannot show
 - At zoom 2 a heaped hopper (yellow balls piled above the rim) reads apart from an empty or part
   full one on about four tiles in five; behind the hub, behind a referee or at the far side it
-  often cannot be read. Say `cannot_see` then, do not guess.
+  often cannot be read. Say `cannot_see` for that tile then, do not guess. Fuel piled on the
+  floor behind the robot is not in its hopper. The target's yellow arc runs under its bumper,
+  never over the hopper.
 - Fuel, shots and points never come from positions. A tile can show a heaped or empty hopper or
   balls leaving; say so and cite it.
 - The corner camera panels are not calibrated: nothing is ringed or boxed there. A robot there

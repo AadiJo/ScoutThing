@@ -107,7 +107,8 @@ class DrivingLine(_Model):
     why: str
     """The measured features and thresholds that set `default`."""
     look_at: list[float]
-    """`loaded_trip` only: the tile times at which to read the hopper (served at zoom 2)."""
+    """`loaded_trip` only: the tile times at which to read the hopper (served at zoom 2): only
+    moments from which a heaped hopper could still cost a second."""
     opponent_contacts: list[str]
     """Contact facts in the line's span with an opponent or unlabelled robot."""
     split: OpponentSplit | None
@@ -207,9 +208,6 @@ Call = Literal[
     "home_earlier",
     "home",
     "not_home",
-    "heaped",
-    "not_heaped",
-    "cannot_see",
 ]
 """Overrules of a barrier or readiness line's default, each needing a checkable contradiction:
 `opponent` (barrier lines: the unlabelled robot of the line's `split` is established as an
@@ -222,14 +220,16 @@ robot), `home_earlier` (a line whose time is an upper bound: a tile shows it hom
 `charged_s` gives the seconds), `home` (a `not_judged` readiness line: a tile at the activation
 shows it in its zone, its bumper read), `not_home` (a readiness line cleared by a gap inference,
 or `not_judged` with its bumper read: a tile at the activation shows it out of its zone;
-`charged_s`, optional, the seconds to a cited tile showing it home). `loaded_trip` lines
-(always called): `heaped` (`heaped_at` says from when), `not_heaped` (empty or part full on its
-late tiles) or `cannot_see`."""
+`charged_s`, optional, the seconds to a cited tile showing it home)."""
+Hopper = Literal["heaped", "not_heaped", "cannot_see"]
+"""A hopper reading: on one tile (`TileRead`), or a whole trip's ruling, which code derives from
+its tiles: `heaped` from the earliest readable tile from which every later readable tile is
+heaped when that is at least two tiles, else `not_heaped`; `cannot_see` when none is
+readable."""
 
 
 class LineCall(_Model):
-    """The grader's decision on one ledger line: every trip, and only the barrier and
-    readiness lines whose default it overrules."""
+    """The grader's overrule of one barrier or readiness line's default."""
 
     line: str = Field(description="Ledger line id, e.g. D1 or R2.")
     call: Call
@@ -238,11 +238,6 @@ class LineCall(_Model):
         ge=0.0,
         description="home_earlier (and optionally not_home): seconds from the line's start "
         "(readiness: the activation) to the cited tile that shows the target home.",
-    )
-    heaped_at: float | None = Field(
-        default=None,
-        description="heaped only: video time of the earliest cited tile in the trip from "
-        "which every later hopper tile is heaped.",
     )
     corner_bumper: int | None = Field(
         default=None,
@@ -256,6 +251,30 @@ class LineCall(_Model):
     )
     text: Text = Field(description="One sentence: what the tiles show.")
     cites: Cites
+
+
+class TileRead(_Model):
+    """The hopper on one HOPPER TILE."""
+
+    t: float = Field(description="The tile's video time, as the ledger lists it.")
+    hopper: Hopper = Field(
+        description="heaped: yellow balls piled above the rim. not_heaped: empty or part full. "
+        "cannot_see: the target is not ringed (or, on a corner tile, its bumper not read), or "
+        "its hopper is hidden or too small to read."
+    )
+
+
+class HopperReading(_Model):
+    """The grader's reading of one `loaded_trip` line: every HOPPER TILE, one by one."""
+
+    line: str = Field(description="The loaded_trip line id, e.g. D1.")
+    tiles: list[TileRead] = Field(min_length=1, description="One per HOPPER TILE of the line.")
+    corner_bumper: int | None = Field(
+        default=None,
+        description="Required when a reading rests on a corner camera tile: the target's "
+        "bumper number as you read it there.",
+    )
+    text: Text = Field(description="One sentence: what the tiles show.")
 
 
 Verdict = Literal["opponent_on_target", "target_on_opponent", "partner", "apart", "could_not_tell"]
@@ -309,9 +328,9 @@ class AutoReport(_Model):
 class GradeAnswer(_Model):
     """The agent's whole answer."""
 
+    hoppers: list[HopperReading] = Field(description="One per loaded_trip line.")
     line_calls: list[LineCall] = Field(
-        description="One per loaded_trip line, plus one per barrier or readiness line whose "
-        "default you overrule."
+        description="One per barrier or readiness line whose default you overrule."
     )
     episodes: list[DefenseEpisode] = Field(
         description="Together they cover every defense item fact id."
@@ -346,12 +365,16 @@ class ScoredCall(_Model):
 
     line: str
     default: ReadinessRuling
-    call: Call | None
-    """The grader's call; None when it kept the default."""
+    call: Call | Hopper | None
+    """The grader's call; None when it kept the default. `loaded_trip` lines: the ruling code
+    derived from `hopper_tiles`."""
     charged_total_s: float
     """Seconds this line adds to the driving total, or the readiness lateness."""
     charged_s: float | None = None
     heaped_at: float | None = None
+    """Heaped trips: the tile from which code charged it."""
+    hopper_tiles: list[TileRead] = Field(default_factory=list[TileRead])
+    """`loaded_trip` lines: the grader's reading of each HOPPER TILE."""
     corner_bumper: int | None = None
     text: str
     """The grader's sentence, or the default's rule when it kept the default."""
@@ -432,7 +455,7 @@ class Grade(StageFile):
     """The grade for the target team. Auto is reported but not scored. Text fields have
     their `{...}` references resolved."""
 
-    schema_version: Literal[7] = 7
+    schema_version: Literal[8] = 8
     team: int
     rubric_version: str
     coverage: Coverage
