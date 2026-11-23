@@ -10,7 +10,9 @@ from scout.schemas.common import StageFile
 class VideoInfo(StageFile):
     """Facts about the source video from ffprobe. `fps` is `fps_num / fps_den`.
 
-    `t = frame / fps` for every frame; the frame reader refuses a video with `cfr` false.
+    Frames are slots on an even grid: frame `i` is at `t = i / fps` for every frame. A slot
+    with no picture of its own (listed in `held_frames`) shows the previous picture, as a
+    player does.
     """
 
     schema_version: Literal[1] = 1
@@ -31,4 +33,7 @@ class VideoInfo(StageFile):
     field_order: str
     interlaced: bool
     cfr: bool
-    """Constant frame rate: r_frame_rate equals avg_frame_rate and frame_count matches."""
+    """Constant frame rate: every grid slot has its own picture (`held_frames` is empty)."""
+    held_frames: tuple[int, ...] = ()
+    """Grid slots with no picture of their own (the container skips that timestamp). The
+    reader returns the previous frame's picture there."""
