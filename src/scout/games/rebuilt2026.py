@@ -117,6 +117,23 @@ def zone_of(x: float, alliance: Alliance) -> Zone:
     return "neutral"
 
 
+Lane = Literal["bump", "trench"]
+
+
+def barrier_at(x: float, y: float, margin_m: float) -> tuple[Alliance, Lane] | None:
+    """The barrier line (named by its hub's alliance) and lane under field point (x, y), with
+    the bumps' depth widened by `margin_m` on each side; None off every barrier and beside a
+    hub face (y within the hub's width), where nothing is drivable."""
+    hub = HUBS["blue"]
+    if hub.y0 < y < hub.y1:
+        return None
+    for alliance, (x0, x1) in BARRIER_X.items():
+        if x0 - margin_m <= x <= x1 + margin_m:
+            lane: Lane = "bump" if BUMPS[0].y0 <= y <= BUMPS[1].y1 else "trench"
+            return alliance, lane
+    return None
+
+
 # --- match timing -------------------------------------------------------------
 
 AUTO_S = 20.0
