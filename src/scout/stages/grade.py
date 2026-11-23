@@ -2,25 +2,32 @@
 video and settings.json.
 
 Writes grade.json (see `scout.schemas.grade`): 1-10 scores for three driving skills with
-cited evidence, timestamped notes and an unscored auto report, written by Claude Code run
-headless (`claude -p`). Also writes grade.md, the same grade as a short readable report, and
-`grade_work/` with the prompts, every contact sheet served, the frame log and each session's
-stream.
+cited evidence, the ledgers and defense episodes they rest on, timestamped notes and an
+unscored auto report, written by Claude Code run headless (`claude -p`). Also writes
+grade.md, the same grade as a short readable report, and `grade_work/` with the prompts,
+every contact sheet served, the frame log and each session's stream.
 
 Steps:
 
-1. Build the prompt from files: `grade_system.md` and `grade_task.md` beside this module
+1. Code builds the driving ledger, the readiness ledger and the list of defense items from
+   the facts (`ledgers`), so the grader decides per line instead of doing arithmetic.
+2. Build the prompt from files: `grade_system.md` and `grade_task.md` beside this module
    (game-independent), and the game guide, limits and rubric under
-   `scout/games/rebuilt2026_grade/`. The task carries the match timeline and all of facts.json.
-2. Run `claude -p` sealed: our system prompt replaces the default one, no built-in tools, no
+   `scout/games/rebuilt2026_grade/`. The task carries the match timeline, the ledgers, the
+   defense items and all of facts.json.
+3. Run `claude -p` sealed: our system prompt replaces the default one, no built-in tools, no
    settings files, skills or other MCP servers, and one MCP tool, `frames`, served by
    `python -m scout.stages.grade <run>` (`serve_frames` below). The tool crops the main camera
-   around the target, rings it, tiles up to four moments with the match clock, logs every sheet to
-   `grade_work/frames.jsonl` and refuses past IMAGE_CAP sheets. The session's init message is
-   checked so a leak fails the stage instead of tainting the grade.
-3. Check the structured answer: schema, every citation against the fact ids and the frame
-   log, note times against what they cite, and frame evidence for defense. On failure the
-   session is resumed once with the exact errors; a second failure fails the stage.
+   around the target, rings it, boxes every other tracked robot with its team and partner or
+   opponent (or "unlabelled"), tiles up to four moments with the match clock, lists the facts
+   overlapping them, logs every sheet to `grade_work/frames.jsonl` and refuses past IMAGE_CAP
+   sheets. The session's init message is checked so a leak fails the stage.
+4. Check the structured answer (`check_answer`): citations, one call per ledger line,
+   episodes covering every defense item with the evidence each verdict needs, numbers only
+   as references to fact fields, team names only when labelled or read, no purpose words,
+   places that agree with where the target was, and each score inside the band the rubric
+   computes from the calls. On failure the session is resumed with the exact errors, up to
+   ATTEMPTS answers in all; then the stage fails.
 """
 
 from __future__ import annotations
@@ -29,10 +36,12 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -45,16 +54,39 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from scout.camera import Camera
-from scout.games.rebuilt2026 import ROBOT_FOOTPRINT_M
+from scout.games.rebuilt2026 import BARRIER_X, CENTER_LINE_X_M, ROBOT_FOOTPRINT_M, zone_of
 from scout.run import RunDir, Stage
-from scout.schemas.facts import Facts
+from scout.schemas.common import Alliance
+from scout.schemas.facts import (
+    ContactFact,
+    CrossingFact,
+    CrossingTurnedBackFact,
+    Fact,
+    Facts,
+    GapFact,
+    HubOnFact,
+    NearInGap,
+    OtherRobot,
+    PhaseFact,
+    StopFact,
+    ZoneVisitFact,
+)
 from scout.schemas.grade import (
     SKILLS,
+    DefenseEpisode,
+    DefenseItem,
+    DrivingKind,
+    DrivingLine,
     FrameSheet,
     Grade,
     GradeAnswer,
+    LineCall,
     Note,
+    ReadinessLine,
     RunRecord,
+    ScoredSkill,
+    SkillName,
+    TileRecord,
 )
 from scout.schemas.identity import Identity
 from scout.schemas.match import MatchInfo
@@ -63,37 +95,68 @@ from scout.schemas.video import VideoInfo
 from scout.video import frame_at
 
 F64 = NDArray[np.float64]
+I64 = NDArray[np.int64]
 Image = NDArray[np.uint8]
 JSON = dict[str, object]
+Band = tuple[int, int]
 
 GAME_DIR = "rebuilt2026_grade"
 """Folder under `scout.games` with the game guide, limits and rubric for this game."""
 IMAGE_CAP = 20
 EFFORT = "medium"
-"""Claude Code effort level. Medium keeps a grade near two minutes on Opus."""
+"""Claude Code effort level. Medium keeps a grade between 40 and 110 s on Opus."""
 MAX_BUDGET_USD = 8.0
-"""Stops a runaway session; one grade lists at about 1 to 3 USD."""
+"""Stops a runaway session; one grade lists at about 0.3 to 1 USD."""
 TIMEOUT_S = 600.0
 TOOL = "frames"
 SERVER = "scout"
 TOOL_ID = f"mcp__{SERVER}__{TOOL}"
 SESSION_TOOLS = (TOOL_ID, "StructuredOutput")
 """The only tools a grader session may load: ours, and the one `--json-schema` adds."""
+ATTEMPTS = 3
+"""Answers checked per grade: the first and up to two retries in the same session, each told
+exactly what failed. The checks are strict, so one retry was not always enough."""
 NOTE_REACH_S = 5.0
 """A note's `t` must be within this of something it cites."""
 FRAME_MATCH_S = 0.051
+SPAN_PAD_S = 2.0
+"""A frame this close to an episode or ledger line counts as evidence for it."""
+SLOW_CROSS_STOPPED_S = 1.0
+SLOW_CROSS_S = 2.5
+"""A seen crossing stopped this long, or this long on the barrier, is a driving line (a
+clean one takes 0.5 to 1 s)."""
+MIN_TRACKED_SHARE = 0.5
+"""Below this share of teleop tracked, driving may be null."""
+CENTRE_NEAR_M = 1.5
+BARRIER_NEAR_M = 2.5
+"""A place word is supported when the target was this close to the centre line, or to a
+barrier's bumps (people say "at the hub" for a robot a metre or two in front of it)."""
+MIN_LOST_S = 1.0
+"""Shorter barrier moments are touches, not ledger lines."""
 
+NEAR_BOX_M = 2.5
+"""A boxed robot this close to the target can be the defender or partner a text names."""
 TRACKED_WITHIN_S = 0.15
-"""A target sample this close in time counts as the target's position at a tile."""
+"""A sample this close in time counts as a robot's position at a tile."""
 NEARBY_S = 5.0
 """When untracked, the crop centres on the target's position within this much time."""
 CROP_W, CROP_H = 800, 450
 TILE_W = 640
 FULL_W = 960
 HEADER_H = 26
+LEGEND_H = 24
 RING: tuple[int, int, int] = (0, 225, 255)
 RING_EST: tuple[int, int, int] = (0, 140, 255)
+MARK: dict[str, tuple[int, int, int]] = {
+    "opponent": (255, 0, 255),
+    "partner": (80, 220, 80),
+    "unknown": (230, 230, 230),
+}
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+LEGEND = (
+    "Yellow ring: target. Boxes: robots the tool tracked (team PARTNER/OPP, or 'unlabelled'). "
+    "A robot with NO box was not tracked."
+)
 
 ENV_KEEP = (
     "ANTHROPIC_API_KEY",
@@ -117,6 +180,10 @@ def _grade_md(run: RunDir) -> Path:
 
 def _frame_log(run: RunDir) -> Path:
     return _work(run) / "frames.jsonl"
+
+
+def _fmt(v: float) -> str:
+    return f"{v:.2f}" if abs(v) < 1 else f"{v:.1f}"
 
 
 # --- match clock ------------------------------------------------------------------------
@@ -145,6 +212,484 @@ def _phase(match: MatchInfo, t: float) -> str:
     return "-"
 
 
+def _own_active(match: MatchInfo) -> list[tuple[float, float]]:
+    """Teleop spans with the target's hub active."""
+    return [
+        (p.t_start, p.t_end)
+        for p in match.phases
+        if p.name != "auto" and p.active_hubs is not None and match.target_alliance in p.active_hubs
+    ]
+
+
+def _relation(match: MatchInfo, team: int) -> Literal["partner", "opponent", "unknown"]:
+    slot = next((s for s in match.roster if s.team == team), None)
+    if slot is None:
+        return "unknown"
+    return "partner" if slot.alliance == match.target_alliance else "opponent"
+
+
+# --- tracks -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Target:
+    """The target team's samples (what facts.json calls its path)."""
+
+    t: F64
+    xy: F64
+    box: F64
+    """(n, 4) main-view box in full-frame pixels; NaN when interpolated or from a corner view."""
+
+    def near(self, a: float, b: float) -> F64:
+        """Positions (k, 2) tracked between video times a and b."""
+        return self.xy[(self.t >= a) & (self.t <= b)]
+
+
+@dataclass(frozen=True)
+class _Others:
+    """Every other track's samples with its team label (-1 when unlabelled)."""
+
+    t: F64
+    track: I64
+    team: I64
+    xy: F64
+    box: F64
+    """(n, 4) main-view box; NaN when interpolated or from a corner view."""
+
+
+def _load_tracks(run: RunDir, match: MatchInfo) -> tuple[_Target, _Others]:
+    """The target: samples inside identity segments labelled with it, minus frames two
+    tracks both claim. Others: every other sample, with its label."""
+    ident = Identity.load(run.identity_json)
+    tracks = read_tracks(run.tracks)
+    target = match.target_team
+    named = [s for s in ident.segments if s.team is not None]
+    seg = pl.DataFrame(
+        {
+            "track_id": [s.track_id for s in named],
+            "f0": [s.frame_start for s in named],
+            "f1": [s.frame_end for s in named],
+            "team": [s.team for s in named],
+        },
+        schema={"track_id": pl.Int32, "f0": pl.Int64, "f1": pl.Int64, "team": pl.Int64},
+    )
+    labels = (
+        tracks.select("track_id", "frame")
+        .join(seg, on="track_id")
+        .filter(pl.col("frame").is_between(pl.col("f0"), pl.col("f1")))
+        .unique(["track_id", "frame"], keep="first")
+        .select("track_id", "frame", "team")
+    )
+    rows = tracks.join(labels, on=["track_id", "frame"], how="left")
+
+    def boxes(df: pl.DataFrame) -> F64:
+        main = ((df["state"] == "measured") & (df["view"] == "main")).fill_null(False)
+        box = df.select("x1", "y1", "x2", "y2").to_numpy().astype(np.float64)
+        box[~main.to_numpy()] = np.nan
+        return box
+
+    mine = rows.filter(pl.col("team") == target)
+    mine = mine.unique(["track_id", "frame"]).filter(pl.col("frame").is_unique()).sort("frame")
+    rest = rows.filter(pl.col("team").is_null() | (pl.col("team") != target)).sort("frame")
+    return (
+        _Target(
+            t=mine["t"].to_numpy().astype(np.float64),
+            xy=mine.select("x", "y").to_numpy().astype(np.float64),
+            box=boxes(mine),
+        ),
+        _Others(
+            t=rest["t"].to_numpy().astype(np.float64),
+            track=rest["track_id"].to_numpy().astype(np.int64),
+            team=rest["team"].fill_null(-1).to_numpy().astype(np.int64),
+            xy=rest.select("x", "y").to_numpy().astype(np.float64),
+            box=boxes(rest),
+        ),
+    )
+
+
+# --- ledgers ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Ledgers:
+    driving: list[DrivingLine]
+    readiness: list[ReadinessLine]
+    items: list[DefenseItem]
+
+
+def _overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
+    return a0 <= b1 + 1e-6 and b0 <= a1 + 1e-6
+
+
+def _in_spans(t: float, spans: Sequence[tuple[float, float]]) -> bool:
+    return any(a - 1e-6 <= t < b for a, b in spans)
+
+
+def _contacts_in(facts: Sequence[Fact], a: float, b: float) -> tuple[list[str], list[str]]:
+    """(contacts with an opponent or unlabelled robot, contacts with only partners) in [a, b]."""
+    opp: list[str] = []
+    partner: list[str] = []
+    for f in facts:
+        if isinstance(f, ContactFact) and _overlap(f.t_start, f.t_end, a, b):
+            if all(o.relation == "partner" for o in f.data.others):
+                partner.append(f.id)
+            else:
+                opp.append(f.id)
+    return opp, partner
+
+
+def _per_team[T: (OtherRobot, NearInGap)](rows: Sequence[T]) -> list[T]:
+    """Rows nearest first, one per labelled team (a team on several tracks is listed once)."""
+    seen: set[int] = set()
+    out: list[T] = []
+    for o in rows:
+        if o.team is None or o.team not in seen:
+            out.append(o)
+        if o.team is not None:
+            seen.add(o.team)
+    return out
+
+
+def _end_text(end: str) -> str:
+    return {
+        "target_moved_away": "the target moved away",
+        "other_moved_away": "the other robot moved away",
+        "unknown_other_track_lost": "tracking of the other robot ended: how it ended is unknown",
+        "unknown_target_track_lost": "tracking of the target ended: how it ended is unknown",
+        "match_end": "the match ended",
+    }.get(end, end)
+
+
+def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
+    """The driving and readiness ledgers and the defense items, from the facts alone."""
+    fs = facts.facts
+    teleop = match.teleop_start_t - 1e-6
+    active = _own_active(match)
+    contact_m = facts.thresholds.get("CONTACT_M", 1.6)
+    raw: list[tuple[float, float, DrivingKind, list[str], float, float, bool | None, str]] = []
+
+    def taken(a: float, b: float) -> bool:
+        return any(_overlap(a, b, r[0], r[1]) for r in raw)
+
+    def hub(t: float) -> bool | None:
+        ph = next((p for p in match.phases if p.t_start <= t < p.t_end), None)
+        if ph is None or ph.active_hubs is None:
+            return None
+        return match.target_alliance in ph.active_hubs
+
+    for f in fs:
+        if isinstance(f, CrossingTurnedBackFact) and f.t_start >= teleop:
+            d = f.data
+            folded = [
+                s.id
+                for s in fs
+                if isinstance(s, StopFact)
+                and s.data.on_barrier is not None
+                and _overlap(s.t_start, s.t_end, f.t_start, f.t_end)
+            ]
+            lost = d.seconds_to_across if d.seconds_to_across is not None else d.time_on_barrier_s
+            how = (
+                f"got across by {d.across_id} ({d.across_lane or 'route unseen'}) "
+                f"{_fmt(lost)} s after first touching it"
+                if d.seconds_to_across is not None
+                else "did not get across within 8 s"
+            )
+            stops = "; ".join(
+                f"{s.id}: stopped {_fmt(s.data.duration_s)} s, {_fmt(s.data.seen_s)} s seen and "
+                f"{_fmt(s.data.unseen_s)} s inferred across gaps (start {s.data.start}, end "
+                f"{s.data.end})"
+                for s in fs
+                if isinstance(s, StopFact) and s.id in folded
+            )
+            text = (
+                f"went onto the {d.barrier} {d.lane} from the {d.side} zone and came back "
+                f"({d.attempts} attempt{'s' if d.attempts > 1 else ''}), then {how}; on the "
+                f"barrier {_fmt(d.time_on_barrier_s)} s, stopped {_fmt(d.stopped_s)} s, "
+                f"{_fmt(d.unseen_s)} s unseen" + (f"; {stops}" if stops else "")
+            )
+            raw.append(
+                (f.t_start, f.t_end, "turned_back", [f.id, *folded], lost, d.unseen_s,
+                 d.own_hub_active, text)
+            )  # fmt: skip
+    for f in fs:
+        if (
+            isinstance(f, StopFact)
+            and f.t_start >= teleop
+            and f.data.on_barrier is not None
+            and not taken(f.t_start, f.t_end)
+        ):
+            d = f.data
+            text = (
+                f"stopped on the {d.on_barrier} {d.lane} {_fmt(d.duration_s)} s: "
+                f"{_fmt(d.seen_s)} s seen, {_fmt(d.unseen_s)} s inferred across gaps "
+                f"(start {d.start}, end {d.end})"
+            )
+            raw.append(
+                (f.t_start, f.t_end, "barrier_stop", [f.id], d.duration_s, d.unseen_s,
+                 hub(f.t_start), text)
+            )  # fmt: skip
+    for f in fs:
+        if (
+            isinstance(f, ZoneVisitFact)
+            and f.t_start >= teleop
+            and f.data.zone == "on_barrier"
+            and not taken(f.t_start, f.t_end)
+        ):
+            d = f.data
+            text = (
+                f"stayed on the {d.barrier} {d.lane} {_fmt(d.duration_s)} s "
+                f"({_fmt(d.untracked_s)} s untracked), from {d.came_from} to {d.went_to}"
+            )
+            raw.append(
+                (f.t_start, f.t_end, "barrier_stay", [f.id], d.duration_s, d.untracked_s,
+                 hub(f.t_start), text)
+            )  # fmt: skip
+    for f in fs:
+        if not isinstance(f, CrossingFact) or f.t_start < teleop:
+            continue
+        d = f.data
+        on = d.time_on_barrier_s if d.time_on_barrier_s is not None else d.observed_s
+        if (d.stopped_s >= SLOW_CROSS_STOPPED_S or on >= SLOW_CROSS_S) and not taken(
+            f.t_start, f.t_end
+        ):
+            text = (
+                f"crossed the {d.barrier} {d.lane} from {d.from_zone} to {d.to_zone} in "
+                f"{_fmt(on)} s, stopped {_fmt(d.stopped_s)} s"
+            )
+            raw.append((f.t_start, f.t_end, "slow_crossing", [f.id], on, 0.0, hub(f.t_start), text))
+    raw = sorted((r for r in raw if r[4] >= MIN_LOST_S), key=lambda r: r[0])
+    driving: list[DrivingLine] = []
+    for n, (a, b, kind, ids, lost, unseen, own, text) in enumerate(raw, 1):
+        opp, partner = _contacts_in(fs, a, b)
+        driving.append(
+            DrivingLine(
+                id=f"D{n}",
+                kind=kind,
+                facts=ids,
+                t_start=a,
+                t_end=b,
+                phase=_phase(match, a),
+                own_hub_active=own,
+                lost_s=round(lost, 2),
+                unseen_s=round(unseen, 2),
+                opponent_contacts=opp,
+                partner_contacts=partner,
+                text=text,
+            )
+        )
+
+    readiness: list[ReadinessLine] = []
+    for f in fs:
+        if not isinstance(f, HubOnFact):
+            continue
+        d = f.data
+        ph = next(p for p in match.phases if p.name == d.phase)
+        never = d.in_own_zone is not True and d.reached_own_zone_after_s is None
+        late = (
+            0.0
+            if d.in_own_zone
+            else (ph.t_end - ph.t_start if never else d.reached_own_zone_after_s or 0.0)
+        )
+        bound = bool(not d.in_own_zone and d.reached_after_gap)
+        where = (
+            "in its own zone"
+            if d.in_own_zone
+            else "outside its own zone"
+            if d.in_own_zone is False
+            else "untracked at that moment"
+        )
+        arrive = (
+            ""
+            if d.in_own_zone
+            else "; never tracked in its own zone in this phase"
+            if never
+            else f"; first tracked in its own zone {_fmt(late)} s later"
+            + (" (first seen after a gap: at most that late)" if bound else "")
+        )
+        readiness.append(
+            ReadinessLine(
+                id=f"R{len(readiness) + 1}",
+                fact=f.id,
+                phase=d.phase,
+                t=f.t_start,
+                in_zone=d.in_own_zone,
+                late_s=round(late, 2),
+                late_is_bound=bound,
+                never_home=never,
+                text=f"its hub turned on for {d.phase}: {where}{arrive}",
+            )
+        )
+
+    items: list[DefenseItem] = []
+    for f in fs:
+        if f.t_start < teleop:
+            continue
+        in_active = _in_spans(f.t_start, active)
+        if isinstance(f, ContactFact):
+            d = f.data
+            if all(o.relation == "partner" for o in d.others):
+                continue
+            who = ", ".join(
+                (
+                    f"{o.team} {o.relation} (track label)"
+                    if o.team is not None
+                    else f"unlabelled track {o.track_id} (detector bumper colour {o.bumper_seen})"
+                )
+                + f" {_fmt(o.min_distance_m)} m"
+                + (
+                    f", closing speeds: target {_fmt(o.target_closing_mps)}, other "
+                    f"{_fmt(o.other_closing_mps)} m/s"
+                    if o.target_closing_mps is not None and o.other_closing_mps is not None
+                    else ""
+                )
+                for o in _per_team(d.others)
+            )
+            text = (
+                f"contact, target {d.target_zone}, own hub "
+                f"{'active' if in_active else 'inactive'}; "
+                f"{who}; {_fmt(d.seen_s)} s seen, {_fmt(d.unseen_s)} s unseen, target still "
+                f"{_fmt(d.longest_still_s)} s; end: {_end_text(d.end)}"
+            )
+            home = in_active and d.target_zone == "own"
+            items.append(
+                DefenseItem(
+                    fact=f.id, t_start=f.t_start, t_end=f.t_end, home_active=home, text=text
+                )
+            )
+        elif isinstance(f, GapFact) and any(
+            _in_spans(t, active) for t in (f.t_start, f.t_end - 1e-3)
+        ):
+            d = f.data
+            near = [o for o in d.others_near if o.relation != "partner"]
+            if not near:
+                continue
+            who = ", ".join(
+                (
+                    f"{o.team} {o.relation}"
+                    if o.team is not None
+                    else f"unlabelled track {o.track_id}"
+                )
+                + f" {_fmt(o.min_distance_m)} m"
+                for o in _per_team(d.others_near)
+            )
+            zones = f"{d.before.zone if d.before else '?'} to {d.after.zone if d.after else '?'}"
+            text = (
+                f"target unseen {_fmt(d.duration_s)} s ({zones}, inference {d.inference}); "
+                f"robots tracked near its last or next seen spot: {who}"
+            )
+            home = bool(d.before and d.after and d.before.zone == d.after.zone == "own")
+            items.append(
+                DefenseItem(
+                    fact=f.id, t_start=f.t_start, t_end=f.t_end, home_active=home, text=text
+                )
+            )
+        elif (
+            isinstance(f, StopFact)
+            and f.data.unseen_s > 0
+            and in_active
+            and f.data.nearest_tracked_m is not None
+            and f.data.nearest_tracked_m <= contact_m
+        ):
+            d = f.data
+            text = (
+                f"stop {_fmt(d.duration_s)} s in the {d.zone} zone, {_fmt(d.unseen_s)} s inferred "
+                f"across gaps; nearest tracked robot {_fmt(d.nearest_tracked_m or 0.0)} m"
+            )
+            home = d.zone == "own" and d.on_barrier is None
+            items.append(
+                DefenseItem(
+                    fact=f.id, t_start=f.t_start, t_end=f.t_end, home_active=home, text=text
+                )
+            )
+    return Ledgers(driving, readiness, items)
+
+
+def _ledger_text(led: Ledgers, match: MatchInfo) -> tuple[str, str, str]:
+    """The driving ledger, readiness ledger and defense items as prompt text."""
+
+    def span(a: float, b: float) -> str:
+        return f"{a:.1f}-{b:.1f} s ({_clock(match, a)[1]}, {_phase(match, a)})"
+
+    drive = "\n".join(
+        f"- {d.id} {d.kind} {span(d.t_start, d.t_end)}, own hub active: {d.own_hub_active}; "
+        f"lost_s {_fmt(d.lost_s)}, unseen_s {_fmt(d.unseen_s)}; facts {', '.join(d.facts)}; "
+        f"{d.text}; contacts with opponent or unlabelled robots: "
+        f"{', '.join(d.opponent_contacts) or 'none'}; with partners only: "
+        f"{', '.join(d.partner_contacts) or 'none'}"
+        for d in led.driving
+    )
+    ready = "\n".join(
+        f"- {r.id} {r.fact} at {r.t:.1f} s ({_clock(match, r.t)[1]}): late_s {_fmt(r.late_s)}"
+        f"{' (bound)' if r.late_is_bound else ''}; {r.text}"
+        for r in led.readiness
+    )
+    items = "\n".join(
+        f"- {i.fact} {span(i.t_start, i.t_end)}{', HOME IN ACTIVE TIME' if i.home_active else ''}: "
+        f"{i.text}"
+        for i in led.items
+    )
+    return drive or "(no lines)", ready or "(no lines)", items or "(no items)"
+
+
+# --- bands ------------------------------------------------------------------------------
+
+
+def _band_of(x: float, edges: Sequence[float]) -> Band:
+    """9-10 at or below edges[0], then one band lower past each edge."""
+    k = sum(x > e for e in edges)
+    return (9 - 2 * k, 10 - 2 * k)
+
+
+def driving_band(lines: Sequence[DrivingLine], calls: dict[str, LineCall]) -> Band:
+    """From charged seconds, with uncertain lines counted half."""
+    total = 0.0
+    for d in lines:
+        c = calls.get(d.id)
+        if c is None:
+            continue
+        if c.call == "charged":
+            total += c.charged_s if c.charged_s is not None else d.lost_s
+        elif c.call == "uncertain":
+            total += d.lost_s / 2
+    return _band_of(total, (0.0, 3.0, 6.0, 10.0)) if total > 0 else (9, 10)
+
+
+def readiness_band(lines: Sequence[ReadinessLine], calls: dict[str, LineCall]) -> Band | None:
+    """From the latest charged activation, with uncertain ones counted half."""
+    if not lines:
+        return None
+    late: list[float] = []
+    for r in lines:
+        c = calls.get(r.id)
+        if c is None:
+            continue
+        if c.call == "charged" and r.never_home:
+            return (1, 2)
+        late.append(
+            r.late_s if c.call == "charged" else r.late_s / 2 if c.call == "uncertain" else 0.0
+        )
+    band = _band_of(max(late, default=0.0), (1.0, 3.0, 8.0))
+    if sum(x > 1.0 for x in late) >= 2:
+        band = min(band, (5, 6))
+    return band
+
+
+def defense_band(episodes: Sequence[DefenseEpisode]) -> Band | None:
+    """From the cost of each `opponent_on_target` episode; None when there is none."""
+    costs = [e.cost_s for e in episodes if e.verdict == "opponent_on_target"]
+    if not costs:
+        return None
+    if sum(costs) > 30:
+        return (1, 2)
+    if max(costs) > 8 or (len(costs) >= 2 and sum(c > 3 for c in costs) > len(costs) / 2):
+        return (3, 4)
+    if max(costs) > 5 or sum(c > 2 for c in costs) >= 2:
+        return (5, 6)
+    if max(costs) > 2:
+        return (7, 8)
+    return (9, 10)
+
+
 # --- the frame tool ---------------------------------------------------------------------
 
 
@@ -171,42 +716,8 @@ class FrameRequest(BaseModel):
         default="target",
         description="'target': crop around the target robot. 'full': the whole main camera.",
     )
-
-
-@dataclass(frozen=True)
-class _Target:
-    """The target team's samples (what facts.json calls its path), for looking it up at
-    any moment."""
-
-    t: F64
-    xy: F64
-    box: F64
-    """(n, 4) main-view box in full-frame pixels; NaN when interpolated or from a corner view."""
-
-
-def _load_target(run: RunDir, match: MatchInfo) -> _Target:
-    """Track samples inside identity segments labelled with the target, minus frames two
-    tracks both claim."""
-    ident = Identity.load(run.identity_json)
-    target = match.target_team
-    segs = [s for s in ident.segments if s.team == target]
-    tracks = read_tracks(run.tracks)
-    parts = [
-        tracks.filter(
-            (pl.col("track_id") == s.track_id)
-            & pl.col("frame").is_between(s.frame_start, s.frame_end)
-        )
-        for s in segs
-    ]
-    rows = pl.concat(parts) if parts else tracks.clear()
-    rows = rows.unique(["track_id", "frame"]).filter(pl.col("frame").is_unique()).sort("frame")
-    main = (rows["state"] == "measured") & (rows["view"] == "main")
-    box = rows.select("x1", "y1", "x2", "y2").to_numpy().astype(np.float64)
-    box[~main.to_numpy()] = np.nan
-    return _Target(
-        t=rows["t"].to_numpy().astype(np.float64),
-        xy=rows.select("x", "y").to_numpy().astype(np.float64),
-        box=box,
+    zoom: Literal[1, 2] = Field(
+        default=1, description="2: a crop half as wide around the target, to read bumpers."
     )
 
 
@@ -220,17 +731,19 @@ class _Spot:
     """Box to ring; None when the target is not tracked here."""
     measured: bool
     status: str
+    xy: tuple[float, float] | None
+    """Field position when tracked at this moment."""
 
 
 def _spot(target: _Target, cam: Camera, t: float) -> _Spot:
     """Look up the target at video time `t`: its box if measured, its projected footprint if
     interpolated, else the nearest known position within NEARBY_S for centring only."""
     if len(target.t) == 0:
-        return _Spot(None, None, False, "target never tracked")
+        return _Spot(None, None, False, "target never tracked", None)
     i = int(np.argmin(np.abs(target.t - t)))
     dt = float(target.t[i] - t)
     half = ROBOT_FOOTPRINT_M / 2
-    x, y = target.xy[i]
+    x, y = float(target.xy[i][0]), float(target.xy[i][1])
     foot = cam.project(
         np.array([[x + dx, y + dy, 0.0] for dx in (-half, half) for dy in (-half, half)])
     )
@@ -248,25 +761,78 @@ def _spot(target: _Target, cam: Camera, t: float) -> _Spot:
         if np.isfinite(target.box[i]).all():
             b = tuple(float(v) for v in target.box[i])
             box = (b[0], b[1], b[2], b[3])
-            return _Spot(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), box, True, "tracked")
+            c = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+            return _Spot(c, box, True, "tracked", (x, y))
         if fbox is not None:
             c = ((fbox[0] + fbox[2]) / 2, (fbox[1] + fbox[3]) / 2)
-            return _Spot(c, fbox, False, "tracked (estimated box)")
+            return _Spot(c, fbox, False, "tracked (estimated box)", (x, y))
     if abs(dt) <= NEARBY_S and fbox is not None:
         when = "next seen" if dt > 0 else "last seen"
         c = ((fbox[0] + fbox[2]) / 2, (fbox[1] + fbox[3]) / 2)
-        return _Spot(c, None, False, f"NOT tracked ({when} {abs(dt):.1f}s away, centred there)")
-    return _Spot(None, None, False, "NOT tracked nearby")
+        return _Spot(c, None, False, f"NOT tracked ({when} {abs(dt):.1f}s away)", None)
+    return _Spot(None, None, False, "NOT tracked nearby", None)
+
+
+@dataclass(frozen=True)
+class _Mark:
+    """Another tracked robot on a tile."""
+
+    team: int | None
+    relation: Literal["partner", "opponent", "unknown"]
+    box: tuple[float, float, float, float]
+    dist_m: float | None
+
+    @property
+    def label(self) -> str:
+        if self.team is None:
+            return "unlabelled"
+        return f"{self.team} {'PARTNER' if self.relation == 'partner' else 'OPP'}"
+
+
+def _marks(others: _Others, match: MatchInfo, spot: _Spot, t: float, same_m: float) -> list[_Mark]:
+    """Other robots with a measured main-view box within TRACKED_WITHIN_S of `t`, nearest
+    sample per track. Unlabelled tracks on the target's own spot are the target itself."""
+    idx = np.flatnonzero(
+        (np.abs(others.t - t) <= TRACKED_WITHIN_S) & np.isfinite(others.box).all(axis=1)
+    )
+    best: dict[int, int] = {}
+    for i in idx.tolist():
+        k = int(others.track[i])
+        if k not in best or abs(others.t[i] - t) < abs(others.t[best[k]] - t):
+            best[k] = i
+    out: list[_Mark] = []
+    for i in best.values():
+        team = int(others.team[i])
+        ox, oy = float(others.xy[i][0]), float(others.xy[i][1])
+        dist = None if spot.xy is None else math.hypot(ox - spot.xy[0], oy - spot.xy[1])
+        if team < 0 and dist is not None and dist < same_m:
+            continue
+        b = others.box[i]
+        out.append(
+            _Mark(
+                team=None if team < 0 else team,
+                relation="unknown" if team < 0 else _relation(match, team),
+                box=(float(b[0]), float(b[1]), float(b[2]), float(b[3])),
+                dist_m=dist,
+            )
+        )
+    return sorted(out, key=lambda m: m.dist_m if m.dist_m is not None else 99.0)
 
 
 def _tile(
-    image: Image, view: Literal["target", "full"], spot: _Spot, panel: tuple[int, int, int, int]
-) -> Image:
-    """Crop (or shrink) one main-view frame and ring the target. `panel` is the main view
-    x, y, w, h in full-frame pixels; `image` is that panel."""
+    image: Image,
+    view: Literal["target", "full"],
+    zoom: int,
+    spot: _Spot,
+    marks: list[_Mark],
+    panel: tuple[int, int, int, int],
+) -> tuple[Image, list[_Mark]]:
+    """Crop (or shrink) one main-view frame, box the other tracked robots and ring the
+    target; returns the tile and the marks drawn on it. `panel` is the main view x, y, w, h in
+    full-frame pixels; `image` is that panel."""
     px, py, pw, ph = panel
     if view == "target" and spot.center is not None:
-        cw, ch = min(CROP_W, pw), min(CROP_H, ph)
+        cw, ch = min(CROP_W // zoom, pw), min(CROP_H // zoom, ph)
         x0 = int(np.clip(spot.center[0] - px - cw / 2, 0, pw - cw))
         y0 = int(np.clip(spot.center[1] - py - ch / 2, 0, ph - ch))
         out_w = TILE_W
@@ -276,33 +842,55 @@ def _tile(
     crop = image[y0 : y0 + ch, x0 : x0 + cw]
     scale = out_w / cw
     size = (out_w, round(ch * scale))
-    tile = np.asarray(cv2.resize(crop, size, interpolation=cv2.INTER_AREA), np.uint8)
+    tile = np.asarray(cv2.resize(crop, size, interpolation=cv2.INTER_CUBIC), np.uint8)
+
+    def to_tile(u: float, v: float) -> tuple[int, int]:
+        return round((u - px - x0) * scale), round((v - py - y0) * scale)
+
+    drawn: list[_Mark] = []
+    for m in marks:
+        (ax, ay), (bx, by) = to_tile(m.box[0], m.box[1]), to_tile(m.box[2], m.box[3])
+        if not (0 <= (ax + bx) / 2 <= size[0] and 0 <= (ay + by) / 2 <= size[1]):
+            continue
+        drawn.append(m)
+        color = MARK[m.relation]
+        cv2.rectangle(tile, (ax, ay), (bx, by), color, 2)
+        (tw, th), _ = cv2.getTextSize(m.label, FONT, 0.5, 1)
+        ty = max(th + 4, ay - 3)
+        cv2.rectangle(tile, (ax, ty - th - 4), (ax + tw + 4, ty + 2), (0, 0, 0), -1)
+        cv2.putText(tile, m.label, (ax + 2, ty - 1), FONT, 0.5, color, 1, cv2.LINE_AA)
     if spot.box is not None:
         bx1, by1, bx2, by2 = spot.box
-        cx = ((bx1 + bx2) / 2 - px - x0) * scale
-        cy = ((by1 + by2) / 2 - py - y0) * scale
-        ax = max(14.0, (bx2 - bx1) / 2 * scale + 10)
-        ay = max(14.0, (by2 - by1) / 2 * scale + 10)
+        cx, cy = to_tile((bx1 + bx2) / 2, (by1 + by2) / 2)
+        ax_ = max(14.0, (bx2 - bx1) / 2 * scale + 10)
+        ay_ = max(14.0, (by2 - by1) / 2 * scale + 10)
         color = RING if spot.measured else RING_EST
-        cv2.ellipse(tile, (round(cx), round(cy)), (round(ax), round(ay)), 0, 0, 360, color, 3)
-    return tile
+        cv2.ellipse(tile, (cx, cy), (round(ax_), round(ay_)), 0, 0, 360, color, 3)
+    return tile, drawn
 
 
-def _with_header(tile: Image, text: str) -> Image:
-    head = np.zeros((HEADER_H, tile.shape[1], 3), np.uint8)
-    cv2.putText(head, text, (6, HEADER_H - 8), FONT, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-    return np.vstack([head, tile])
+def _bar(width: int, height: int, text: str, scale: float = 0.55) -> Image:
+    bar = np.zeros((height, width, 3), np.uint8)
+    cv2.putText(bar, text, (6, height - 8), FONT, scale, (255, 255, 255), 1, cv2.LINE_AA)
+    return bar
 
 
 def _sheet(tiles: list[Image], view: Literal["target", "full"]) -> Image:
-    """Tiles in a 2-wide grid for crops, one column for full views."""
+    """Tiles in a 2-wide grid for crops, one column for full views, with the legend."""
     if view == "full" or len(tiles) == 1:
-        return np.vstack(tiles)
-    h, w = tiles[0].shape[:2]
-    while len(tiles) % 2:
-        tiles = [*tiles, np.zeros((h, w, 3), np.uint8)]
-    rows = [np.hstack(tiles[i : i + 2]) for i in range(0, len(tiles), 2)]
-    return np.vstack(rows)
+        grid = np.vstack(tiles)
+    else:
+        h, w = tiles[0].shape[:2]
+        while len(tiles) % 2:
+            tiles = [*tiles, np.zeros((h, w, 3), np.uint8)]
+        grid = np.vstack([np.hstack(tiles[i : i + 2]) for i in range(0, len(tiles), 2)])
+    return np.vstack([grid, _bar(grid.shape[1], LEGEND_H, LEGEND, 0.5)])
+
+
+FACT_KINDS_LISTED = frozenset(
+    {"gap", "crossing", "crossing_in_gap", "crossing_turned_back", "stop",
+     "left_own_zone_while_active", "contact", "hub_on"}
+)  # fmt: skip
 
 
 class _FrameServer:
@@ -313,7 +901,9 @@ class _FrameServer:
         self.info = VideoInfo.load(run.video_json)
         self.match = MatchInfo.load(run.match_json)
         self.cam = Camera.load(run.calibration_json, "main")
-        self.target = _load_target(run, self.match)
+        self.target, self.others = _load_tracks(run, self.match)
+        self.facts = Facts.load(run.facts_json)
+        self.same_m = self.facts.thresholds.get("SAME_ROBOT_M", 0.7)
         m = self.match.views["main"]
         self.panel = (m.x, m.y, m.w, m.h)
 
@@ -333,26 +923,63 @@ class _FrameServer:
         main = self.match.views["main"]
         tiles: list[Image] = []
         lines: list[str] = []
+        records: list[TileRecord] = []
         for t in times:
             frame = frame_at(self.run.video, self.info, t + 0.5 / fps, crop=main)
             spot = _spot(self.target, self.cam, t)
+            marks = _marks(self.others, self.match, spot, t, self.same_m)
             period, clock = _clock(self.match, t)
             phase = _phase(self.match, t)
             label = f"t={t:.1f}s  {clock} {period} {phase}  target {spot.status}"
-            tiles.append(_with_header(_tile(frame.image, req.view, spot, self.panel), label))
-            lines.append(f"- frame:{t:.1f}  clock {clock} ({period}, {phase}), {spot.status}")
+            image, marks = _tile(frame.image, req.view, req.zoom, spot, marks, self.panel)
+            tiles.append(np.vstack([_bar(image.shape[1], HEADER_H, label), image]))
+            boxed = ", ".join(
+                m.label.replace("OPP", "opponent").replace("PARTNER", "partner")
+                + (f" {m.dist_m:.1f} m" if m.dist_m is not None else "")
+                for m in marks
+            )
+            lines.append(
+                f"- frame:{t:.1f}  clock {clock} ({period}, {phase}), {spot.status}; "
+                f"boxed: {boxed or 'none'}"
+                + ("; an unlabelled box here may be the target itself" if spot.xy is None else "")
+            )
+            records.append(
+                TileRecord(
+                    t=t,
+                    teams_marked=sorted({m.team for m in marks if m.team is not None}),
+                    teams_near=sorted(
+                        {
+                            m.team
+                            for m in marks
+                            if m.team is not None
+                            and m.dist_m is not None
+                            and m.dist_m <= NEAR_BOX_M
+                        }
+                    ),
+                    unlabelled_marked=sum(m.team is None for m in marks),
+                )
+            )
         n = done + 1
         rel = f"grade_work/sheet-{n:02d}.jpg"
         sheet = _sheet(tiles, req.view)
         cv2.imwrite(str(self.run.path / rel), sheet, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        record = FrameSheet(image=rel, view=req.view, times=times)
+        record = FrameSheet(image=rel, view=req.view, zoom=req.zoom, tiles=records)
         with _frame_log(self.run).open("a") as f:
             f.write(record.model_dump_json() + "\n")
+        near = [
+            f"{f.id} ({f.t_start:.1f}-{f.t_end:.1f})"
+            for f in self.facts.facts
+            if f.kind in FACT_KINDS_LISTED
+            and _overlap(f.t_start, f.t_end, times[0] - 0.5, times[-1] + 0.5)
+        ]
         text = (
             f"Sheet {n} of at most {IMAGE_CAP} ({rel}). Tiles, citable as written:\n"
             + "\n".join(lines)
-            + "\nYellow ring: the target's measured box. Orange ring: its position estimated "
-            "between detections."
+            + f"\nFacts overlapping these tiles: {', '.join(near) or 'none'}."
+            + "\nYellow ring: the target's measured box; orange ring: its position estimated "
+            "between detections. Boxes are the other robots the tool tracked: team and "
+            "PARTNER/OPP from the roster, or 'unlabelled' when the tool does not know the team. "
+            "A robot with no box was NOT tracked: no fact knows about it."
         )
         return text, sheet
 
@@ -367,7 +994,8 @@ def serve_frames(run_path: Path) -> None:
         "description": (
             "Show the main broadcast camera at up to four consecutive moments, cropped around "
             "the target robot (ringed) or the whole view, labelled with video time and match "
-            f"clock. At most {IMAGE_CAP} sheets per grade."
+            "clock. Other tracked robots are boxed with their team and partner/opponent, or "
+            f"'unlabelled'. At most {IMAGE_CAP} sheets per grade."
         ),
         "inputSchema": FrameRequest.model_json_schema(),
     }
@@ -441,8 +1069,8 @@ def _rubric_version(rubric: str) -> str:
     return value.strip()
 
 
-def _prompts(match: MatchInfo, facts_json: str) -> tuple[str, str]:
-    """System prompt (rules, game, limits, rubric) and task (match and facts)."""
+def _prompts(match: MatchInfo, facts_json: str, led: Ledgers) -> tuple[str, str]:
+    """System prompt (rules, game, limits, rubric) and task (match, ledgers and facts)."""
     system = "\n\n".join(
         [
             _text("grade_system.md").replace("{{image_cap}}", str(IMAGE_CAP)),
@@ -451,7 +1079,11 @@ def _prompts(match: MatchInfo, facts_json: str) -> tuple[str, str]:
             _text("rubric.md"),
         ]
     )
-    roster = ", ".join(f"{s.team} ({s.alliance} {s.station})" for s in match.roster)
+    roster = ", ".join(
+        f"{s.team} ({s.alliance} {s.station}, "
+        f"{'target' if s.team == match.target_team else _relation(match, s.team)})"
+        for s in match.roster
+    )
     phases = "\n".join(
         f"- {p.name}: {p.t_start:.1f}-{p.t_end:.1f} s, active: "
         f"{', '.join(p.active_hubs) if p.active_hubs is not None else 'unknown'}"
@@ -462,6 +1094,7 @@ def _prompts(match: MatchInfo, facts_json: str) -> tuple[str, str]:
         for p in match.phases
         if p.active_hubs is not None and match.target_alliance in p.active_hubs
     ]
+    drive, ready, items = _ledger_text(led, match)
     compact = json.dumps(json.loads(facts_json), separators=(",", ":"))
     fill = {
         "team": str(match.target_team),
@@ -470,6 +1103,9 @@ def _prompts(match: MatchInfo, facts_json: str) -> tuple[str, str]:
         "auto_winner": match.auto_winner or "unknown",
         "phases": phases,
         "own_active": ", ".join(own),
+        "driving_ledger": drive,
+        "readiness_ledger": ready,
+        "defense_items": items,
         "facts": compact,
     }
     task = _text("grade_task.md")
@@ -616,61 +1252,627 @@ def _check_sealed(init: JSON) -> None:
 
 # --- checking the answer ----------------------------------------------------------------
 
+REF = re.compile(r"\{([^{}]*)\}")
+SHIFT_WORD = re.compile(r"\bshifts? ?[1-4](?:(?:, ?| and | or | to )[1-4])*\b", re.IGNORECASE)
+NUMBER = re.compile(r"\d+(?:\.\d+)?")
+NEGATED = re.compile(r"\b(no|not|without|never|nor)\W+(?:\w+\W+){0,3}$", re.IGNORECASE)
+DEFENDER_WORD = re.compile(r"\b(defenders?|defending|defended|pinn(?:ed|ing)|pins?)\b", re.I)
+PARTNER_WORD = re.compile(r"\bpartners?\b", re.IGNORECASE)
+MOTIVE_WORD = re.compile(
+    r"\b(re-?load\w*|refill\w*|collect\w*|gather\w*|feed\w*|fed|stockpil\w*|wait\w*|intak\w*|"
+    r"scoop\w*|tr(?:y|ies|ied|ying) to|want\w*|decid\w*|in order to|"
+    r"looking for|hunting)\b",
+    re.IGNORECASE,
+)
+FUEL_WORD = re.compile(
+    r"\b(fuel|balls?|hopper|loaded|shots?|shoot\w*|fir(?:e|es|ed|ing)|volleys?|scored|scoring)\b",
+    re.IGNORECASE,
+)
+PLACE_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bcent(?:re|er)[ -]?line\b|\bmidfield\b", re.I), "centre line"),
+    (re.compile(r"\bred (?:hub|bump|ramp|trench)", re.I), "red barrier"),
+    (re.compile(r"\bblue (?:hub|bump|ramp|trench)", re.I), "blue barrier"),
+    (re.compile(r"\b(?:own|its|alliance) zone\b", re.I), "own zone"),
+    (re.compile(r"\bneutral zone\b", re.I), "neutral zone"),
+)
+ATTACK = frozenset({"opponent_on_target", "target_on_opponent"})
+NEEDS_FRAME_FOR_PASS = 1.0
+"""A pass may be dismissed from facts alone when the target was never still this long."""
+
+
+@dataclass(frozen=True)
+class GradeContext:
+    """Everything `check_answer` checks against, built once per run."""
+
+    facts: Facts
+    match: MatchInfo
+    led: Ledgers
+    target: _Target
+    teleop_tracked_share: float
+
+    @property
+    def by_id(self) -> dict[str, Fact]:
+        return {f.id: f for f in self.facts.facts}
+
+
+def grade_context(run: RunDir) -> GradeContext:
+    """Load what the checker needs from a run folder."""
+    match = MatchInfo.load(run.match_json)
+    facts = Facts.load(run.facts_json)
+    target, _ = _load_tracks(run, match)
+    teleop = [f for f in facts.facts if isinstance(f, PhaseFact) and f.phase != "auto"]
+    dur = sum(f.data.coverage.duration_s for f in teleop)
+    tracked = sum(f.data.coverage.tracked_s for f in teleop)
+    return GradeContext(facts, match, ledgers(facts, match), target, tracked / dur if dur else 0.0)
+
+
+@dataclass
+class _Item:
+    """One answer item with text, for the text checks."""
+
+    at: str
+    text: str
+    cites: list[str]
+    bumpers_read: list[int]
+    roles: bool
+    """Check role words and places (notes, calls, episodes)."""
+
+
+class _Checker:
+    """Collects problems while checking one answer."""
+
+    def __init__(self, ctx: GradeContext, sheets: list[FrameSheet]) -> None:
+        self.ctx = ctx
+        self.by_id = ctx.by_id
+        self.tiles = {round(tile.t, 1): tile for s in sheets for tile in s.tiles}
+        self.problems: list[str] = []
+        self.lines: dict[str, DrivingLine | ReadinessLine] = {
+            **{d.id: d for d in ctx.led.driving},
+            **{r.id: r for r in ctx.led.readiness},
+        }
+        self.episodes: list[DefenseEpisode] = []
+
+    def bad(self, msg: str) -> None:
+        self.problems.append(msg)
+
+    def frame_t(self, cite: str) -> float | None:
+        try:
+            t = float(cite.removeprefix("frame:"))
+        except ValueError:
+            return None
+        return next((s for s in self.tiles if abs(t - s) <= FRAME_MATCH_S), None)
+
+    def span(self, cite: str, at: str) -> tuple[float, float] | None:
+        """Time span of a citation, or None (with a problem) when it is not valid."""
+        if cite.startswith("frame:"):
+            t = self.frame_t(cite)
+            if t is None:
+                self.bad(f"{at}: {cite} was never served by the frame tool (cite as frame:<t>)")
+                return None
+            return (t, t)
+        f = self.by_id.get(cite)
+        if f is None:
+            self.bad(f"{at}: {cite!r} is not a fact id in facts.json")
+            return None
+        return (f.t_start, f.t_end)
+
+    def frames_in(self, cites: Iterable[str], a: float, b: float) -> list[float]:
+        out: list[float] = []
+        for c in cites:
+            t = self.frame_t(c) if c.startswith("frame:") else None
+            if t is not None and a - SPAN_PAD_S <= t <= b + SPAN_PAD_S:
+                out.append(t)
+        return out
+
+    # who is who
+
+    def labelled(self, cites: Iterable[str], near_only: bool = False) -> set[int]:
+        """Teams labelled in cited facts or boxed on cited tiles (`near_only`: only boxes
+        within NEAR_BOX_M of the target)."""
+        out: set[int] = set()
+        for c in cites:
+            if c.startswith("frame:"):
+                t = self.frame_t(c)
+                if t is not None:
+                    tile = self.tiles[t]
+                    out |= set(tile.teams_near if near_only else tile.teams_marked)
+                continue
+            f = self.by_id.get(c)
+            if isinstance(f, ContactFact):
+                out |= {o.team for o in f.data.others if o.team is not None}
+            elif isinstance(f, GapFact):
+                out |= {o.team for o in f.data.others_near if o.team is not None}
+        return out
+
+    def episode_roles(self, cites: Iterable[str]) -> set[str]:
+        """Verdicts of episodes overlapping the cited spans."""
+        spans = [s for c in cites if (s := self._quiet_span(c)) is not None]
+        out: set[str] = set()
+        for e in self.episodes:
+            es = self._episode_span(e)
+            if es is not None and any(_overlap(a, b, es[0], es[1]) for a, b in spans):
+                out.add(e.verdict)
+        return out
+
+    def _quiet_span(self, cite: str) -> tuple[float, float] | None:
+        if cite.startswith("frame:"):
+            t = self.frame_t(cite)
+            return None if t is None else (t, t)
+        f = self.by_id.get(cite)
+        return None if f is None else (f.t_start, f.t_end)
+
+    def _episode_span(self, e: DefenseEpisode) -> tuple[float, float] | None:
+        spans = [(f.t_start, f.t_end) for i in e.facts if (f := self.by_id.get(i)) is not None]
+        if not spans:
+            return None
+        return (min(a for a, _ in spans), max(b for _, b in spans))
+
+    # text
+
+    def resolve(self, item: _Item) -> str:
+        """Check one text field and return it with its references filled in."""
+        at, text = item.at, item.text
+        cited = set(item.cites)
+        out = text
+
+        def value(ref: str) -> str | None:
+            if ref.startswith("frame:"):
+                t = self.frame_t(ref)
+                if t is None:
+                    self.bad(f"{at}: {{{ref}}} quotes a frame the tool never served")
+                    return None
+                return _clock(self.ctx.match, t)[1]
+            head, _, path = ref.partition(".")
+            if head in self.lines:
+                obj: object = self.lines[head].model_dump()
+            elif head in self.by_id:
+                if head not in cited:
+                    self.bad(f"{at}: {{{ref}}} quotes {head}; add {head} to this item's cites")
+                    return None
+                dump = self.by_id[head].model_dump()
+                data = dump.get("data")
+                first = path.split(".")[0]
+                obj = data if isinstance(data, dict) and first in data else dump
+            else:
+                self.bad(f"{at}: {{{ref}}} names no fact id, ledger line or frame")
+                return None
+            for part in path.split(".") if path else []:
+                if isinstance(obj, dict) and part in obj:
+                    obj = TypeAdapter(dict[str, object]).validate_python(obj)[part]
+                elif isinstance(obj, list) and part.isdigit():
+                    items = TypeAdapter(list[object]).validate_python(obj)
+                    obj = items[int(part)] if int(part) < len(items) else None
+                else:
+                    self.bad(f"{at}: {{{ref}}}: {head} has no field {path!r}")
+                    return None
+            if isinstance(obj, bool):
+                return "yes" if obj else "no"
+            if isinstance(obj, int):
+                return str(obj)
+            if isinstance(obj, float):
+                return _fmt(obj)
+            if isinstance(obj, str):
+                return obj
+            self.bad(f"{at}: {{{ref}}} is {obj!r}, not a single value to quote")
+            return None
+
+        for m in REF.finditer(text):
+            v = value(m.group(1).strip())
+            if v is not None:
+                out = out.replace(m.group(0), v, 1)
+        bare = SHIFT_WORD.sub(" ", REF.sub(" ", text))
+        roster = {s.team for s in self.ctx.match.roster}
+        named: set[int] = set()
+        for m in NUMBER.finditer(bare):
+            tok = m.group(0)
+            if tok.isdigit() and int(tok) in roster:
+                named.add(int(tok))
+                continue
+            self.bad(
+                f"{at}: the number {tok!r} is typed into the text; numbers must be references "
+                "like {stop-03.duration_s}, {D1.lost_s} or {frame:92.8}, or a team number"
+            )
+        has_frame = any(c.startswith("frame:") for c in item.cites)
+        known = self.labelled(item.cites) | {self.ctx.match.target_team}
+        if has_frame:
+            known |= set(item.bumpers_read)
+        for team in sorted(named - known):
+            self.bad(
+                f"{at}: names {team}, which no cited fact labels and no cited tile boxes; cite "
+                "the fact or tile that labels it, or a tile where you read its bumper number "
+                "(and list it in bumpers_read), or call it 'an unidentified robot'"
+            )
+        if (m := MOTIVE_WORD.search(bare)) is not None:
+            self.bad(
+                f"{at}: {m.group(0)!r} claims a purpose positions cannot show; say where it went "
+                "and what a frame shows, not why"
+            )
+        if not has_frame and (m := FUEL_WORD.search(bare)) is not None:
+            self.bad(
+                f"{at}: {m.group(0)!r} is about fuel or shooting, which positions cannot show; "
+                "cite the tile that shows it or remove it"
+            )
+        if item.roles:
+            self.roles(item, bare)
+            self.places(item, bare)
+        return out
+
+    def roles(self, item: _Item, bare: str) -> None:
+        near = self.labelled(item.cites, near_only=True) | set(item.bumpers_read)
+        rel = {_relation(self.ctx.match, t) for t in near if t != self.ctx.match.target_team}
+        verdicts = self.episode_roles(item.cites)
+        for word, ok, need in (
+            (DEFENDER_WORD, "opponent" in rel or bool(verdicts & ATTACK), "an opponent"),
+            (PARTNER_WORD, "partner" in rel or "partner" in verdicts, "a partner"),
+        ):  # fmt: skip
+            for m in word.finditer(bare):
+                if NEGATED.search(bare[: m.start()]) or ok:
+                    continue
+                self.bad(
+                    f"{item.at}: {m.group(0)!r} needs {need} established by a cited fact's "
+                    "label, a box on a cited tile, a bumper you read, or an overlapping "
+                    "defense episode with that verdict"
+                )
+                break
+
+    def places(self, item: _Item, bare: str) -> None:
+        claims = [name for pat, name in PLACE_WORDS if pat.search(bare)]
+        if not claims:
+            return
+        xs: list[float] = []
+        for c in item.cites:
+            s = self._quiet_span(c)
+            if s is None:
+                continue
+            pad = 0.5 if c.startswith("frame:") else SPAN_PAD_S
+            got = self.ctx.target.near(s[0] - pad, s[1] + pad)
+            if c.startswith("frame:") and not len(got):
+                return
+            xs += [float(v) for v in got[:, 0]]
+        alliance: Alliance = self.ctx.match.target_alliance
+        near = set[str]()
+        for c in item.cites:
+            f = self.by_id.get(c)
+            if f is not None:
+                near |= _declared_places(f.model_dump().get("data"))
+        if not xs and not near:
+            return
+        for x in xs:
+            for dx in (-0.5, 0.0, 0.5):
+                near.add(f"{zone_of(x + dx, alliance)} zone")
+            if abs(x - CENTER_LINE_X_M) <= CENTRE_NEAR_M:
+                near.add("centre line")
+            for colour, (x0, x1) in BARRIER_X.items():
+                if x0 - BARRIER_NEAR_M <= x <= x1 + BARRIER_NEAR_M:
+                    near.add(f"{colour} barrier")
+        span = f"tracked at x {min(xs):.1f}-{max(xs):.1f} m" if xs else "not tracked"
+        for claim in claims:
+            if claim not in near:
+                self.bad(
+                    f"{item.at}: says {claim!r}, but the target was {span} over what it cites "
+                    f"and those facts name only: {', '.join(sorted(near)) or 'nothing'}; fix "
+                    "the place or cite the tile that shows it"
+                )
+
+
+ZONE_KEYS = frozenset(
+    {"zone", "from_zone", "to_zone", "side", "target_zone", "came_from", "went_to"}
+)
+
+
+def _declared_places(data: object) -> set[str]:
+    """Places a fact names itself: its zones (as "own zone", ...) and barriers ("red
+    barrier"), anywhere in its data."""
+    out: set[str] = set()
+    if isinstance(data, dict):
+        for k, v in TypeAdapter(dict[str, object]).validate_python(data).items():
+            if k in ZONE_KEYS and v in ("own", "neutral", "opponent"):
+                out.add(f"{v} zone")
+            elif k in ("barrier", "on_barrier") and v in ("red", "blue"):
+                out.add(f"{v} barrier")
+            else:
+                out |= _declared_places(v)
+    elif isinstance(data, list):
+        for v in TypeAdapter(list[object]).validate_python(data):
+            out |= _declared_places(v)
+    return out
+
 
 def check_answer(
-    raw: object, facts: Facts, sheets: list[FrameSheet]
-) -> tuple[GradeAnswer | None, list[str]]:
-    """Validate the agent's answer against the schema, the fact ids and the frames the tool
-    served. Returns the answer when it passes, and every problem found."""
+    raw: object, ctx: GradeContext, sheets: list[FrameSheet]
+) -> tuple[GradeAnswer | None, list[str], dict[SkillName, Band | None], dict[str, str]]:
+    """Validate the agent's answer. Returns the answer when it passes, every problem found,
+    each skill's band, and every text field resolved (keyed by its location)."""
     try:
         answer = GradeAnswer.model_validate(raw)
     except ValidationError as e:
         problems = [
             f"schema: {'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()
         ]
-        return None, problems
-    spans = {f.id: (f.t_start, f.t_end) for f in facts.facts}
-    served = sorted({t for s in sheets for t in s.times})
-    problems: list[str] = []
+        return None, problems, {}, {}
+    ck = _Checker(ctx, sheets)
+    led = ctx.led
+    resolved: dict[str, str] = {}
 
-    def where(cite: str, at: str) -> tuple[float, float] | None:
-        if cite.startswith("frame:"):
-            try:
-                t = float(cite.removeprefix("frame:"))
-            except ValueError:
-                problems.append(f"{at}: {cite!r} is not frame:<video seconds>")
-                return None
-            if not any(abs(t - s) <= FRAME_MATCH_S for s in served):
-                problems.append(f"{at}: {cite} was never served by the frame tool")
-                return None
-            return (t, t)
-        if cite not in spans:
-            problems.append(f"{at}: {cite!r} is not a fact id in facts.json")
-            return None
-        return spans[cite]
+    def text(
+        at: str, value: str, cites: list[str], bumpers: list[int] | None = None, roles: bool = True
+    ) -> None:
+        resolved[at] = ck.resolve(_Item(at, value, cites, bumpers or [], roles))
 
+    # episodes first: role words elsewhere lean on them
+    items = {i.fact: i for i in led.items}
+    covered: set[str] = set()
+    for k, e in enumerate(answer.episodes):
+        at = f"episode {k + 1} ({', '.join(e.facts)})"
+        for c in e.cites:
+            ck.span(c, at)
+        bad_ids = [i for i in e.facts if i not in ck.by_id]
+        if bad_ids:
+            ck.bad(f"{at}: {bad_ids} are not fact ids")
+            continue
+        covered |= set(e.facts)
+        span = ck._episode_span(e)  # pyright: ignore[reportPrivateUsage]
+        assert span is not None
+        frames = ck.frames_in(e.cites, *span)
+        team = e.other_team
+        rel: str = "unknown"
+        if e.identified_by == "track_label":
+            if team is None or team not in ck.labelled([*e.facts, *e.cites]):
+                ck.bad(
+                    f"{at}: track_label needs other_team to be a team labelled in its facts "
+                    "or boxed on a cited tile"
+                )
+            else:
+                rel = _relation(ctx.match, team)
+        elif e.identified_by == "bumper_number":
+            if team is None or team not in {s.team for s in ctx.match.roster} or not frames:
+                ck.bad(
+                    f"{at}: bumper_number needs a roster team and a cited tile within "
+                    f"{SPAN_PAD_S:g} s of the episode"
+                )
+            else:
+                rel = _relation(ctx.match, team)
+        elif e.identified_by in ("bumper_red", "bumper_blue"):
+            if not frames:
+                ck.bad(
+                    f"{at}: {e.identified_by} needs a cited tile within {SPAN_PAD_S:g} s of "
+                    "the episode"
+                )
+            else:
+                rel = (
+                    "partner"
+                    if e.identified_by == f"bumper_{ctx.match.target_alliance}"
+                    else "opponent"
+                )
+        elif team is not None:
+            ck.bad(f"{at}: identified_by none but other_team is set")
+        if e.identified_by != "none":
+            for i in e.facts:
+                f = ck.by_id[i]
+                if not isinstance(f, ContactFact):
+                    continue
+                teams = {o.team for o in f.data.others}
+                rels = {o.relation for o in f.data.others if o.team is not None}
+                boxed = {
+                    m
+                    for c in e.cites
+                    if (t := ck.frame_t(c) if c.startswith("frame:") else None) is not None
+                    and f.t_start - SPAN_PAD_S <= t <= f.t_end + SPAN_PAD_S
+                    for m in ck.tiles[t].teams_near
+                }
+                fits = (
+                    team in teams or rel in rels or (None in teams and team in boxed)
+                    if e.identified_by == "track_label"
+                    else None in teams or team in teams
+                    if e.identified_by == "bumper_number"
+                    else None in teams or rel in rels
+                )
+                if not fits:
+                    ck.bad(
+                        f"{at}: no robot in {i} can be {team or e.identified_by} (its robots "
+                        f"are {sorted(str(t or 'unlabelled') for t in teams)}); give it its own "
+                        "episode"
+                    )
+        need = {
+            "opponent_on_target": "opponent",
+            "target_on_opponent": "opponent",
+            "partner": "partner",
+        }
+        if e.verdict in need and rel != need[e.verdict]:
+            ck.bad(
+                f"{at}: {e.verdict} needs the other robot established as {need[e.verdict]} "
+                f"(it is {rel}: from {e.identified_by}); otherwise use could_not_tell"
+            )
+        if e.verdict in need and not frames:
+            ck.bad(f"{at}: {e.verdict} needs a cited tile within {SPAN_PAD_S:g} s of the episode")
+        long = [i.fact for i in (items.get(x) for x in e.facts) if i and i.t_end - i.t_start >= 1.0]
+        if long and not frames and len(sheets) < IMAGE_CAP:
+            ck.bad(
+                f"{at}: {', '.join(long)} lasted a second or more; open and cite a tile within "
+                f"{SPAN_PAD_S:g} s of it before deciding (could_not_tell without a tile is only "
+                "allowed once the sheet budget is used up)"
+            )
+        if e.verdict == "pass_no_holdup" and not frames:
+            for i in e.facts:
+                f = ck.by_id[i]
+                if not (
+                    isinstance(f, ContactFact)
+                    and f.data.unseen_s == 0
+                    and f.data.longest_still_s < NEEDS_FRAME_FOR_PASS
+                    and f.data.end != "unknown_target_track_lost"
+                ):
+                    ck.bad(
+                        f"{at}: {i} cannot be dismissed as a pass from the facts alone (only a "
+                        "fully seen contact with the target never still for a second and tracked "
+                        "after can); cite a tile or use could_not_tell"
+                    )
+        if e.verdict != "opponent_on_target" and e.cost_s:
+            ck.bad(f"{at}: cost_s must be 0 unless the verdict is opponent_on_target")
+        mine = [items[i] for i in e.facts if i in items]
+        away = [i for i in mine if not i.home_active]
+        if e.cost_s and mine and not away:
+            ck.bad(
+                f"{at}: cost_s must be 0: the target was home in its own active time, where being "
+                "pressed is playing through (rubric)"
+            )
+        elif away and len(away) < len(mine):
+            most = sum(i.t_end - i.t_start for i in away)
+            if e.cost_s > most + 1e-6:
+                ck.bad(
+                    f"{at}: cost_s {e.cost_s:g} is more than the {_fmt(most)} s of its items away "
+                    "from home or outside its active time; home time in its active time costs 0"
+                )
+        if e.cost_s > span[1] - span[0] + SPAN_PAD_S:
+            ck.bad(f"{at}: cost_s {e.cost_s:g} is longer than the episode's facts span")
+    ck.episodes = list(answer.episodes)
+    missing = [i.fact for i in led.items if i.fact not in covered]
+    if missing:
+        ck.bad(
+            f"episodes: these defense items are not accounted for: {', '.join(missing)}; put each "
+            "in an episode (could_not_tell is allowed)"
+        )
+    for k, e in enumerate(answer.episodes):
+        text(
+            f"episode {k + 1} ({', '.join(e.facts)})",
+            e.text,
+            [*e.facts, *e.cites],
+            [e.other_team] if e.identified_by == "bumper_number" and e.other_team else [],
+        )
+
+    # ledger calls
+    calls: dict[str, LineCall] = {}
+    for c in answer.line_calls:
+        if c.line in calls:
+            ck.bad(f"line_calls: {c.line} has more than one call")
+        calls[c.line] = c
+    for line_id in ck.lines:
+        if line_id not in calls:
+            ck.bad(f"line_calls: ledger line {line_id} has no call")
+    opp_spans = [
+        s for e in answer.episodes if e.verdict == "opponent_on_target"
+        if (s := ck._episode_span(e)) is not None  # pyright: ignore[reportPrivateUsage]
+    ]  # fmt: skip
+    for c in answer.line_calls:
+        at = f"line call {c.line}"
+        line = ck.lines.get(c.line)
+        if line is None:
+            ck.bad(f"{at}: no ledger line {c.line}")
+            continue
+        for x in c.cites:
+            ck.span(x, at)
+        a, b = (
+            (line.t_start, line.t_end)
+            if isinstance(line, DrivingLine)
+            else (line.t, line.t + line.late_s)
+        )
+        frames = ck.frames_in(c.cites, a, b)
+        driving = isinstance(line, DrivingLine)
+        if c.call in ("hub_inactive", "partner") and not driving:
+            ck.bad(f"{at}: {c.call} is for driving lines only")
+        if (
+            c.call == "hub_inactive"
+            and isinstance(line, DrivingLine)
+            and line.own_hub_active is not False
+        ):
+            ck.bad(f"{at}: hub_inactive needs own_hub_active false; it is {line.own_hub_active}")
+        if c.call == "partner" and isinstance(line, DrivingLine):
+            stops = [
+                (f.t_start, f.t_end)
+                for i in line.facts
+                if isinstance(f := ck.by_id.get(i), StopFact)
+            ] or [(line.t_start, line.t_end)]
+            held = [
+                i
+                for i in line.partner_contacts
+                if any(_overlap(ck.by_id[i].t_start, ck.by_id[i].t_end, a0, b0) for a0, b0 in stops)
+            ]
+            if not held:
+                ck.bad(
+                    f"{at}: partner needs a partner contact fact while it was stopped "
+                    f"({', '.join(f'{a0:.1f}-{b0:.1f}' for a0, b0 in stops)} s); a partner nearby "
+                    "is not in the way"
+                )
+        if c.call in ("partner", "frame_contradicts") and not frames:
+            ck.bad(
+                f"{at}: {c.call} needs a cited tile within {SPAN_PAD_S:g} s of {a:.1f}-{b:.1f} s"
+            )
+        if c.call == "opponent" and not any(
+            _overlap(a - SPAN_PAD_S, b + SPAN_PAD_S, s0, s1) for s0, s1 in opp_spans
+        ):
+            ck.bad(f"{at}: opponent needs an opponent_on_target episode overlapping the line")
+        if (
+            c.call == "charged"
+            and isinstance(line, DrivingLine)
+            and line.unseen_s > 0
+            and not frames
+        ):
+            ck.bad(
+                f"{at}: {line.id} is partly inferred ({_fmt(line.unseen_s)} s unseen); charge it "
+                "only with a cited tile in its span that shows it, else call it uncertain"
+            )
+        if c.charged_s is not None:
+            if not isinstance(line, DrivingLine) or c.call != "charged":
+                ck.bad(f"{at}: charged_s is only for charged driving lines")
+            elif c.charged_s > line.lost_s or not frames:
+                ck.bad(
+                    f"{at}: charged_s must be at most lost_s ({_fmt(line.lost_s)}) and backed "
+                    "by a cited tile in the line's span"
+                )
+        text(
+            at, c.text, [*c.cites, *(line.facts if isinstance(line, DrivingLine) else [line.fact])]
+        )
+
+    # skills
+    bands: dict[SkillName, Band | None] = {
+        "driving": driving_band(led.driving, calls),
+        "shift_readiness": readiness_band(led.readiness, calls),
+        "handling_defense": defense_band(answer.episodes),
+    }
     names = [g.skill for g in answer.skills]
     if sorted(names) != sorted(SKILLS):
-        problems.append(f"skills: need exactly one each of {list(SKILLS)}, got {names}")
+        ck.bad(f"skills: need exactly one each of {list(SKILLS)}, got {names}")
     for g in answer.skills:
+        at = f"skill {g.skill}"
         for c in g.cites:
-            where(c, f"skill {g.skill}")
-        if (
-            g.skill == "handling_defense"
-            and g.score is not None
-            and not any(c.startswith("frame:") for c in g.cites)
-        ):
-            problems.append("skill handling_defense: a score needs at least one frame citation")
+            ck.span(c, at)
+        band = bands[g.skill]
+        null_ok = band is None or (
+            g.skill == "driving" and ctx.teleop_tracked_share < MIN_TRACKED_SHARE
+        )
+        if g.score is None and not null_ok:
+            ck.bad(
+                f"{at}: null is not allowed; the rubric band from your calls and episodes is {band}"
+            )
+        elif g.score is not None and band is None:
+            ck.bad(
+                f"{at}: must be null: "
+                + (
+                    "there is no hub_on fact"
+                    if g.skill == "shift_readiness"
+                    else "no episode is opponent_on_target"
+                )
+            )
+        elif g.score is not None and band is not None and not band[0] <= g.score <= band[1]:
+            ck.bad(
+                f"{at}: score {g.score} is outside the band {band[0]}-{band[1]} the rubric "
+                "gives for your calls and episodes"
+            )
+        text(f"{at} summary", g.summary, g.cites, roles=False)
+        if g.null_reason is not None:
+            text(f"{at} null_reason", g.null_reason, g.cites, roles=False)
     for c in answer.auto.cites:
-        where(c, "auto")
+        ck.span(c, "auto")
+    text("auto", answer.auto.text, answer.auto.cites, roles=False)
     for k, n in enumerate(answer.notes):
         at = f"note {k + 1} (t={n.t})"
-        found = [s for c in n.cites if (s := where(c, at)) is not None]
+        found = [s for c in n.cites if (s := ck.span(c, at)) is not None]
         if found and not any(a - NOTE_REACH_S <= n.t <= b + NOTE_REACH_S for a, b in found):
-            problems.append(f"{at}: t is more than {NOTE_REACH_S:g} s from everything it cites")
+            ck.bad(f"{at}: t is more than {NOTE_REACH_S:g} s from everything it cites")
         if n.kind == "played_through_defense" and not any(c.startswith("frame:") for c in n.cites):
-            problems.append(f"{at}: played_through_defense needs a frame citation")
-    return (answer if not problems else None), problems
+            ck.bad(f"{at}: played_through_defense needs a frame citation")
+        text(at, n.text, n.cites, n.bumpers_read)
+    problems = ck.problems
+    return (answer if not problems else None), problems, bands, resolved
 
 
 def _retry_prompt(problems: list[str]) -> str:
@@ -685,7 +1887,8 @@ def _retry_prompt(problems: list[str]) -> str:
 
 
 def _usage(results: list[JSON]) -> tuple[int, int, int, int, float | None, int, list[str]]:
-    """Summed input, output, cache read, cache write tokens, cost, turns and models."""
+    """Summed input, output, cache read, cache write tokens, the cost (the last result's
+    total: the retry resumes the same session), turns and models."""
     ins = outs = reads = writes = turns = 0
     cost: float | None = None
     models: list[str] = []
@@ -698,7 +1901,7 @@ def _usage(results: list[JSON]) -> tuple[int, int, int, int, float | None, int, 
         turns += _int(r.get("num_turns"))
         c = r.get("total_cost_usd")
         if isinstance(c, int | float):
-            cost = (cost or 0.0) + float(c)
+            cost = float(c)  # a resumed session reports its running total
         models += [m for m in _as_dict(r.get("modelUsage")) if m not in models]
     return ins, outs, reads, writes, cost, turns, models
 
@@ -710,13 +1913,12 @@ def _int(v: object) -> int:
 def grade(run: RunDir) -> None:
     exe = _claude()
     model = run.settings().grader_model
-    match = MatchInfo.load(run.match_json)
-    facts_text = run.facts_json.read_text()
-    facts = Facts.model_validate_json(facts_text)
+    ctx = grade_context(run)
+    match = ctx.match
     work = _work(run)
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir()
-    system, task = _prompts(match, facts_text)
+    system, task = _prompts(match, run.facts_json.read_text(), ctx.led)
     (work / "system_prompt.md").write_text(system)
     (work / "task_prompt.md").write_text(task)
     start = time.perf_counter()
@@ -725,42 +1927,69 @@ def grade(run: RunDir) -> None:
         _command(exe, model, run, system, None), task, run.path, work / "session-1.jsonl"
     )
     results = [first.result]
-    sheets = _served(run)
-    answer, problems = check_answer(first.answer, facts, sheets)
+    session = first
     rejection: list[str] | None = None
-    if answer is None:
-        rejection = problems
-        (work / "rejection-1.json").write_text(
-            json.dumps({"answer": first.answer, "problems": problems}, indent=2)
+    for attempt in range(1, ATTEMPTS + 1):
+        sheets = _served(run)
+        answer, problems, bands, resolved = check_answer(session.answer, ctx, sheets)
+        if answer is not None:
+            break
+        rejection = rejection or problems
+        (work / f"rejection-{attempt}.json").write_text(
+            json.dumps({"answer": session.answer, "problems": problems}, indent=2)
         )
-        second = _run_claude(
-            _command(exe, model, run, system, first.session_id),
+        if attempt == ATTEMPTS:
+            raise RuntimeError(
+                f"grader answer rejected {ATTEMPTS} times; no grade written:\n"
+                + "\n".join(problems)
+            )
+        session = _run_claude(
+            _command(exe, model, run, system, session.session_id),
             _retry_prompt(problems),
             run.path,
-            work / "session-2.jsonl",
+            work / f"session-{attempt + 1}.jsonl",
         )
-        results.append(second.result)
-        sheets = _served(run)
-        answer, problems = check_answer(second.answer, facts, sheets)
-        if answer is None:
-            (work / "rejection-2.json").write_text(
-                json.dumps({"answer": second.answer, "problems": problems}, indent=2)
-            )
-            raise RuntimeError(
-                "grader answer rejected twice; no grade written:\n" + "\n".join(problems)
-            )
+        results.append(session.result)
+    else:
+        raise AssertionError("unreachable")
 
     ins, outs, reads, writes, cost, turns, models = _usage(results)
-    notes = []
-    for n in sorted(answer.notes, key=lambda n: n.t):
+    notes: list[Note] = []
+    for k, n in enumerate(answer.notes):
         period, clock = _clock(match, n.t)
-        notes.append(Note(**n.model_dump(), clock=clock, period=period))
+        text = resolved[f"note {k + 1} (t={n.t})"]
+        notes.append(
+            Note.model_validate(n.model_dump() | {"text": text, "clock": clock, "period": period})
+        )
+    notes.sort(key=lambda n: n.t)
+    skills = [
+        ScoredSkill.model_validate(
+            g.model_dump()
+            | {
+                "summary": resolved[f"skill {g.skill} summary"],
+                "null_reason": resolved.get(f"skill {g.skill} null_reason"),
+                "band": bands[g.skill],
+            }
+        )
+        for g in sorted(answer.skills, key=lambda g: SKILLS.index(g.skill))
+    ]
     result = Grade(
         team=match.target_team,
         rubric_version=_rubric_version(_text("rubric.md")),
-        skills=sorted(answer.skills, key=lambda g: SKILLS.index(g.skill)),
+        skills=skills,
+        driving_ledger=ctx.led.driving,
+        readiness_ledger=ctx.led.readiness,
+        defense_items=ctx.led.items,
+        line_calls=[
+            c.model_copy(update={"text": resolved[f"line call {c.line}"]})
+            for c in answer.line_calls
+        ],
+        episodes=[
+            e.model_copy(update={"text": resolved[f"episode {k + 1} ({', '.join(e.facts)})"]})
+            for k, e in enumerate(answer.episodes)
+        ],
         notes=notes,
-        auto=answer.auto,
+        auto=answer.auto.model_copy(update={"text": resolved["auto"]}),
         run=RunRecord(
             model=model,
             models_used=models,
@@ -781,7 +2010,7 @@ def grade(run: RunDir) -> None:
         ),
     )
     result.save(run.grade_json)
-    _grade_md(run).write_text(render_md(result, facts))
+    _grade_md(run).write_text(render_md(result, ctx.facts))
 
 
 def _str(v: object) -> str | None:
@@ -802,20 +2031,67 @@ def render_md(g: Grade, facts: Facts) -> str:
             out.append(f"`{c}` ({f.clock})" if f is not None else f"`{c}`")
         return ", ".join(out)
 
+    def cell(s: str) -> str:
+        return s.replace("|", "/")
+
     lines = [
         f"# Driving grade: team {g.team}",
         "",
-        f"Rubric `{g.rubric_version}`. Scores are absolute, 1 to 10. Auto is reported, not scored.",
+        f"Rubric `{g.rubric_version}`. Scores are absolute, 1 to 10, inside the band the rubric "
+        "gives from the ledger calls and defense episodes. Auto is reported, not scored.",
         "",
-        "| Skill | Score |",
-        "|---|---|",
+        "| Skill | Score | Band |",
+        "|---|---|---|",
     ]
-    lines += [f"| {s.skill} | {s.score if s.score is not None else 'null'} |" for s in g.skills]
+    lines += [
+        f"| {s.skill} | {s.score if s.score is not None else 'null'} | "
+        f"{f'{s.band[0]}-{s.band[1]}' if s.band else 'null'} |"
+        for s in g.skills
+    ]
     for s in g.skills:
         lines += ["", f"## {s.skill}: {s.score if s.score is not None else 'null'}", ""]
         if s.null_reason:
             lines += [f"No score: {s.null_reason}", ""]
         lines += [s.summary, "", f"Evidence: {cites(s.cites)}"]
+    calls = {c.line: c for c in g.line_calls}
+    lines += [
+        "",
+        "## Driving ledger",
+        "",
+        "| Line | Time | Lost (s) | Call | Why |",
+        "|---|---|---|---|---|",
+    ]
+    for d in g.driving_ledger:
+        c = calls.get(d.id)
+        lines.append(
+            f"| {d.id} {d.kind} | {d.t_start:.1f}-{d.t_end:.1f} | {_fmt(d.lost_s)} | "
+            f"{c.call if c else '-'} | {cell(c.text) if c else ''} |"
+        )
+    lines += [
+        "",
+        "## Readiness ledger",
+        "",
+        "| Line | Phase | Late (s) | Call | Why |",
+        "|---|---|---|---|---|",
+    ]
+    for r in g.readiness_ledger:
+        c = calls.get(r.id)
+        lines.append(
+            f"| {r.id} | {r.phase} | {_fmt(r.late_s)} | {c.call if c else '-'} | "
+            f"{cell(c.text) if c else ''} |"
+        )
+    lines += [
+        "",
+        "## Defense episodes",
+        "",
+        "| Facts | Verdict | Other | Cost (s) | What |",
+        "|---|---|---|---|---|",
+    ]
+    for e in g.episodes:
+        who = f"{e.other_team or '?'} ({e.identified_by})"
+        lines.append(
+            f"| {', '.join(e.facts)} | {e.verdict} | {who} | {e.cost_s:g} | {cell(e.text)} |"
+        )
     lines += [
         "",
         "## Notes",
@@ -824,8 +2100,9 @@ def render_md(g: Grade, facts: Facts) -> str:
         "|---|---|---|---|---|",
     ]
     for n in g.notes:
-        text = n.text.replace("|", "/")
-        lines.append(f"| {n.clock} {n.period} | {n.t:.1f} | {n.kind} | {text} | {cites(n.cites)} |")
+        lines.append(
+            f"| {n.clock} {n.period} | {n.t:.1f} | {n.kind} | {cell(n.text)} | {cites(n.cites)} |"
+        )
     r = g.run
     cost = f"{r.cost_usd:.2f} USD (list price)" if r.cost_usd is not None else "not reported"
     lines += [
@@ -842,7 +2119,7 @@ def render_md(g: Grade, facts: Facts) -> str:
         f"Claude Code {r.claude_version or 'unknown'}",
         f"- Wall time: {r.wall_s:.0f} s over {r.turns} turns",
         f"- Contact sheets: {r.images_served} of {r.image_cap}: "
-        + ", ".join(f"{s.image} ({s.view}, t {s.times[0]:.1f})" for s in r.sheets),
+        + ", ".join(f"{s.image} ({s.view}, t {s.tiles[0].t:.1f})" for s in r.sheets),
         f"- Input tokens: {r.input_tokens + r.cache_read_tokens + r.cache_write_tokens} "
         f"({r.cache_read_tokens} cache read, {r.cache_write_tokens} cache write, "
         f"{r.input_tokens} uncached); output tokens: {r.output_tokens}; cost {cost}",
