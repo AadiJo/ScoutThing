@@ -1,4 +1,4 @@
-Rubric version: draft-8
+Rubric version: draft-9
 
 # The three skills and the scale
 
@@ -44,8 +44,10 @@ The tiles span only the part of the trip from which a heaped hopper could still 
   tile is heaped, when that is at least two readable tiles (one heaped tile is one doubtful
   reading); otherwise `not_heaped`, or `cannot_see` when no tile is readable. A tile that
   cannot be read changes nothing.
-- A heaped trip is charged from that tile to its end, less any time a barrier line or an
-  `opponent_on_target` episode already covers, less the time to get home from where it was
+- A heaped trip is charged from that tile to its end, less any time a barrier line already
+  covers, less the time a robot not known to be its partner was within contact distance
+  (what that robot cost cannot be told from wandering, so it is not charged, whatever the
+  contact's verdict), less the time to get home from where it was
   (1.2 s plus half a second per metre outside its zone, at least 3 s), less 3 s more for the
   doubt in one hopper reading. `not_heaped` and `cannot_see`: not charged.
 - A trip's end is when it got home, or, when it was not seen home, where it was last tracked
