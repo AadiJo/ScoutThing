@@ -76,6 +76,7 @@ from scout.games.rebuilt2026 import (
 from scout.run import RunDir, Stage
 from scout.schemas.common import Alliance
 from scout.schemas.facts import (
+    Arrival,
     ContactFact,
     CrossingFact,
     CrossingTurnedBackData,
@@ -95,6 +96,7 @@ from scout.schemas.facts import (
 from scout.schemas.grade import (
     SKILLS,
     Call,
+    Coverage,
     DefenseEpisode,
     DefenseItem,
     DrivingKind,
@@ -104,7 +106,9 @@ from scout.schemas.grade import (
     GradeAnswer,
     LineCall,
     Note,
+    PhaseCoverage,
     ReadinessLine,
+    ReadinessRuling,
     Ruling,
     RunRecord,
     ScoredCall,
@@ -112,6 +116,7 @@ from scout.schemas.grade import (
     ScoredSkill,
     SkillName,
     TileRecord,
+    Untracked,
     View,
 )
 from scout.schemas.identity import Identity
@@ -148,8 +153,16 @@ NOTE_REACH_S = 5.0
 FRAME_MATCH_S = 0.051
 SPAN_PAD_S = 2.0
 """A frame this close to an episode or ledger line counts as evidence for it."""
-MIN_TRACKED_SHARE = 0.5
-"""Below this share of teleop tracked, driving may be null."""
+DRIVING_UNSEEN_MAX = 0.25
+"""Driving is withheld when more than this share of its own active time was untracked in gaps
+that nothing puts in its own zone, unless what was seen already charges more than
+DRIVING_EDGES[1]. Charges come from barrier passes and trips out of its zone, and only unseen
+time away from home can hide them. On the sixteen matches that share is 1 to 21% except two
+blind matches (33%, 51%); a quarter of 90 s is about 22 s, room for two loaded trips or a stall
+and a reroute, enough to move the score three bands."""
+PHASE_UNSEEN_MAX = 0.5
+"""An own-active phase more than this share unseen (as above) flags the driving score: a whole
+shift can be blind in a match that is well tracked overall."""
 CENTRE_NEAR_M = 1.5
 BARRIER_NEAR_M = 2.5
 """A place word is supported when the target was this close to the centre line, or to a
@@ -169,8 +182,13 @@ read at most 0.36 m/s, except one that backed off 4.65 m; the one drive past rea
 went 1.38 m back. STALL_MPS sits between them (0.44 and 0.46 m/s of margin) at the facts'
 below-driving-pace speed; BACKED_OFF_M halfway (1.6 m either side). Only one drive past was in
 active time, so the cleared side rests on little evidence."""
+STALLED_S = 1.0
+"""A turned-back attempt is called a stall only when the robot was measured stopped on the band:
+its slowest speed under the facts' STOP_MPS, or stopped (or unseen, so possibly stopped) this
+long. The audit's frame-checked turn-away without a stall read 0.46 m/s and 0 s stopped; the
+human's stalls read 0.01 to 0.36 m/s (one, at 0.36, also stopped 1.1 s)."""
 HOME_INFERENCES: frozenset[GapInference] = frozenset(
-    {"in_own_zone_beyond_barrier", "entered_own_zone"}
+    {"in_own_zone_beyond_barrier", "entered_own_zone", "own_zone_both_sides"}
 )
 """Gap inferences that put an untracked robot in its own zone (with `stayed_in_place` when it
 was last seen there)."""
@@ -493,17 +511,34 @@ class _Raw:
     look: tuple[float, ...] = ()
 
 
-def _turned_back_default(d: CrossingTurnedBackData) -> tuple[Ruling, str]:
-    """A turned-back attempt is a stall or a back-off (charged) when it slowed on the band or
-    went well back from the barrier afterwards; a drive past keeps its pace and stays close."""
+def _stalled(d: CrossingTurnedBackData, stop_mps: float) -> bool:
+    """Measured stopped on the band (see STALLED_S)."""
+    slow = d.slowest_mps
+    return (slow is not None and slow < stop_mps) or d.stopped_s + d.unseen_s >= STALLED_S
+
+
+def _turned_back_default(d: CrossingTurnedBackData, stop_mps: float) -> tuple[Ruling, str]:
+    """A turned-back attempt is charged when it slowed on the band or went well back from the
+    barrier afterwards; a drive past keeps its pace and stays close. The reason names the
+    measure that fired, and calls it a stall only when the robot was measured stopped."""
     slow, far = d.slowest_mps, d.furthest_from_barrier_m
+    kind = (
+        f"stopped {_fmt(d.stopped_s)} s on the band: a stall"
+        if _stalled(d, stop_mps)
+        else f"never under {stop_mps:g} m/s there and stopped {_fmt(d.stopped_s)} s: a slow "
+        "turn-away, not a stall"
+    )
     if slow is None or slow <= STALL_MPS:
-        what = "no speed read on the band" if slow is None else f"slowest {_fmt(slow)} m/s"
-        return "charged", f"{what} (stall at or under {STALL_MPS:g} m/s)"
+        what = (
+            "no speed could be read on the band"
+            if slow is None
+            else (f"slowed to {_fmt(slow)} m/s on the band")
+        )
+        return "charged", f"{what} (charged at or under {STALL_MPS:g} m/s); {kind}"
     if far is not None and far >= BACKED_OFF_M:
         return "charged", (
-            f"slowest {_fmt(slow)} m/s but backed off {_fmt(far)} m from the barrier (back-off "
-            f"at or over {BACKED_OFF_M:g} m)"
+            f"went {_fmt(far)} m back from the barrier (charged at {BACKED_OFF_M:g} m or more), "
+            f"slowest {_fmt(slow)} m/s: a back-off or turn-away, not a stall"
         )
     return "cleared", (
         f"drive past: slowest {_fmt(slow)} m/s (over {STALL_MPS:g}) and at most "
@@ -511,9 +546,34 @@ def _turned_back_default(d: CrossingTurnedBackData) -> tuple[Ruling, str]:
     )
 
 
+def _arrival_text(a: Arrival, t0: float) -> str:
+    """How an arrival is known, for a ledger line's text."""
+    if a.by == "seen":
+        return "seen arriving"
+    if a.by == "after_gap":
+        return "first tracked there after a gap: at most that"
+    how = f"{a.fact} saw it crossing" if a.by == "crossing" else f"{a.fact}'s inference"
+    return (
+        f"estimated: {how}, plus the rest of the way at the speed it was going; first tracked "
+        f"there {_fmt(a.first_tracked_t - t0)} s after"
+    )
+
+
+def _home_gap(g: GapFact) -> bool:
+    """A gap whose inference puts the untracked robot in its own zone."""
+    d = g.data
+    return d.inference in HOME_INFERENCES or (
+        d.inference == "stayed_in_place" and d.before is not None and d.before.zone == "own"
+    )
+
+
 def _readiness(fs: Sequence[Fact], match: MatchInfo) -> list[ReadinessLine]:
-    """One line per `hub_on` fact, with its default: in its own zone, or untracked inside a
-    gap whose inference puts it there, is cleared; otherwise its lateness is charged."""
+    """One line per `hub_on` fact, with its default: tracked in its own zone, untracked inside
+    a gap whose inference puts it there, or shown home by then by a crossing or inference
+    (`reached`), is cleared. Untracked with its last sighting in its own zone and nothing
+    putting it home, it is `not_judged`: it may have stayed or left, and positions cannot
+    say which. Otherwise its lateness is charged (at most `late_s` when first seen home after
+    a gap)."""
     gaps = [f for f in fs if isinstance(f, GapFact)]
     out: list[ReadinessLine] = []
     for f in fs:
@@ -527,22 +587,37 @@ def _readiness(fs: Sequence[Fact], match: MatchInfo) -> list[ReadinessLine]:
             if d.in_own_zone
             else (ph.t_end - ph.t_start if never else d.reached_own_zone_after_s or 0.0)
         )
-        bound = bool(not d.in_own_zone and d.reached_after_gap)
+        bound = bool(not d.in_own_zone and d.reached and d.reached.by == "after_gap")
         gap = next((g for g in gaps if g.t_start <= f.t_start <= g.t_end), None)
-        home_gap = gap is not None and (
-            gap.data.inference in HOME_INFERENCES
-            or (gap.data.inference == "stayed_in_place" and gap.data.before is not None
-                and gap.data.before.zone == "own")
-        )  # fmt: skip
-        default: Ruling
+        last = d.last_seen
+        default: ReadinessRuling
         if d.in_own_zone:
             default, why = "cleared", "tracked in its own zone"
-        elif d.in_own_zone is None and gap is not None and home_gap:
+        elif d.in_own_zone is None and gap is not None and _home_gap(gap):
             default = "cleared"
             why = f"untracked in {gap.id}, whose inference {gap.data.inference} puts it home"
+        elif d.reached is not None and d.reached.by in ("crossing", "inference") and late == 0:
+            default = "cleared"
+            why = f"untracked; {d.reached.fact} puts it home by the activation"
+        elif d.in_own_zone is None and (last is None or last.zone == "own"):
+            default = "not_judged"
+            why = (
+                "untracked, last seen in its own zone "
+                f"{_fmt(f.t_start - last.t)} s before and nothing seen since puts it out or home: "
+                "where it was is unknown, so it is not judged"
+                if last is not None
+                else "untracked since the match began: not judged"
+            )
         else:
             default = "charged"
-            why = "tracked outside its own zone" if d.in_own_zone is False else "untracked"
+            why = (
+                "tracked outside its own zone"
+                if d.in_own_zone is False
+                else f"untracked, last seen outside its own zone {_fmt(f.t_start - last.t)} s "
+                "before"
+                if last is not None
+                else "untracked"
+            )
         where = (
             "in its own zone"
             if d.in_own_zone
@@ -555,8 +630,8 @@ def _readiness(fs: Sequence[Fact], match: MatchInfo) -> list[ReadinessLine]:
             if d.in_own_zone
             else "; never tracked in its own zone in this phase"
             if never
-            else f"; first tracked in its own zone {_fmt(late)} s later"
-            + (" (first seen after a gap: at most that late)" if bound else "")
+            else f"; in its own zone {_fmt(late)} s later"
+            + (f" ({_arrival_text(d.reached, f.t_start)})" if d.reached is not None else "")
         )
         out.append(
             ReadinessLine(
@@ -582,6 +657,7 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
     teleop = match.teleop_start_t - 1e-6
     active = _own_active(match)
     contact_m = facts.thresholds.get("CONTACT_M", 1.6)
+    stop_mps = facts.thresholds.get("STOP_MPS", 0.3)
     readiness = _readiness(fs, match)
     late = [(r.t, r.t + r.late_s) for r in readiness if r.default == "charged" and r.late_s > 0]
     raw: list[_Raw] = []
@@ -609,9 +685,9 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
             and s.data.barrier_edge_m <= ROBOT_FOOTPRINT_M
         ]
         arrive = (
-            f"first tracked in the {d.far_side} zone {_fmt(d.seconds_to_far_side)} s after "
-            "entering" + (" (after a gap: at most that)" if d.far_side_after_gap else "")
-            if d.seconds_to_far_side is not None
+            f"in the {d.far_side} zone {_fmt(d.seconds_to_far_side)} s after entering "
+            f"({_arrival_text(d.arrived, f.t_start)})"
+            if d.arrived is not None and d.seconds_to_far_side is not None
             else f"never tracked in the {d.far_side} zone after it"
         )
         stops = "".join(
@@ -627,12 +703,13 @@ def ledgers(facts: Facts, match: MatchInfo) -> Ledgers:
             f"{_fmt(d.cost_s)} s until {_end_text(d.cost_end)}, {_fmt(d.own_active_s)} s of it in "
             f"its own active time{stops}"
         )
-        default, why = _turned_back_default(d)
+        default, why = _turned_back_default(d, stop_mps)
         raw.append(
             _Raw(
                 f.t_start, f.t_end, "turned_back", [f.id, *(s.id for s in folded)],
                 active_s(d.own_active_s, f.t_start, f.t_end), d.unseen_s, text, default, why,
-                bound=d.far_side_after_gap and d.cost_end == "reached_far_side",
+                bound=bool(d.arrived and d.arrived.by == "after_gap")
+                and d.cost_end == "reached_far_side",
             )
         )  # fmt: skip
     for f in fs:
@@ -914,6 +991,8 @@ class Charges:
 
     line: dict[str, float]
     """Seconds per driving line, lateness per readiness line."""
+    unjudged: list[str]
+    """Readiness lines `not_judged` by default that no call settled: not scored."""
     driving_s: float
     pin: list[float]
     """Held cost per episode."""
@@ -980,7 +1059,8 @@ def charges(
     episode. Heaped trips: from `heaped_at` to the end of the trip, less barrier lines and
     opponent episodes inside it, the time to get home from there (`_home_allow`) and
     TRIP_GRACE_S. Readiness: `late_s` when charged by default or called `not_home`,
-    `charged_s` when `home_earlier`, else 0."""
+    `charged_s` when `home_earlier` (or `not_home` with it), else 0; a `not_judged` line no
+    call settled is not scored."""
     opp = [
         (k, s)
         for k, e in enumerate(episodes)
@@ -1020,20 +1100,22 @@ def charges(
         excused = _union_s(a, d.t_end, [*held, *(s for _, s in opp)])
         allow = _home_allow(target, alliance, a) + TRIP_GRACE_S
         out[d.id] = max(0.0, d.t_end - a - excused - allow)
+    unjudged: list[str] = []
     for r in led.readiness:
         c = calls.get(r.id)
         call = c.call if c is not None else None
-        out[r.id] = (
-            (c.charged_s or 0.0)
-            if c is not None and call == "home_earlier"
-            else r.late_s
-            if call == "not_home" or (call is None and r.default == "charged")
-            else 0.0
-        )
+        if c is not None and call in ("home_earlier", "not_home") and c.charged_s is not None:
+            out[r.id] = c.charged_s
+        elif call == "not_home" or (call is None and r.default == "charged"):
+            out[r.id] = r.late_s
+        else:
+            out[r.id] = 0.0
+        if r.default == "not_judged" and call not in ("home", "not_home"):
+            unjudged.append(r.id)
     out = {k: round(v, 2) for k, v in out.items()}
     total = sum(out[d.id] for d in led.driving)
     pins = _pins(episodes, led.items)
-    return Charges(out, round(total, 2), pins, [round(x, 2) for x in taken])
+    return Charges(out, unjudged, round(total, 2), pins, [round(x, 2) for x in taken])
 
 
 def _opponent_contacts(
@@ -1050,41 +1132,152 @@ def _opponent_contacts(
     ]
 
 
-Scored = tuple[int | None, Band | None, str | None]
-"""A skill's score, band and, when the score is None, why."""
+@dataclass(frozen=True)
+class Scored:
+    """A skill's score and band (None when withheld, with `null_reason`), and whether it
+    stands on part of the match only."""
+
+    score: int | None
+    band: Band | None
+    null_reason: str | None = None
+    low_coverage: bool = False
 
 
 def scores(
-    led: Ledgers,
-    episodes: Sequence[DefenseEpisode],
-    ch: Charges,
-    tracked_share: float,
+    led: Ledgers, episodes: Sequence[DefenseEpisode], ch: Charges, cov: Coverage
 ) -> dict[SkillName, Scored]:
     """Each skill's score from the charged seconds (see rubric.md): code, not the grader,
-    picks the score inside the band."""
+    picks the score inside the band. Driving is withheld when too much of its own active time
+    went unseen (DRIVING_UNSEEN_MAX) unless what was seen already costs more than one short
+    hesitation, and flagged when a whole phase was mostly unseen (PHASE_UNSEEN_MAX): unseen
+    time can only add charges."""
     out: dict[SkillName, Scored] = {}
-    if tracked_share < MIN_TRACKED_SHARE:
-        out["driving"] = (None, None, "too little of teleop was tracked to judge driving")
+    blind = [p for p in cov.phases if p.unseen_s > PHASE_UNSEEN_MAX * p.duration_s]
+    low = cov.own_active_unseen_share > DRIVING_UNSEEN_MAX
+    if low and ch.driving_s <= DRIVING_EDGES[1]:
+        out["driving"] = Scored(
+            None,
+            None,
+            f"{cov.own_active_unseen_share:.0%} of its own active time was untracked with "
+            f"nothing to say where it was (over {DRIVING_UNSEEN_MAX:.0%}): a stall or a loaded "
+            "trip there would not be seen",
+            True,
+        )
     else:
-        out["driving"] = (_score(ch.driving_s, DRIVING_EDGES),
-                          _band_of(ch.driving_s, DRIVING_EDGES), None)  # fmt: skip
-    late = [ch.line.get(r.id, 0.0) for r in led.readiness]
+        out["driving"] = Scored(
+            _score(ch.driving_s, DRIVING_EDGES),
+            _band_of(ch.driving_s, DRIVING_EDGES),
+            None,
+            low or bool(blind),
+        )
+    judged = [r for r in led.readiness if r.id not in ch.unjudged]
+    late = [ch.line.get(r.id, 0.0) for r in judged]
     if not led.readiness:
-        out["shift_readiness"] = (None, None, "its hub never turned on in teleop")
-    elif any(r.never_home and late[k] >= r.late_s > 0 for k, r in enumerate(led.readiness)):
-        out["shift_readiness"] = (1, (1, 2), None)
+        out["shift_readiness"] = Scored(None, None, "its hub never turned on in teleop")
+    elif not judged:
+        out["shift_readiness"] = Scored(
+            None, None, "it was untracked at every activation of its hub: none could be judged"
+        )
+    elif any(r.never_home and late[k] >= r.late_s > 0 for k, r in enumerate(judged)):
+        out["shift_readiness"] = Scored(1, (1, 2), None, len(judged) < len(led.readiness))
     else:
         worst = max(late)
         score, band = _score(worst, READINESS_EDGES), _band_of(worst, READINESS_EDGES)
         if sum(x > READINESS_EDGES[0] for x in late) >= 2:
             score, band = min(score, 6), min(band, (5, 6))
-        out["shift_readiness"] = (score, band, None)
+        out["shift_readiness"] = Scored(score, band, None, len(judged) < len(led.readiness))
     if not any(e.verdict == "opponent_on_target" for e in episodes):
-        out["handling_defense"] = (None, None, "no opponent was established on it")
+        out["handling_defense"] = Scored(None, None, "no opponent was established on it")
     else:
         d = ch.defense_s
-        out["handling_defense"] = (_score(d, DEFENSE_EDGES), _band_of(d, DEFENSE_EDGES), None)
+        out["handling_defense"] = Scored(_score(d, DEFENSE_EDGES), _band_of(d, DEFENSE_EDGES))
     return out
+
+
+def coverage(facts: Facts, match: MatchInfo, led: Ledgers) -> Coverage:
+    """What the scores rest on: tracked shares of its own active time and of each own-active
+    phase, the gaps there (with whether an inference puts it home), activations judged, and
+    match-wide tracking of it and of the other robots."""
+    gaps = [f for f in facts.facts if isinstance(f, GapFact)]
+    active = _own_active(match)
+    home = [(g.t_start, g.t_end) for g in gaps if _home_gap(g)]
+    unknown = [(g.t_start, g.t_end) for g in gaps if not _home_gap(g)]
+    phases: list[PhaseCoverage] = []
+    for f in facts.facts:
+        if not isinstance(f, PhaseFact) or f.phase == "auto" or not f.data.own_hub_active:
+            continue
+        c = f.data.coverage
+        phases.append(
+            PhaseCoverage(
+                phase=f.phase or "-",
+                duration_s=c.duration_s,
+                tracked_share=c.tracked_share,
+                unseen_s=round(_union_s(f.t_start, f.t_end, unknown), 1),
+                home_s=round(_union_s(f.t_start, f.t_end, home), 1),
+            )
+        )
+    dur = sum(p.duration_s for p in phases)
+    auto = next(
+        (f.data.coverage.tracked_share for f in facts.facts if isinstance(f, PhaseFact)
+         and f.phase == "auto"), 0.0,
+    )  # fmt: skip
+    return Coverage(
+        own_active_s=round(dur, 1),
+        own_active_tracked_share=round(
+            sum(p.tracked_share * p.duration_s for p in phases) / dur if dur else 0.0, 3
+        ),
+        own_active_unseen_share=round(sum(p.unseen_s for p in phases) / dur if dur else 0.0, 3),
+        phases=phases,
+        untracked=[
+            Untracked(fact=g.id, t_start=g.t_start, t_end=g.t_end, inferred_home=_home_gap(g))
+            for g in gaps
+            if any(_overlap(g.t_start, g.t_end, a, b) for a, b in active)
+        ],
+        activations=len(led.readiness),
+        activations_judged=sum(r.default != "not_judged" for r in led.readiness),
+        match_tracked_share=facts.coverage.tracked_share,
+        auto_tracked_share=auto,
+        others_tracked_mean=facts.coverage.others_tracked_mean,
+    )
+
+
+def coverage_text(
+    cov: Coverage, led: Ledgers, sc: dict[SkillName, Scored] | None, unjudged: Sequence[str]
+) -> dict[SkillName, str]:
+    """One sentence per skill on what its score rests on, for grade.json, grade.md and the
+    grader's task (`sc` None: before scoring)."""
+    phases = ", ".join(f"{p.phase} {p.tracked_share:.0%}" for p in cov.phases)
+    unseen = sum(p.unseen_s for p in cov.phases)
+    drive = (
+        f"Driving is judged on its own active time ({cov.own_active_s:.0f} s): the target was "
+        f"tracked {cov.own_active_tracked_share:.0%} of it ({phases}), and {unseen:.0f} s of "
+        f"it ({cov.own_active_unseen_share:.0%}) was untracked with nothing to say where it was"
+    )
+    d = sc.get("driving") if sc else None
+    if d is not None and d.score is None:
+        drive += ", too much to score"
+    elif d is not None and d.low_coverage:
+        drive += ", so the score counts only what was seen and may be too high"
+    skipped = [r for r in led.readiness if r.id in unjudged]
+    ready = (
+        f"Readiness judged {cov.activations_judged} of {cov.activations} activations of its hub"
+        + (
+            "; not judged (untracked, last seen home, nothing seen since): "
+            + ", ".join(f"{r.phase} at {r.t:.1f} s" for r in skipped)
+            if skipped
+            else ""
+        )
+    )
+    defense = (
+        f"The target was tracked {cov.match_tracked_share:.0%} of the match, and on average "
+        f"{cov.others_tracked_mean:.1f} of the other five robots were tracked: contact with a "
+        "robot the tracker missed is not in the facts"
+    )
+    return {
+        "driving": drive + ".",
+        "shift_readiness": ready + ".",
+        "handling_defense": defense + ".",
+    }
 
 
 # --- the frame tool ---------------------------------------------------------------------
@@ -1508,10 +1701,34 @@ def _rubric_version(rubric: str) -> str:
     return value.strip()
 
 
+def _coverage_prompt(cov: Coverage, led: Ledgers, match: MatchInfo) -> str:
+    """What was seen, for the task: the per-skill sentences, auto's tracked share and every
+    gap in its own active time."""
+    said = coverage_text(cov, led, None, [r.id for r in led.readiness if r.default == "not_judged"])
+    own = [p for p in match.phases if p.name != "auto" and p.active_hubs
+           and match.target_alliance in p.active_hubs]  # fmt: skip
+    gaps = "\n".join(
+        f"- {u.fact} {u.t_start:.1f}-{u.t_end:.1f} s "
+        f"({', '.join(p.name for p in own if _overlap(u.t_start, u.t_end, p.t_start, p.t_end))}): "
+        + ("an inference puts it in its own zone" if u.inferred_home else "where it was is unknown")
+        for u in cov.untracked
+    )
+    return "\n".join(
+        [
+            *(f"- {skill}: {text}" for skill, text in said.items()),
+            f"- auto: the target was tracked {cov.auto_tracked_share:.0%} of auto.",
+            "",
+            "Untracked stretches in its own active time:",
+            gaps or "(none)",
+        ]
+    )
+
+
 def _prompts(
-    match: MatchInfo, facts: Facts, facts_json: str, led: Ledgers, home: Corner
+    match: MatchInfo, facts: Facts, facts_json: str, led: Ledgers, home: Corner, cov: Coverage
 ) -> tuple[str, str]:
-    """System prompt (rules, game, limits, rubric) and task (match, ledgers and facts)."""
+    """System prompt (rules, game, limits, rubric) and task (match, coverage, ledgers and
+    facts)."""
     system = "\n\n".join(
         [
             _text("grade_system.md").replace("{{image_cap}}", str(IMAGE_CAP)),
@@ -1545,6 +1762,7 @@ def _prompts(
         "phases": phases,
         "own_active": ", ".join(own),
         "home_view": home,
+        "coverage": _coverage_prompt(cov, led, match),
         "driving_ledger": drive,
         "readiness_ledger": ready,
         "defense_items": items,
@@ -1722,6 +1940,45 @@ FAULT_WORD = re.compile(
     re.IGNORECASE,
 )
 """Words reading a stretch as a driving fault: rejected over a line a tile cleared."""
+_QUANT = (
+    r"(?:no|never|none|nothing|not once|without (?:a|an|any)|every|each|all|(?:the|its) only|"
+    r"(?:only|just) one|the one|a single|two|three|four|five|sole|both|any)"
+)
+_EVENT = (
+    r"(?:trips?|crossings?|stalls?|stops?|attempts?|turn(?:ed)?-?backs?|touch(?:es)?|faults?|"
+    r"mistakes?|problems?|hesitations?|loops?|detours?|excursions?|outings?|exits?|holds?|pins?|"
+    r"contacts?|hits?)"
+)
+ABSENCE_WORD = re.compile(
+    rf"\b{_QUANT}\b(?!\W+of\W+(?:these|those|them|its charged)\b)(?:\W+\w+){{0,3}}?\W+"
+    rf"{_EVENT}\b|\b(?:stayed|remained|kept) (?:well )?(?:behind|inside|in its|at home|home|"
+    r"short of|on its own side)\b|\b(?:twice|thrice|(?:two|three|four|five) times|throughout|"
+    r"the whole|the entire|never (?:left|crossed|"
+    r"went|got out|stalled)|did not (?:leave|cross|go out|stall))\b",
+    re.IGNORECASE,
+)
+"""Claims of absence, counts or staying put ("no trip out", "the one trip", "every crossing",
+"stayed behind the centre line"): over time with untracked stretches they need SEEN_WORD.
+Counts of listed things ("none of these holds") are not claims about unseen time."""
+SEEN_WORD = re.compile(
+    r"\b(seen|tracked|visible|in view|observed|inferred|positions? show)\b", re.IGNORECASE
+)
+UNKNOWN_WORD = re.compile(
+    r"\b(unknown|not known|untracked|unseen|not (?:tracked|seen)|cannot (?:say|tell|show)|"
+    r"do(?:es)? not show)\b",
+    re.IGNORECASE,
+)
+"""A sentence that says the time was not seen is not claiming what happened in it."""
+SENTENCE = re.compile(r"(?<=[.;!?])\s+")
+CLAIM_MIN_SHARE = 0.5
+"""Below this tracked share of what an item covers, no absence or count claim stands, even
+qualified: "as far as tracked" over a fifth of auto says nothing."""
+STALL_WORD = re.compile(r"\b(stall\w*|stuck|wedged|beached|stopped dead)\b", re.IGNORECASE)
+LOST_WORD = re.compile(
+    r"\b(lost time|time lost|wasted|idle\w*|doing nothing|loiter\w*)\b", re.IGNORECASE
+)
+"""Words reading a stop as lost time: refused over a stop in its own zone in its own active
+time, where a robot shoots (the rubric does not charge it)."""
 PLACE_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bcent(?:re|er)[ -]?line\b|\bmidfield\b", re.I), "centre line"),
     (re.compile(r"\bred (?:hub|bump|ramp|trench)", re.I), "red barrier"),
@@ -1746,7 +2003,7 @@ target's tracked positions over what the item cites."""
 ATTACK = frozenset({"opponent_on_target", "target_on_opponent"})
 BARRIER_CALLS: frozenset[Call] = frozenset({"opponent", "partner", "misplaced", "home_earlier"})
 TRIP_CALLS: frozenset[Call] = frozenset({"heaped", "not_heaped", "cannot_see"})
-READINESS_CALLS: frozenset[Call] = frozenset({"opponent", "home_earlier", "not_home"})
+READINESS_CALLS: frozenset[Call] = frozenset({"opponent", "home_earlier", "home", "not_home"})
 
 
 @dataclass(frozen=True)
@@ -1757,7 +2014,7 @@ class GradeContext:
     match: MatchInfo
     led: Ledgers
     target: _Target
-    teleop_tracked_share: float
+    coverage: Coverage
 
     @property
     def by_id(self) -> dict[str, Fact]:
@@ -1769,10 +2026,8 @@ def grade_context(run: RunDir) -> GradeContext:
     match = MatchInfo.load(run.match_json)
     facts = Facts.load(run.facts_json)
     target, _ = _load_tracks(run, match)
-    teleop = [f for f in facts.facts if isinstance(f, PhaseFact) and f.phase != "auto"]
-    dur = sum(f.data.coverage.duration_s for f in teleop)
-    tracked = sum(f.data.coverage.tracked_s for f in teleop)
-    return GradeContext(facts, match, ledgers(facts, match), target, tracked / dur if dur else 0.0)
+    led = ledgers(facts, match)
+    return GradeContext(facts, match, led, target, coverage(facts, match, led))
 
 
 @dataclass
@@ -1785,6 +2040,11 @@ class _Item:
     bumpers_read: list[int]
     roles: bool
     """Check role words and places (notes, calls, episodes)."""
+    scope: list[tuple[float, float]] | None = None
+    """Time its absence and count claims cover (summaries, auto); None: what it cites."""
+    claims: bool = True
+    """Check absence and count claims (notes, summaries, auto). Episodes and calls judge what
+    their tiles show by design."""
 
 
 @dataclass(frozen=True)
@@ -1818,6 +2078,7 @@ class _Checker:
         self.charged_lines: list[DrivingLine] = []
         self.cleared_lines: list[tuple[DrivingLine, str]] = []
         self.pinned: list[tuple[float, float]] = []
+        self.gaps = [f for f in ctx.facts.facts if isinstance(f, GapFact)]
 
     def bad(self, msg: str) -> None:
         self.problems.append(msg)
@@ -1983,6 +2244,7 @@ class _Checker:
                 "cite the tile that shows it or remove it"
             )
         self.readings(item, bare, has_frame)
+        self.unseen(item, text)
         if item.roles:
             self.roles(item, bare)
             self.places(item, bare)
@@ -2021,6 +2283,88 @@ class _Checker:
                     + ", ".join(f"{i} was called {why}" for i, why in cleared)
                 )
                 return
+
+    def unseen(self, item: _Item, text: str) -> None:
+        """No claim beyond what was seen: absence and count claims over time with untracked
+        stretches say "seen" or "tracked" (and need half of it tracked); a quoted stop or hold
+        that was partly inferred quotes its inferred part too; "stall" needs the robot measured
+        stopped (`_stalled`); a stop at home in its own active time is not lost time."""
+        at = item.at
+        cited = [f for c in item.cites if (f := self.by_id.get(c)) is not None]
+        scope = item.scope if item.scope is not None else self.spans_of(item.cites)
+        gaps = [
+            (g.t_start, g.t_end)
+            for g in self.gaps
+            if any(_overlap(g.t_start, g.t_end, a, b) for a, b in scope)
+        ]
+        if gaps and item.claims:
+            total = sum(b - a for a, b in scope)
+            hidden = sum(_union_s(a, b, gaps) for a, b in scope)
+            share = 1.0 - hidden / total if total > 0 else 0.0
+            for sentence in SENTENCE.split(REF.sub("#", text)):
+                m = ABSENCE_WORD.search(sentence)
+                if (
+                    m is None
+                    or UNKNOWN_WORD.search(sentence)
+                    or (SEEN_WORD.search(sentence) and share >= CLAIM_MIN_SHARE)
+                ):
+                    continue
+                spans = ", ".join(f"{a:.1f}-{b:.1f} s" for a, b in gaps[:6])
+                self.bad(
+                    f"{at}: {m.group(0)!r} claims what happened over time that was partly "
+                    f"untracked ({spans}; {share:.0%} tracked)"
+                    + (
+                        ": say how much was tracked instead"
+                        if share < CLAIM_MIN_SHARE
+                        else ': say it was what was seen or tracked ("no trip out was seen")'
+                    )
+                )
+                break
+        refs = {m.group(1).strip() for m in REF.finditer(text)}
+        for f in cited:
+            if isinstance(f, StopFact) and f.data.unseen_s > 0:
+                quoted, need = {"duration_s"}, ("unseen_s", "seen_s")
+            elif isinstance(f, ContactFact) and f.data.still_unseen_s > 0:
+                quoted, need = {"still_s", "longest_still_s"}, ("still_unseen_s",)
+            else:
+                continue
+            if any(f"{f.id}.{q}" in refs for q in quoted) and not any(
+                f"{f.id}.{n}" in refs for n in need
+            ):
+                self.bad(
+                    f"{at}: it quotes {f.id}'s seconds but part of them was inferred across a "
+                    f"gap; quote {{{f.id}.{need[0]}}} too and say that part was inferred"
+                )
+        bare = REF.sub(" ", text)
+        turned = [f for f in cited if isinstance(f, CrossingTurnedBackFact)]
+        m = STALL_WORD.search(bare)
+        if (
+            m is not None
+            and not NEGATED.search(bare[: m.start()])
+            and turned
+            and not any(isinstance(f, StopFact) for f in cited)
+            and not any(
+                _stalled(f.data, self.ctx.facts.thresholds.get("STOP_MPS", 0.3)) for f in turned
+            )
+        ):
+            self.bad(
+                f"{at}: {m.group(0)!r}, but {', '.join(f.id for f in turned)} was never measured "
+                f"stopped on the band; say what fired, e.g. slowed to "
+                f"{{{turned[0].id}.slowest_mps}} m/s, or that it turned away"
+            )
+        home = [
+            f
+            for f in cited
+            if isinstance(f, StopFact)
+            and f.data.where.zone == "own"
+            and f.data.on_barrier is None
+            and f.data.own_active_s > 0
+        ]
+        if home and (m := LOST_WORD.search(bare)) is not None:
+            self.bad(
+                f"{at}: {m.group(0)!r} over {home[0].id}, a stop in its own zone in its own "
+                "active time: that is where it shoots, not lost time"
+            )
 
     def roles(self, item: _Item, bare: str) -> None:
         near = self.labelled(item.cites, near_only=True) | set(item.bumpers_read)
@@ -2304,8 +2648,8 @@ def _check_call(
         )
     if c.heaped_at is not None and c.call != "heaped":
         ck.bad(f"{at}: heaped_at is only for heaped")
-    if c.charged_s is not None and c.call != "home_earlier":
-        ck.bad(f"{at}: charged_s is only for home_earlier")
+    if c.charged_s is not None and c.call not in ("home_earlier", "not_home"):
+        ck.bad(f"{at}: charged_s is only for home_earlier and not_home")
     if isinstance(line, DrivingLine) and trip:
         seen = [
             t
@@ -2380,14 +2724,28 @@ def _check_call(
                 "(arrival first seen after a gap): charged_s = the seconds from its start to a "
                 f"cited tile that shows the target home, under {_fmt(cap)}"
             )
-    elif c.call == "not_home" and (
-        line.default != "cleared"
-        or not any(abs(t - a) <= NOT_HOME_S for t in ck.frames_in(c.cites, a, a, pad=NOT_HOME_S))
-    ):
-        ck.bad(
-            f"{at}: not_home overrules a cleared readiness line only, with a cited tile within "
-            f"{NOT_HOME_S:g} s of the activation that shows the target out of its own zone"
+    elif c.call in ("home", "not_home") and isinstance(line, ReadinessLine):
+        near = any(abs(t - a) <= NOT_HOME_S for t in ck.frames_in(c.cites, a, a, pad=NOT_HOME_S))
+        unknown = line.default == "not_judged"
+        read = c.corner_bumper == ctx.match.target_team
+        at_home = c.charged_s is None or any(
+            abs(t - a - c.charged_s) <= 0.6 for t in ck.frames_in(c.cites, a, a + c.charged_s)
         )
+        if c.call == "home" and not (unknown and near and read):
+            ck.bad(
+                f"{at}: home settles a not_judged readiness line only, with a cited tile within "
+                f"{NOT_HOME_S:g} s of the activation where you read the target's bumper number "
+                "(corner_bumper) in its own zone"
+            )
+        elif c.call == "not_home" and not (
+            near and at_home and (read if unknown else line.default == "cleared")
+        ):
+            ck.bad(
+                f"{at}: not_home overrules a cleared readiness line, or settles a not_judged one "
+                "with the target's bumper read (corner_bumper), with a cited tile within "
+                f"{NOT_HOME_S:g} s of the activation that shows the target out of its own zone; "
+                "charged_s, if given, is the seconds to a cited tile that shows it home"
+            )
 
 
 def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Checked:
@@ -2404,9 +2762,22 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
     resolved: dict[str, str] = {}
 
     def text(
-        at: str, value: str, cites: list[str], bumpers: list[int] | None = None, roles: bool = True
+        at: str,
+        value: str,
+        cites: list[str],
+        bumpers: list[int] | None = None,
+        roles: bool = True,
+        scope: list[tuple[float, float]] | None = None,
+        claims: bool = True,
     ) -> None:
-        resolved[at] = ck.resolve(_Item(at, value, cites, bumpers or [], roles))
+        resolved[at] = ck.resolve(_Item(at, value, cites, bumpers or [], roles, scope, claims))
+
+    m = ctx.match
+    scopes: dict[SkillName, list[tuple[float, float]]] = {
+        "driving": _own_active(m),
+        "shift_readiness": _own_active(m),
+        "handling_defense": [(m.teleop_start_t, m.teleop_end_t)],
+    }
 
     _check_episodes(ck, answer, sheets)
     calls: dict[str, LineCall] = {}
@@ -2446,22 +2817,24 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
             e.text,
             [*e.facts, *e.cites],
             [e.other_team] if e.identified_by == "bumper_number" and e.other_team else [],
+            claims=False,
         )
     for c in answer.line_calls:
         line = ck.lines.get(c.line)
         if line is not None:
             own = line.facts if isinstance(line, DrivingLine) else [line.fact]
-            text(f"line call {c.line}", c.text, [*c.cites, *own])
+            text(f"line call {c.line}", c.text, [*c.cites, *own], claims=False)
     names = [g.skill for g in answer.skills]
     if sorted(names) != sorted(SKILLS):
         ck.bad(f"skills: need exactly one each of {list(SKILLS)}, got {names}")
     for g in answer.skills:
         for c in g.cites:
             ck.span(c, f"skill {g.skill}")
-        text(f"skill {g.skill} summary", g.summary, g.cites, roles=False)
+        text(f"skill {g.skill} summary", g.summary, g.cites, roles=False, scope=scopes[g.skill])
     for c in answer.auto.cites:
         ck.span(c, "auto")
-    text("auto", answer.auto.text, answer.auto.cites, roles=False)
+    text("auto", answer.auto.text, answer.auto.cites, roles=False,
+         scope=[(m.auto_start_t, m.auto_end_t)])  # fmt: skip
     for k, n in enumerate(answer.notes):
         at = f"note {k + 1} (t={n.t})"
         found = [s for c in n.cites if (s := ck.span(c, at)) is not None]
@@ -2484,9 +2857,22 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
         ]
         if n.kind == "went_wrong" and cleared and not hit:
             ck.bad(f"{at}: kind went_wrong over {', '.join(cleared)}, which is cleared")
+        home = [
+            i
+            for i in n.cites
+            if isinstance(f := ck.by_id.get(i), StopFact)
+            and f.data.where.zone == "own"
+            and f.data.on_barrier is None
+            and f.data.own_active_s > 0
+        ]
+        if n.kind == "went_wrong" and home and not hit:
+            ck.bad(
+                f"{at}: kind went_wrong over {home[0]}, a stop in its own zone in its own active "
+                "time, which no line charges: that is where it shoots"
+            )
         text(at, n.text, n.cites, n.bumpers_read)
     problems = ck.problems
-    sc = scores(led, answer.episodes, ch, ctx.teleop_tracked_share)
+    sc = scores(led, answer.episodes, ch, ctx.coverage)
     return Checked(answer if not problems else None, problems, sc, ch, resolved)
 
 
@@ -2534,7 +2920,9 @@ def grade(run: RunDir) -> None:
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir()
     home = _home_view(Camera.load(run.calibration_json, "main"), match)
-    system, task = _prompts(match, ctx.facts, run.facts_json.read_text(), ctx.led, home)
+    system, task = _prompts(
+        match, ctx.facts, run.facts_json.read_text(), ctx.led, home, ctx.coverage
+    )
     (work / "system_prompt.md").write_text(system)
     (work / "task_prompt.md").write_text(task)
     start = time.perf_counter()
@@ -2572,6 +2960,10 @@ def grade(run: RunDir) -> None:
     assert ch is not None
 
     ins, outs, reads, writes, cost, turns, models = _usage(results)
+    cov = ctx.coverage.model_copy(
+        update={"activations_judged": len(ctx.led.readiness) - len(ch.unjudged)}
+    )
+    said = coverage_text(cov, ctx.led, checked.scores, ch.unjudged)
     notes: list[Note] = []
     for k, n in enumerate(answer.notes):
         period, clock = _clock(match, n.t)
@@ -2585,9 +2977,11 @@ def grade(run: RunDir) -> None:
             skill=g.skill,
             summary=resolved[f"skill {g.skill} summary"],
             cites=g.cites,
-            score=checked.scores[g.skill][0],
-            band=checked.scores[g.skill][1],
-            null_reason=checked.scores[g.skill][2],
+            score=checked.scores[g.skill].score,
+            band=checked.scores[g.skill].band,
+            null_reason=checked.scores[g.skill].null_reason,
+            coverage=said[g.skill],
+            low_coverage=checked.scores[g.skill].low_coverage,
         )
         for g in sorted(answer.skills, key=lambda g: SKILLS.index(g.skill))
     ]
@@ -2611,6 +3005,7 @@ def grade(run: RunDir) -> None:
     result = Grade(
         team=match.target_team,
         rubric_version=_rubric_version(_text("rubric.md")),
+        coverage=cov,
         skills=skills,
         driving_ledger=ctx.led.driving,
         readiness_ledger=ctx.led.readiness,
@@ -2676,6 +3071,11 @@ def render_md(g: Grade, facts: Facts) -> str:
     lines = [
         f"# Driving grade: team {g.team}",
         "",
+        "## What the scores rest on",
+        "",
+        *(f"- {s.skill}: {s.coverage}" for s in g.skills),
+        f"- auto: the target was tracked {g.coverage.auto_tracked_share:.0%} of auto.",
+        "",
         f"Rubric `{g.rubric_version}`. Scores are absolute, 1 to 10, computed from the charged "
         "seconds and episode costs. Auto is reported, not scored.",
         "",
@@ -2683,7 +3083,8 @@ def render_md(g: Grade, facts: Facts) -> str:
         "|---|---|---|",
     ]
     lines += [
-        f"| {s.skill} | {s.score if s.score is not None else 'null'} | "
+        f"| {s.skill} | {s.score if s.score is not None else 'null'}"
+        f"{' (low coverage: may be too high)' if s.low_coverage and s.score is not None else ''} | "
         f"{f'{s.band[0]}-{s.band[1]}' if s.band else 'null'} |"
         for s in g.skills
     ]

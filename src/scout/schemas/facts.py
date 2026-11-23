@@ -134,7 +134,9 @@ class PhaseFact(_Fact):
 # --- coverage gaps --------------------------------------------------------------
 
 GapCause = Literal["match_start", "match_end", "track_ended", "label_ended", "label_conflict"]
-GapInference = Literal["stayed_in_place", "in_own_zone_beyond_barrier", "entered_own_zone"]
+GapInference = Literal[
+    "stayed_in_place", "in_own_zone_beyond_barrier", "entered_own_zone", "own_zone_both_sides"
+]
 
 
 class NearInGap(_Model):
@@ -170,7 +172,9 @@ class GapData(_Model):
     driving away from it, so it very probably spent the gap in its own zone.
     `entered_own_zone`: at least OWN_INFER_MIN_S long, last seen on or at its own barrier
     driving toward its own wall and next seen in its own zone, so it very probably crossed
-    home just after it was last seen. None: unknown."""
+    home just after it was last seen. `own_zone_both_sides`: at most OWN_BOTH_MAX_S long, last
+    and next seen in its own zone, so it was probably home throughout (it may have left and
+    come back unseen). None: unknown."""
     others_near: list[NearInGap]
     """Other tracked robots near the target's last-seen or next-seen position during the gap
     (unlabelled tracks closer than SAME_ROBOT_M are left out: they are probably the target
@@ -285,6 +289,25 @@ class CrossingInGapFact(_Fact):
     data: CrossingInGapData
 
 
+ArrivalBy = Literal["seen", "crossing", "inference", "after_gap"]
+
+
+class Arrival(_Model):
+    """The earliest evidence that the target got somewhere (home, or the far side of a
+    barrier). `seen`: tracked arriving. When it was first tracked there after a gap: `crossing`
+    (a `crossing` fact last saw it on the band crossing that way) or `inference` (the gap's
+    `inference` puts it there): `t` is then an estimate, the rest of the way at the speed it
+    was going that way when last seen; else `after_gap`: `t` is the first sample after
+    the gap, so it got there at most then (an upper bound)."""
+
+    t: float
+    by: ArrivalBy
+    fact: str | None
+    """The crossing or gap fact behind a `crossing` or `inference` estimate."""
+    first_tracked_t: float
+    """First tracked time there (equal to `t` when `seen`)."""
+
+
 CostEnd = Literal[
     "reached_far_side", "tried_again", "hub_went_inactive", "track_lost", "match_end", "came_back"
 ]
@@ -323,20 +346,20 @@ class CrossingTurnedBackData(_Model):
     bridged gap counts as the straight line across it, so a stall hidden in one reads slow);
     None when no speed could be read. A drive past reads at driving pace; a stall or a
     reversal reads slow."""
-    far_side_t: float | None
-    """First tracked time in `far_side` (off the barrier) after turning back; None if never
-    before the match ended."""
-    far_side_after_gap: bool
-    """True when that first time came right after a gap: it got there at most then."""
+    arrived: Arrival | None
+    """When it got to `far_side` (off the barrier) after turning back; None if never seen
+    there before the match ended."""
     seconds_to_far_side: float | None
-    """From entering the band to `far_side_t` (an upper bound when `far_side_after_gap`)."""
+    """From entering the band to `arrived.t` (an upper bound when `arrived.by` is
+    `after_gap`)."""
     across_id: str | None
     """The `crossing` or `crossing_in_gap` fact of this barrier by which it got to
     `far_side` within the cost window; None if none."""
     cost_s: float
     """The fact's span: from entering the band to `cost_end`."""
     cost_end: CostEnd
-    """What ended the span. Toward home: the earliest of `reached_far_side`, `tried_again`
+    """What ended the span. Toward home: the earliest of `reached_far_side` (`arrived.t`),
+    `tried_again`
     (its next attempt on this barrier from `side` began), `hub_went_inactive` (the end of the
     first own-active stretch ending after it began), `track_lost` (the last sample before an
     untracked stretch longer than BRIDGE_MAX_S: how long it really took is unknown, at least
@@ -423,16 +446,21 @@ class TripData(_Model):
     left: Seen
     """Last tracked position in its own zone before leaving."""
     left_unseen_s: float
-    """Untracked time between `left` and the first position outside (0: seen leaving)."""
+    """Untracked time between `left` and the first position outside. 0: seen leaving, and the
+    trip starts at `left`. Above 0: when it left is not known (a lost track or a lost label
+    looks the same), and the trip starts at the first position seen outside."""
     own_active_left_s: float
-    """Own-active time remaining when it left."""
+    """Own-active time remaining at the trip's start."""
     back: Seen | None
     """First tracked position back in its own zone, if before its own-active time ended."""
+    home: Arrival | None
+    """When it got home (see `Arrival`; earlier than `back` when a crossing or a gap's
+    inference shows it crossing home before it was tracked there). The trip ends here."""
     at_active_end: Seen | None
     """When not back before its own-active time ended: the tracked position nearest that
     moment (within 1 s), else None."""
     duration_s: float
-    """From `left` to `back`, or to the end of its own-active time."""
+    """From the trip's start to `home.t`, or to the end of its own-active time."""
     unseen_s: float
     """Untracked time inside `duration_s`."""
     furthest: Seen
@@ -579,10 +607,11 @@ class HubOnData(_Model):
     `since_after_gap`)."""
     since_after_gap: bool
     reached_own_zone_after_s: float | None
-    """When not in its own zone: seconds until it was first tracked there (how late it
-    was); None if never in this phase."""
-    reached_after_gap: bool
-    """True when that arrival was first seen after a gap, so it arrived at most that late."""
+    """When not tracked in its own zone: seconds from the activation until it got there
+    (`reached.t`, 0 when a crossing or inference puts it home before the activation); None if
+    never in this phase."""
+    reached: Arrival | None
+    """How that arrival is known (`after_gap`: it arrived at most that late)."""
 
 
 class HubOnFact(_Fact):
@@ -665,7 +694,7 @@ FactKind = Literal[
 class Facts(StageFile):
     """All facts for one team, sorted by `t_start`, plus match-wide coverage."""
 
-    schema_version: Literal[5] = 5
+    schema_version: Literal[6] = 6
     team: int
     alliance: Alliance
     clock_rate: float

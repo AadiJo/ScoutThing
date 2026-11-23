@@ -11,6 +11,12 @@ Phases in video seconds, with the hubs active in each:
 The target's own hub is active in: {{own_active}}
 The corner camera panel showing its own end: {{home_view}}
 
+# What was seen
+
+Code computed these from the facts. Write nothing about untracked time as if it were seen.
+
+{{coverage}}
+
 # Driving ledger
 
 Each barrier line's DEFAULT stands unless you overrule it on a tile (see the rules); a charged
@@ -20,7 +26,9 @@ line costs its `lost_s`. Each `loaded_trip` line needs a hopper call from its HO
 
 # Readiness ledger
 
-Each DEFAULT stands unless you overrule it on a tile; a charged line costs `late_s`.
+Each DEFAULT stands unless you overrule it on a tile; a charged line costs `late_s`. A
+`not_judged` line costs nothing and is not scored unless a tile settles it (`home` or
+`not_home`).
 
 {{readiness_ledger}}
 

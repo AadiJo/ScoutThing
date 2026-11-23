@@ -46,6 +46,9 @@ one of the two uncalibrated corner camera panels (no ring, no boxes)."""
 Ruling = Literal["charged", "cleared"]
 """A ledger line's default: `charged` costs its `lost_s` (readiness: `late_s`), `cleared`
 costs nothing."""
+ReadinessRuling = Literal["charged", "cleared", "not_judged"]
+"""A readiness line's default; `not_judged`: where the robot was at the activation is unknown,
+so the line costs nothing and does not count toward the score unless a tile settles it."""
 
 
 class _Model(BaseModel):
@@ -111,9 +114,11 @@ class ReadinessLine(_Model):
     late_is_bound: bool
     """True when the arrival was first seen after a gap, so it was at most `late_s` late."""
     never_home: bool
-    default: Ruling
-    """`cleared` when tracked in its own zone, or untracked inside a gap whose `inference`
-    puts it there; otherwise `charged` (`late_s`)."""
+    default: ReadinessRuling
+    """`cleared` when tracked in its own zone, untracked inside a gap whose `inference` puts it
+    there, or put home by then by a crossing or inference; `not_judged` when untracked with its
+    last sighting in its own zone and nothing putting it home; otherwise `charged`
+    (`late_s`)."""
     why: str
     text: str
 
@@ -132,6 +137,45 @@ class DefenseItem(_Model):
     text: str
 
 
+class PhaseCoverage(_Model):
+    """One teleop phase with its own hub active: how much of it the target was tracked."""
+
+    phase: str
+    duration_s: float
+    tracked_share: float
+    unseen_s: float
+    """Untracked in gaps that nothing puts in its own zone: where it was is unknown."""
+    home_s: float
+    """Untracked in gaps whose `inference` puts it in its own zone."""
+
+
+class Untracked(_Model):
+    """A gap fact in its own active time."""
+
+    fact: str
+    t_start: float
+    t_end: float
+    inferred_home: bool
+
+
+class Coverage(_Model):
+    """What the scores rest on, computed by code from facts.json."""
+
+    own_active_s: float
+    """Teleop seconds with its own hub active: what driving is judged on."""
+    own_active_tracked_share: float
+    own_active_unseen_share: float
+    """Share of that time untracked in gaps that nothing puts in its own zone."""
+    phases: list[PhaseCoverage]
+    untracked: list[Untracked]
+    activations: int
+    activations_judged: int
+    match_tracked_share: float
+    auto_tracked_share: float
+    others_tracked_mean: float
+    """Other robots (of five) tracked per frame over the match, on average."""
+
+
 # --- the agent's answer -----------------------------------------------------------------
 
 Call = Literal[
@@ -139,6 +183,7 @@ Call = Literal[
     "partner",
     "misplaced",
     "home_earlier",
+    "home",
     "not_home",
     "heaped",
     "not_heaped",
@@ -151,10 +196,12 @@ score), `partner` (barrier lines: its own partner was
 in the way; needs a tile and a partner contact), `misplaced` (barrier lines charged by
 default: ringed tiles show the facts put the target in the wrong place, or the ring on another
 robot), `home_earlier` (a line whose time is an upper bound: a tile shows it home sooner;
-`charged_s` gives the seconds), `not_home` (readiness lines cleared by a gap inference: a tile
-at the activation shows it out of its zone). `loaded_trip` lines (always called): `heaped`
-(`heaped_at` says from when), `not_heaped` (empty or part full on its late tiles) or
-`cannot_see`."""
+`charged_s` gives the seconds), `home` (a `not_judged` readiness line: a tile at the activation
+shows it in its zone, its bumper read), `not_home` (a readiness line cleared by a gap inference,
+or `not_judged` with its bumper read: a tile at the activation shows it out of its zone;
+`charged_s`, optional, the seconds to a cited tile showing it home). `loaded_trip` lines
+(always called): `heaped` (`heaped_at` says from when), `not_heaped` (empty or part full on its
+late tiles) or `cannot_see`."""
 
 
 class LineCall(_Model):
@@ -166,8 +213,8 @@ class LineCall(_Model):
     charged_s: float | None = Field(
         default=None,
         ge=0.0,
-        description="home_earlier only: seconds from the line's start (readiness: the "
-        "activation) to the cited tile that shows the target home.",
+        description="home_earlier (and optionally not_home): seconds from the line's start "
+        "(readiness: the activation) to the cited tile that shows the target home.",
     )
     heaped_at: float | None = Field(
         default=None,
@@ -176,8 +223,8 @@ class LineCall(_Model):
     )
     corner_bumper: int | None = Field(
         default=None,
-        description="Required when the call cites a corner camera tile: the target's bumper "
-        "number as you read it there.",
+        description="Required when the call cites a corner camera tile, or calls home or "
+        "not_home on a not_judged line: the target's bumper number as you read it there.",
     )
     text: Text = Field(description="One sentence: what the tiles show.")
     cites: Cites
@@ -258,6 +305,11 @@ class ScoredSkill(SkillSummary):
     """The rubric's two-score band around `score`; None when `score` is None."""
     null_reason: str | None
     """Why `score` is None."""
+    coverage: str
+    """What the score rests on, in one sentence a person can read (computed by code)."""
+    low_coverage: bool
+    """The score stands on part of the match only: unseen time can only add charges, so the
+    true score may be lower."""
 
 
 class ScoredCall(_Model):
@@ -265,7 +317,7 @@ class ScoredCall(_Model):
     seconds code charged."""
 
     line: str
-    default: Ruling
+    default: ReadinessRuling
     call: Call | None
     """The grader's call; None when it kept the default."""
     charged_total_s: float
@@ -352,9 +404,10 @@ class Grade(StageFile):
     """The grade for the target team. Auto is reported but not scored. Text fields have
     their `{...}` references resolved."""
 
-    schema_version: Literal[5] = 5
+    schema_version: Literal[6] = 6
     team: int
     rubric_version: str
+    coverage: Coverage
     skills: list[ScoredSkill]
     driving_ledger: list[DrivingLine]
     readiness_ledger: list[ReadinessLine]
