@@ -12,10 +12,12 @@ import polars as pl
 from pydantic import BaseModel, ConfigDict, Field
 
 from scout.schemas.common import VIEW_NAMES, StageFile, TableSpec
+from scout.schemas.detections import COLOR
 
 LabelSource = Literal[
     "digits",
     "digits_extended",
+    "votes",
     "appearance",
     "appearance_continuity",
     "no_reads",
@@ -28,6 +30,12 @@ LabelSource = Literal[
   track, with no named read of another team in between.
 - `digits_extended`: the same label carried past those reads toward the track's ends, until
   the unnamed reads turn against the team or a time limit.
+- `votes`: a stretch the rules above left unlabelled, between the first and last of many
+  confident reads of one team on bumper boxes of that team's alliance colour, whose free read
+  need not spell the number (a bumper whose digits the free read garbles, such as 2468's blue
+  set read as "9409" or "268"), where that team holds nearly all confident reads of the
+  stretch. Off for the whole match for a team once one of its vote labels clashes with
+  another track's label of it (`TeamEvidence.votes_off`).
 - `appearance`: a stretch with no number-read label, named because its robot looks like that
   team's number-read stretches in this match (appearance embedder) by a clear margin over
   every team not labelled elsewhere at the time. See `AppearanceEvidence`.
@@ -77,7 +85,8 @@ class LabelSegment(BaseModel):
     `appearance*` segment, `appearance.cosine` clipped to [0, 1]."""
     source: LabelSource
     n_reads: int = Field(ge=0)
-    """Agreeing named reads behind the label (0 when `team` is null or not from reads)."""
+    """Agreeing named reads behind the label, or votes on a `votes` segment (0 when `team` is
+    null or not from reads)."""
     appearance: AppearanceEvidence | None = None
     """Set on `appearance*` segments only."""
 
@@ -97,12 +106,39 @@ class ClaimConflict(BaseModel):
     when both lost it."""
 
 
+class TeamEvidence(BaseModel):
+    """How much number evidence one roster team had, and why it got no label if it got none."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    team: int
+    named_reads: int = Field(ge=0)
+    """Named (non-abstaining) reads in any view, joined to a track or not."""
+    named_on_track: int = Field(ge=0)
+    """Named main-view reads joined to a track."""
+    vote_reads: int = Field(ge=0)
+    """Main-view reads joined to a track that count as votes for the team (see `votes`)."""
+    corner_votes: int = Field(ge=0)
+    """Corner-view reads that count as votes; corners are not tracked, so they label nothing,
+    but many of them with no label means the robot was readable only there."""
+    votes_off: bool
+    """True when a `votes` label of this team clashed with another track's label of it (so
+    another robot also reads as it), and none of its reads counted as votes in this match."""
+    labelled_s: float = Field(ge=0.0)
+    """Track time labelled with the team, from any source."""
+    reason: str | None
+    """Why the team has no label, when `labelled_s` is 0; None otherwise."""
+
+
 class Identity(StageFile):
-    """Label segments covering every track sample, and the same-team conflicts resolved."""
+    """Label segments covering every track sample, the same-team conflicts resolved, and the
+    number evidence per roster team."""
 
     schema_version: Literal[1] = 1
     segments: list[LabelSegment]
     conflicts: list[ClaimConflict]
+    teams: list[TeamEvidence] = Field(default_factory=list[TeamEvidence])
+    """One entry per roster team, in roster order (empty in files written before it existed)."""
 
 
 READER_NAME = "s1_digits"
@@ -119,6 +155,7 @@ READS = TableSpec(
         "y1": pl.Float32(),
         "x2": pl.Float32(),
         "y2": pl.Float32(),
+        "color": COLOR,
         "text": pl.String(),
         "text_p": pl.Float32(),
         "roster": pl.List(pl.Int32()),
@@ -137,6 +174,7 @@ against the match roster.
 
 - `track_id`: the track whose measured box covers at least 80% of this main-view box in
   the same frame (the best one if several); null for corner views and unmatched boxes.
+- `color`: the detector's bumper colour class for the box (`red`, `blue` or `unknown`).
 - `text`, `text_p`: the free (unconstrained) read and its sequence probability; `text` may
   be any digit string, or empty.
 - `roster`: the teams scored, in match.json roster order; `probs[k]` is the probability of

@@ -5,7 +5,7 @@ view, scored against the six roster teams, with the track each main-view box joi
 identity.json: which stretch of which track is which team, or null when unsure. Also writes
 `reads_check.jpg` (crops exactly as the reader sees them, sampled across views and
 confidence) and `identity_check.jpg` (one timeline row per track, coloured by label, hatched
-where the label is not from number reads, with a tick per named read).
+where the label is not from number reads, with a tick per named read and per vote read).
 
 Reading: one ffmpeg decode pass at the detector's SAMPLE_HZ. Each detector box is cut for the
 number reader and each measured track box for the appearance embedder on the CPU; full
@@ -14,8 +14,11 @@ batches go to the GPU in half precision. Only one decoded frame is held at a tim
 Labelling: named reads are sparse anchors on tracks (tracks are main view only, so corner
 reads never label). A few agreeing reads label a stretch of a track, which may carry on
 past them while the weaker reads do not contradict; named reads of two teams on one track
-mark a change of robot, and the stretch between them stays null. No team is left on two
-tracks at once. Then each remaining null stretch (not `conflict`) may be named from its
+mark a change of robot, and the stretch between them stays null. A null stretch (not
+`conflict`) where one team holds nearly all of many confident reads on its own alliance's
+bumper colour is labelled `votes` (`_label_votes`): some bumper sets defeat the free read
+but not the roster-constrained one. No team is left on two tracks at once. Then each
+remaining null stretch (not `conflict`) may be named from its
 appearance against this match's number-read boxes, among the teams not labelled elsewhere
 at the time, with continuity loosening the bar (`_label_unread`). Those labels never
 replace a number-read label and are marked `appearance*` in `source`.
@@ -50,6 +53,7 @@ from scout.schemas.identity import (
     Identity,
     LabelSegment,
     LabelSource,
+    TeamEvidence,
     write_reads,
 )
 from scout.schemas.match import MatchInfo
@@ -105,6 +109,35 @@ p >= 0.05 93-95% of the time and another robot's team 9-15% of the time, so thre
 in a row mark a likely change of robot the tracker missed. On Qualification 16 and Playoff 12
 this stop removed one of two same-team clashes; extending 3- and 4-read labels caused the
 other clash and the one wrong hand-marked label (a pin where one box covers two robots)."""
+
+VOTE_P = ACCEPT_P
+VOTE_SAME_COLOUR = True
+"""A vote for a team is a non-static read whose best roster team is that team at p >= VOTE_P,
+whatever the free read says, on a bumper box whose detector colour is the team's alliance.
+2468's blue bumpers (thin "4") free-read as "9409", "2659", "268" while the constrained read
+gives 2468 at p ~ 1.0: in Qualification 26 that left 17 named main-view reads against 674
+such reads, almost all on 2468's own tracks. On stretches pinned by `digits` labels in 13
+runs, 0.6% of p >= 0.99 reads with a disagreeing free read named another team; 0.29% when the
+box colour matched the team's alliance and 4.0% when it did not (Playoff 4: red 8515's turned
+bumper read as blue 2468 at p ~ 1 for 4 s)."""
+VOTE_MIN_READS = 8
+VOTE_MIN_SPAN_S = 1.0
+VOTE_SHARE = 0.85
+"""A `votes` label needs VOTE_MIN_READS votes for one team on one null stretch, first to last
+at least VOTE_MIN_SPAN_S apart, and those votes must be at least VOTE_SHARE of all non-static
+p >= VOTE_P reads on the stretch (any team, any colour). Wrong reads come in short bursts on
+one pose (the 8515 burst above was 21 reads in 3.8 s), so the share over the whole stretch,
+not the count, is the guard; the count keeps 1-2 s fragments out.
+
+Votes can still be another robot read as the team, and no feature of the reads (free-read
+spelling, roster mass) tells those apart from 2468's real but garbled blue reads: in Playoff 4
+red 9999, whose number never reads in the main view, read as red 8515 at p = 0.95-1.0 for
+12 s on two tracks; in Qualification 10 red 2468's bumper read as "8528" -> 8515 for 4 s.
+Each of those clashed with the real 8515's label on another track. So when any `votes` label
+of a team clashes with another track's label of it (`_resolve_claims`), the team's reads are
+not votes for the rest of the match (`_label`). On frames, all 8 of 8515's other vote
+stretches in Playoff 4 and all 12 of 2468's were right. An impostor stretch while the real
+team is not itself labelled would not clash, and is the remaining risk."""
 
 EMBED_BATCH = 256
 """Appearance crops per GPU batch (224x224 each)."""
@@ -405,6 +438,7 @@ def _read_boxes(
                 "y1",
                 "x2",
                 "y2",
+                "color",
             ),
             pl.DataFrame(
                 {
@@ -493,11 +527,13 @@ def _label_track(
     LABEL_MIN_SPAN_S labels its own stretch (`digits`) and, with EXTEND_MIN_READS reads and on
     a side with no named read of another team, extends with `_reach` (`digits_extended`).
     Between named reads of two teams nothing is labelled (`conflict`): the track changed
-    robot somewhere in there.
+    robot somewhere in there. What is still null may then be labelled by `_label_votes`
+    (reads need `_vote_columns`).
     """
     marks = [_Mark(None, "below_rule" if len(reads) else "no_reads")] * len(sample_t)
     named = reads.filter(~pl.col("abstain"))
     if named.is_empty():
+        _label_votes(sample_t, marks, reads, roster)
         return marks
     read_t = reads["t"].to_numpy()
     probs = np.asarray(reads["probs"].to_list(), np.float64)
@@ -526,16 +562,76 @@ def _label_track(
         if extend and i == len(runs) - 1:
             paint(ts[-1], _reach(ts[-1], +1, read_t, p), ext)
         paint(ts[0], ts[-1], _Mark(team, "digits", len(ts)))
+    _label_votes(sample_t, marks, reads, roster)
     return marks
 
 
-def _resolve_claims(labels: pl.DataFrame) -> tuple[pl.DataFrame, list[ClaimConflict]]:
+def _vote_columns(reads: pl.DataFrame, match: MatchInfo, off: set[int]) -> pl.DataFrame:
+    """Add `confident` (non-static, best team at p >= VOTE_P) and `vote` (also on a bumper of
+    that team's alliance colour, if VOTE_SAME_COLOUR, and the team not in `off`) to reads."""
+    alliance = {s.team: s.alliance for s in match.roster}
+    confident = ~pl.col("static") & (pl.col("conf") >= VOTE_P)
+    colour_ok = pl.col("color").cast(pl.String) == pl.col("best").replace_strict(
+        alliance, return_dtype=pl.String
+    )
+    vote = confident & ~pl.col("best").is_in(list(off))
+    return reads.with_columns(
+        confident=confident, vote=vote & colour_ok if VOTE_SAME_COLOUR else vote
+    )
+
+
+def _label_votes(
+    sample_t: NDArray[np.float64], marks: list[_Mark], reads: pl.DataFrame, roster: list[int]
+) -> None:
+    """Paint `votes` marks in place on each maximal null, non-`conflict` stretch of one track
+    whose votes (reads sorted by t, with `_vote_columns`) meet VOTE_MIN_READS, VOTE_MIN_SPAN_S
+    and VOTE_SHARE for one team: from its first vote to its last, extended by `_reach` as a
+    `digits` label is, but never past the stretch."""
+    if reads.is_empty():
+        return
+    probs = np.asarray(reads["probs"].to_list(), np.float64)
+    read_t = reads["t"].to_numpy()
+    best = reads["best"].to_numpy()
+    vote = reads["vote"].to_numpy()
+    confident = reads["confident"].to_numpy()
+    free = [m.team is None and m.source != "conflict" for m in marks]
+    i = 0
+    while i < len(marks):
+        if not free[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(marks) and free[j + 1]:
+            j += 1
+        inside = (read_t >= sample_t[i]) & (read_t <= sample_t[j])
+        n_confident = int(np.sum(inside & confident))
+        for team in np.unique(best[inside & vote]).tolist():
+            ts = read_t[inside & vote & (best == team)]
+            if (
+                len(ts) >= VOTE_MIN_READS
+                and ts[-1] - ts[0] >= VOTE_MIN_SPAN_S - 1e-6
+                and len(ts) >= VOTE_SHARE * n_confident
+            ):
+                p = probs[:, roster.index(int(team))]
+                lo, hi = _reach(ts[0], -1, read_t, p), _reach(ts[-1], +1, read_t, p)
+                for k in range(i, j + 1):
+                    if lo <= sample_t[k] <= hi:
+                        marks[k] = _Mark(int(team), "votes", len(ts))
+                break
+        i = j + 1
+
+
+def _resolve_claims(
+    labels: pl.DataFrame,
+) -> tuple[pl.DataFrame, list[ClaimConflict], set[int]]:
     """Make sure no team is on two tracks at once. Labels are compared as time intervals
     (one per run of equal labels on a track). Where two tracks' intervals for one team
-    overlap, a `digits` interval beats a `digits_extended` one, which loses all of itself
-    (an extension that ran into another track's claim is not trusted past that point);
-    two `digits` intervals both lose the overlap, and two extended ones both lose all.
-    Losers become `conflict`. Returns the labels and the conflicts found."""
+    overlap, a `digits` interval beats a `digits_extended` or `votes` one, which loses all of
+    itself (an extension that ran into another track's claim is not trusted past that point,
+    and a vote label that clashes is not trusted at all); two `digits` intervals both lose
+    the overlap, and two of the weaker kinds both lose all.
+    Losers become `conflict`. Returns the labels, the conflicts found, and the teams of which
+    a `votes` interval took part in a conflict."""
     runs = labels.with_row_index("i").with_columns(
         run=pl.struct("team", "source").rle_id().over("track_id")
     )
@@ -553,18 +649,21 @@ def _resolve_claims(labels: pl.DataFrame) -> tuple[pl.DataFrame, list[ClaimConfl
     )
     lost: set[int] = set()
     conflicts: list[ClaimConflict] = []
+    vote_clash: set[int] = set()
     for a, b in itertools.combinations(spans, 2):
         if a["team"] != b["team"] or a["track_id"] == b["track_id"]:
             continue
         lo, hi = max(a["s"], b["s"]), min(a["e"], b["e"])
         if lo > hi:
             continue
+        if "votes" in (a["source"], b["source"]):
+            vote_clash.add(int(a["team"]))
         backed = [x for x in (a, b) if x["source"] == "digits"]
         kept = backed[0] if len(backed) == 1 else None
         for x in (a, b):
             if x is kept:
                 continue
-            if x["source"] == "digits_extended":
+            if x["source"] in ("digits_extended", "votes"):
                 lost.update(x["rows"])
             else:
                 lost.update(
@@ -589,7 +688,7 @@ def _resolve_claims(labels: pl.DataFrame) -> tuple[pl.DataFrame, list[ClaimConfl
         team=pl.when(is_lost).then(None).otherwise(pl.col("team")),
     )
     conflicts.sort(key=lambda c: (c.t_start, c.team))
-    return out, conflicts
+    return out, conflicts, vote_clash
 
 
 @dataclass(frozen=True)
@@ -734,11 +833,11 @@ def _label_unread(
     return out, evidence
 
 
-def _label(
-    reads: pl.DataFrame, tracks: pl.DataFrame, roster: list[int], embeds: _Embeds
-) -> Identity:
-    """identity.json from reads (with track_id) and tracks."""
-    joined = reads.filter(pl.col("track_id").is_not_null() & ~pl.col("static")).sort("t")
+def _number_labels(
+    joined: pl.DataFrame, tracks: pl.DataFrame, roster: list[int]
+) -> tuple[pl.DataFrame, list[ClaimConflict], set[int]]:
+    """Per track sample labels from joined non-static reads (`digits*` and `votes`), after
+    `_resolve_claims`, with its conflicts and vote-clash teams."""
     by_track = {int(k): g for (k,), g in joined.group_by("track_id")}
     empty = joined.clear()
     cols: dict[str, list[int | float | str | None]] = {
@@ -763,7 +862,27 @@ def _label(
             "n_reads": pl.Int64,
         },
     )
-    labels, conflicts = _resolve_claims(labels)
+    return _resolve_claims(labels)
+
+
+def _label(
+    reads: pl.DataFrame, tracks: pl.DataFrame, match: MatchInfo, embeds: _Embeds
+) -> Identity:
+    """identity.json from reads (with track_id) and tracks. Labels from numbers with votes
+    for every team, then again without the votes of each team whose vote label clashed, until
+    none clash (see VOTE_SHARE)."""
+    roster = [s.team for s in match.roster]
+    off: set[int] = set()
+    while True:
+        voted = _vote_columns(reads, match, off)
+        joined = voted.filter(pl.col("track_id").is_not_null() & ~pl.col("static")).sort("t")
+        labels, conflicts, clashed = _number_labels(joined, tracks, roster)
+        if not clashed - off:
+            break
+        off |= clashed
+    reads = voted
+    by_track = {int(k): g for (k,), g in joined.group_by("track_id")}
+    empty = joined.clear()
     labels, evidence = _label_unread(labels, tracks, embeds, roster)
     segments: list[LabelSegment] = []
     runs = labels.sort("track_id", "frame").with_columns(
@@ -795,7 +914,59 @@ def _label(
                 appearance=ev,
             )
         )
-    return Identity(segments=segments, conflicts=conflicts)
+    return Identity(
+        segments=segments,
+        conflicts=conflicts,
+        teams=_team_evidence(reads, segments, match, off),
+    )
+
+
+def _team_evidence(
+    reads: pl.DataFrame, segments: list[LabelSegment], match: MatchInfo, off: set[int]
+) -> list[TeamEvidence]:
+    """Per roster team: its read counts (votes counted even for teams in `off`, whose votes
+    were turned off), labelled time and, when unlabelled, why."""
+    reads = _vote_columns(reads, match, set())
+    out: list[TeamEvidence] = []
+    on_track = pl.col("track_id").is_not_null()
+    corner = pl.col("view") != "main"
+    for team in (s.team for s in match.roster):
+        mine = reads.filter(pl.col("best") == team)
+        named = mine.filter(~pl.col("abstain"))
+        n_track = named.filter(on_track).height
+        votes = mine.filter(pl.col("vote") & on_track).height
+        corner_votes = mine.filter(pl.col("vote") & corner).height
+        labelled = sum(s.t_end - s.t_start + 1 / SAMPLE_HZ for s in segments if s.team == team)
+        reason = None
+        if labelled == 0:
+            if n_track == 0 and votes == 0 and named.height:
+                reason = f"its {named.height} named reads are all in the untracked corner views"
+            elif n_track == 0 and team in off:
+                reason = (
+                    f"no named read on a track, and its {votes} vote reads were not used: a vote"
+                    " label clashed with another track's, so another robot also reads as it"
+                )
+            elif n_track == 0 and votes == 0:
+                reason = "no confident read of its number on any tracked bumper box"
+            else:
+                reason = (
+                    f"{n_track} named and {votes} vote reads on tracks, but on no stretch enough"
+                    " agreeing ones without other teams' reads, or its labels clashed with"
+                    " another track's"
+                )
+        out.append(
+            TeamEvidence(
+                team=team,
+                named_reads=named.height,
+                named_on_track=n_track,
+                vote_reads=votes,
+                corner_votes=corner_votes,
+                votes_off=team in off,
+                labelled_s=labelled,
+                reason=reason,
+            )
+        )
+    return out
 
 
 def _draw_identity(
@@ -803,7 +974,8 @@ def _draw_identity(
 ) -> None:
     """Write identity_check.jpg: one row per track over match time, coloured by label (the
     target team orange, other teams in their own colours, null grey, `conflict` dark red),
-    a short white tick at the top of the row at each named read joined to the track, and a
+    a short white tick at the top of the row at each named read joined to the track, a short
+    black tick at the bottom at each other vote read (`_vote_columns`), and a
     strip on top that is orange wherever some track carries the target team. Labels from
     number reads are solid; `appearance*` labels are hatched with dark stripes (sparse for
     `appearance`, dense for `appearance_continuity`), in the strip too."""
@@ -837,6 +1009,11 @@ def _draw_identity(
     cv2.putText(img, f"{match.target_team} labelled", (4, strip - 8), 0, 0.4, (255, 255, 255), 1)
     named = reads.filter(~pl.col("abstain") & pl.col("track_id").is_not_null())
     ticks = {int(k): g["t"].to_list() for (k,), g in named.group_by("track_id")}
+    off = {e.team for e in ident.teams if e.votes_off}
+    voted = _vote_columns(reads, match, off).filter(
+        pl.col("vote") & pl.col("abstain") & pl.col("track_id").is_not_null()
+    )
+    vote_ticks = {int(k): g["t"].to_list() for (k,), g in voted.group_by("track_id")}
     for row, tid in enumerate(order):
         y0 = top + row * rh
         for s in by_track[tid]:
@@ -846,6 +1023,8 @@ def _draw_identity(
             fill(x(s.t_start), y0, x(s.t_end) + 1, y0 + rh - 2, c, s.source)
         for t in ticks.get(tid, []):
             cv2.line(img, (x(t), y0), (x(t), y0 + max(1, rh // 3)), (255, 255, 255), 1)
+        for t in vote_ticks.get(tid, []):
+            cv2.line(img, (x(t), y0 + rh - 2 - max(1, rh // 4)), (x(t), y0 + rh - 3), (0, 0, 0), 1)
         if rh >= 8 or row % 5 == 0:
             cv2.putText(img, str(tid), (4, y0 + rh - 2), 0, 0.3, (200, 200, 200), 1)
     bottom = top + rh * len(order)
@@ -882,8 +1061,7 @@ def identify(run: RunDir) -> None:
     mark = timer.add("join + write reads", mark)
     _draw_check(run.path / "reads_check.jpg", check_rows, reads)
     mark = timer.add("reads sheet", mark)
-    roster = [s.team for s in match.roster]
-    ident = _label(reads, tracks, roster, embeds)
+    ident = _label(reads, tracks, match, embeds)
     ident.save(run.identity_json)
     mark = timer.add("label", mark)
     _draw_identity(run.path / "identity_check.jpg", ident, reads, match, info.duration_s)
@@ -903,6 +1081,13 @@ def identify(run: RunDir) -> None:
         f" {len(target)} for {match.target_team}, {len(ident.conflicts)} same-team conflicts"
     )
     print("  labelled track time: " + ", ".join(f"{k} {v:.0f}s" for k, v in by_source.items()))
+    for e in ident.teams:
+        print(
+            f"  {e.team}: {e.named_on_track} named + {e.vote_reads} vote reads on tracks,"
+            f" {e.corner_votes} corner votes, labelled {e.labelled_s:.0f}s"
+            + (", votes off after a clash" if e.votes_off else "")
+            + (f" (unlabelled: {e.reason})" if e.reason else "")
+        )
     print("  " + "  ".join(f"{k} {v:.1f}s" for k, v in timer.s.items()) + f"  total {total:.1f}s")
     gpu = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
