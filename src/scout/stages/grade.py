@@ -27,7 +27,8 @@ Steps:
    moments with the match clock, lists the facts overlapping them, logs every sheet to
    `grade_work/frames.jsonl` and refuses past IMAGE_CAP sheets. The session's init message is
    checked so a leak fails the stage.
-4. Check the structured answer (`check_answer`): citations, a hopper call per trip, each
+4. Check the structured answer (`check_answer`): citations, a hopper reading per trip tile
+   (code turns them into the trip's ruling, `_hopper_ruling`), each
    overrule of a default backed by the checkable contradiction it names, episodes covering
    every defense item, numbers only as references to fact fields, team names only when
    labelled or read, no purpose words, places that agree with where the target was, and no
@@ -105,6 +106,7 @@ from scout.schemas.grade import (
     FrameSheet,
     Grade,
     GradeAnswer,
+    Hopper,
     LineCall,
     Note,
     OpponentSplit,
@@ -117,6 +119,7 @@ from scout.schemas.grade import (
     ScoredEpisode,
     ScoredSkill,
     SkillName,
+    TileRead,
     TileRecord,
     Untracked,
     View,
@@ -218,8 +221,20 @@ right about four times in five, so a remainder of a few seconds rests on one dou
 Subtracted, not a cut-off, so moving `heaped_at` one tile moves the charge by that step only."""
 LOOK_TILES = 4
 LOOK_FIRST_S = 1.0
-"""Hopper tiles of a trip: up to LOOK_TILES, from LOOK_FIRST_S after it left to TRIP_ALLOW_S
-before it ended (heaped any later costs nothing)."""
+LOOK_STEP_S = 1.0
+"""Hopper tiles of a trip: up to LOOK_TILES, at least LOOK_STEP_S apart, from LOOK_FIRST_S
+after it left to the last moment from which a heaped hopper could still cost MIN_LOST_S
+(`_look_times`). A trip with no such moment is no ledger line: a later heap costs nothing, so
+reading it could only flip a ruling that charges 0 s. On the sixteen development matches that
+drops 15 of 28 trips, 6 of the 8 whose rulings flipped between two saved gradings (5 of them
+charged 0 s either way, one 0.24 s from a heap on its first tile)."""
+HEAPED_TILES = 2
+"""A trip is heaped only when at least this many readable tiles in a row, through its last
+readable one, are heaped: a heap on one tile rests on one reading. On the development matches a
+lone heap on a far-side last tile (fuel piled on the floor behind the robot at the hopper's
+height) charged 1.1 s in two gradings of a trip the film study logs as part full; the one heaped
+trip the film study calls wasted read heaped on three tiles in both. A trip with fewer hopper
+tiles than this is no ledger line."""
 PIN_ALLOW_S = 3.0
 """Still seconds beside an opponent an episode may hold before they cost (pinning longer
 than 3 s is a foul in this game)."""
@@ -268,8 +283,8 @@ MARK: dict[str, tuple[int, int, int]] = {
 }
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 LEGEND = (
-    "Yellow ring: target. Boxes: robots the tool tracked (team PARTNER/OPP, or 'unlabelled'). "
-    "A robot with NO box was not tracked."
+    "Yellow arc under it: target. Boxes: robots the tool tracked (team PARTNER/OPP, or "
+    "'unlabelled'). A robot with NO box was not tracked."
 )
 CORNER_LEGEND = (
     "CORNER camera, uncalibrated: no ring and no boxes. Find the target by its bumper number."
@@ -500,11 +515,20 @@ def _end_text(end: str) -> str:
     }.get(end, end)
 
 
-def _look_times(a: float, b: float) -> list[float]:
-    """Hopper tile times for a trip from a to b, evenly spaced, at most 5 s apart."""
-    first, last = a + LOOK_FIRST_S, max(a + LOOK_FIRST_S, b - TRIP_ALLOW_S)
-    n = max(1, min(LOOK_TILES, 1 + math.floor((last - first) / 1.5)))
-    step = min(5.0, round((last - first) / (n - 1), 1)) if n > 1 else 0.0
+def _look_times(a: float, b: float, target: _Target, alliance: Alliance) -> list[float]:
+    """Hopper tile times for a trip from a to b, evenly spaced (see LOOK_STEP_S); empty when a
+    heap seen at any moment of it could not cost MIN_LOST_S (`charges`, before excused time),
+    or fewer than HEAPED_TILES tiles fit."""
+    first = round(a + LOOK_FIRST_S, 1)
+    last = round(b - TRIP_ALLOW_S - TRIP_GRACE_S - MIN_LOST_S, 1)
+    while last >= first and b - last - _home_allow(target, alliance, last) < (
+        TRIP_GRACE_S + MIN_LOST_S
+    ):
+        last = round(last - 0.1, 1)
+    n = min(LOOK_TILES, 1 + math.floor((last - first) / LOOK_STEP_S + 1e-9))
+    if last < first or n < HEAPED_TILES:
+        return []
+    step = round((last - first) / (n - 1), 1)
     return [round(first + k * step, 1) for k in range(n)]
 
 
@@ -854,10 +878,10 @@ def ledgers(facts: Facts, match: MatchInfo, target: _Target, others: _Others) ->
         raw.append(_Raw(f.t_start, f.t_end, "slow_crossing", [f.id], lost, 0.0, text))
     raw = [r for r in raw if r.lost >= MIN_LOST_S]
     for f in fs:
-        if (
-            not isinstance(f, TripFact)
-            or f.data.duration_s < LOOK_FIRST_S + TRIP_ALLOW_S + MIN_LOST_S
-        ):
+        if not isinstance(f, TripFact):
+            continue
+        look = tuple(_look_times(f.t_start, f.t_end, target, match.target_alliance))
+        if not look:
             continue
         d = f.data
         past = d.past_centre_line_m
@@ -868,7 +892,6 @@ def ledgers(facts: Facts, match: MatchInfo, target: _Target, others: _Others) ->
             + ("then back home" if d.back is not None else "not back before its active time ended")
             + (f"; stops out: {', '.join(d.stop_ids)}" if d.stop_ids else "")
         )
-        look = tuple(_look_times(f.t_start, f.t_end))
         raw.append(
             _Raw(f.t_start, f.t_end, "loaded_trip", [f.id], d.duration_s, d.unseen_s, text,
                  "cleared", "no hopper reading yet", look=look)
@@ -1013,8 +1036,10 @@ def _ledger_text(
             *([corner] if d.unseen_s >= 1.0 or d.bound else []),
         ]
         rule = (
-            f"HOPPER TILES: frames t={d.look_at[0]:.1f} count {len(d.look_at)} step_s "
-            f"{(d.look_at[1] - d.look_at[0]) if len(d.look_at) > 1 else 1.0:.1f} zoom 2"
+            f"HOPPER TILES {', '.join(f'{t:.1f}' for t in d.look_at)} (frames t="
+            f"{d.look_at[0]:.1f} count {len(d.look_at)} step_s "
+            f"{(d.look_at[1] - d.look_at[0]) if len(d.look_at) > 1 else 1.0:.1f} zoom 2): read "
+            "each one"
             if d.look_at
             else f"DEFAULT {d.default} ({d.why})"
         )
@@ -1172,6 +1197,7 @@ def _home_allow(target: _Target, alliance: Alliance, t: float) -> float:
 def charges(
     led: Ledgers,
     calls: dict[str, LineCall],
+    heaped: dict[str, float],
     episodes: Sequence[DefenseEpisode],
     by_id: dict[str, Fact],
     target: _Target,
@@ -1181,9 +1207,9 @@ def charges(
     grader overruled it: `home_earlier` charges its `charged_s`, `partner` and `misplaced`
     nothing. Of that, the line's `split` seconds (less any time `home_earlier` took off) go to
     the episode holding the split's contact instead, when the split applies
-    (`_split_applies`). Heaped trips: from
-    `heaped_at` to the end of the trip, less barrier lines and opponent episodes inside it, the
-    time to get home from there (`_home_allow`) and TRIP_GRACE_S. Readiness: `late_s` when
+    (`_split_applies`). Heaped trips (`heaped`: trip line to its `heaped_at`, `_hopper_ruling`):
+    from `heaped_at` to the end of the trip, less barrier lines and opponent episodes inside it,
+    the time to get home from there (`_home_allow`) and TRIP_GRACE_S. Readiness: `late_s` when
     charged by default or called `not_home`, `charged_s` when `home_earlier` (or `not_home`
     with it), else 0; a `not_judged` line no call settled is not scored."""
     opp = [
@@ -1223,13 +1249,12 @@ def charges(
         if out[d.id] > 0 or secs > 0 or call == "partner":
             held.append((d.t_start, d.t_end))
     for d in led.driving:
-        c = calls.get(d.id)
         if d.kind != "loaded_trip":
             continue
-        if c is None or c.call != "heaped" or c.heaped_at is None:
+        if (h := heaped.get(d.id)) is None:
             out[d.id] = 0.0
             continue
-        a = max(d.t_start, c.heaped_at)
+        a = max(d.t_start, h)
         excused = _union_s(a, d.t_end, [*held, *(s for _, s in opp)])
         allow = _home_allow(target, alliance, a) + TRIP_GRACE_S
         out[d.id] = max(0.0, d.t_end - a - excused - allow)
@@ -1588,7 +1613,8 @@ def _tile(
         ax_ = max(14.0, (bx2 - bx1) / 2 * scale + 10)
         ay_ = max(14.0, (by2 - by1) / 2 * scale + 10)
         color = RING if spot.measured else RING_EST
-        cv2.ellipse(tile, (cx, cy), (round(ax_), round(ay_)), 0, 0, 360, color, 3)
+        # lower half only: a whole ring crossed the hopper above the bumper in fuel's colour
+        cv2.ellipse(tile, (cx, cy), (round(ax_), round(ay_)), 0, 0, 180, color, 3)
     return tile, drawn
 
 
@@ -1728,7 +1754,8 @@ class _FrameServer:
             "target only where you read its bumper number, and give that number as "
             "corner_bumper in any call that cites these tiles."
             if corner
-            else "Yellow ring: the target's measured box; orange ring: its position estimated "
+            else "Yellow arc under a robot: the target's measured box; orange arc: its position "
+            "estimated "
             "between detections. Boxes are the other robots the tool tracked: team and "
             "PARTNER/OPP from the roster, or 'unlabelled' when the tool does not know the team. "
             "A robot with no box was NOT tracked: no fact knows about it."
@@ -2131,7 +2158,6 @@ ATTACK = frozenset({"opponent_on_target", "target_on_opponent"})
 BARRIER_CALLS: frozenset[Call] = frozenset(
     {"opponent", "no_opponent", "partner", "misplaced", "home_earlier"}
 )
-TRIP_CALLS: frozenset[Call] = frozenset({"heaped", "not_heaped", "cannot_see"})
 READINESS_CALLS: frozenset[Call] = frozenset({"opponent", "home_earlier", "home", "not_home"})
 
 
@@ -2806,26 +2832,79 @@ def _check_split_call(ck: _Checker, c: LineCall, line: DrivingLine, at: str) -> 
         )
 
 
-def _check_call(
-    ck: _Checker,
-    c: LineCall,
-    line: DrivingLine | ReadinessLine,
-    sheets: list[FrameSheet],
-) -> None:
-    """A trip call needs its hopper tiles; an overrule needs the contradiction its call names,
-    on tiles code can check, and no reading of what the robot meant."""
+def _hopper_ruling(tiles: Sequence[TileRead]) -> tuple[Hopper, float | None]:
+    """A trip's ruling from its tile readings: `heaped` from the earliest readable tile from
+    which every later readable tile is heaped (a hopper rarely empties out of its zone, and an
+    unreadable tile in between says nothing), `not_heaped` when the last readable tile is not,
+    `cannot_see` when none is readable. A heap on fewer than HEAPED_TILES readable tiles is
+    `not_heaped`."""
+    seen = sorted((r for r in tiles if r.hopper != "cannot_see"), key=lambda r: r.t)
+    if not seen:
+        return "cannot_see", None
+    run: list[float] = []
+    for r in reversed(seen):
+        if r.hopper != "heaped":
+            break
+        run.append(r.t)
+    return ("heaped", run[-1]) if len(run) >= HEAPED_TILES else ("not_heaped", None)
+
+
+def _check_hoppers(ck: _Checker, answer: GradeAnswer, sheets: list[FrameSheet]) -> None:
+    """One reading per trip line, one per HOPPER TILE of it and none elsewhere; `heaped` and
+    `not_heaped` only on a served tile with the target ringed (or a corner tile with its bumper
+    read); `cannot_see` on a served tile, unless the sheet budget ran out."""
+    trips = {d.id: d for d in ck.ctx.led.driving if d.kind == "loaded_trip"}
+    team = ck.ctx.match.target_team
+    done: set[str] = set()
+    for r in answer.hoppers:
+        at = f"hoppers {r.line}"
+        line = trips.get(r.line)
+        if line is None or r.line in done:
+            ck.bad(f"{at}: not a loaded_trip line, or read twice: one reading per trip line")
+            continue
+        done.add(r.line)
+        want = ", ".join(f"{t:.1f}" for t in sorted(line.look_at))
+        got = ", ".join(f"{x.t:.1f}" for x in sorted(r.tiles, key=lambda x: x.t))
+        if got != want:
+            ck.bad(f"{at}: read each HOPPER TILE once, exactly at {want} (got {got})")
+        for x in r.tiles:
+            t = ck.frame_t(f"frame:{x.t}")
+            tile = ck.tiles[t] if t is not None else None
+            if tile is None:
+                if x.hopper != "cannot_see" or len(sheets) < IMAGE_CAP:
+                    ck.bad(f"{at}: the tile at {x.t:.1f} s was never served: open it")
+                continue
+            if x.hopper == "cannot_see":
+                continue
+            ringed = tile.main is not None and tile.main.tracked
+            if not ringed and not (tile.corner and r.corner_bumper == team):
+                ck.bad(
+                    f"{at}: {x.hopper} at {x.t:.1f} s needs the target ringed there, or a corner "
+                    f"tile at that time with its bumper read (corner_bumper {team}); else "
+                    "cannot_see"
+                )
+    for d in trips:
+        if d not in done:
+            ck.bad(f"hoppers: trip line {d} has no reading")
+
+
+def _check_call(ck: _Checker, c: LineCall, line: DrivingLine | ReadinessLine) -> None:
+    """An overrule needs the contradiction its call names, on tiles code can check, and no
+    reading of what the robot meant."""
     at = f"line call {c.line}"
     ctx = ck.ctx
     for x in c.cites:
         ck.span(x, at)
     drive = isinstance(line, DrivingLine)
-    trip = drive and line.kind == "loaded_trip"
-    allowed = TRIP_CALLS if trip else BARRIER_CALLS if drive else READINESS_CALLS
+    if drive and line.kind == "loaded_trip":
+        ck.bad(f"{at}: {c.line} is a loaded_trip line: read its hopper tiles in `hoppers`")
+        return
+    allowed = BARRIER_CALLS if drive else READINESS_CALLS
     if c.call not in allowed:
         ck.bad(f"{at}: {c.call} is not a call for this line; use one of {sorted(allowed)}")
         return
     a, b = (line.t_start, line.t_end) if drive else (line.t, line.t + line.late_s)
-    frames = ck.frames_in(c.cites, a, b, pad=0.05 if trip else SPAN_PAD_S)
+    frames = ck.frames_in(c.cites, a, b)
     corner = [t for t in ck.frames_in(c.cites, a, b) if ck.corner_only(t)]
     if corner and c.corner_bumper != ctx.match.target_team:
         ck.bad(
@@ -2833,37 +2912,10 @@ def _check_call(
             "corner tile counts only where you read the target's bumper number there: set "
             f"corner_bumper to {ctx.match.target_team} if you read it, else do not rely on it"
         )
-    if c.heaped_at is not None and c.call != "heaped":
-        ck.bad(f"{at}: heaped_at is only for heaped")
     if c.other_bumper is not None and c.call != "no_opponent":
         ck.bad(f"{at}: other_bumper is only for no_opponent")
     if c.charged_s is not None and c.call not in ("home_earlier", "not_home"):
         ck.bad(f"{at}: charged_s is only for home_earlier and not_home")
-    if isinstance(line, DrivingLine) and trip:
-        seen = [
-            t
-            for t in frames
-            if ((m := ck.tiles[t].main) is not None and m.tracked) or ck.corner_only(t)
-        ]
-        if c.call == "heaped":
-            t = c.heaped_at
-            if t is None or not any(abs(t - s) <= FRAME_MATCH_S for s in seen):
-                ck.bad(
-                    f"{at}: heaped needs heaped_at = the time of a cited tile inside the trip "
-                    f"({a:.1f}-{b:.1f} s) where the target is ringed (or read on a corner tile) "
-                    "and its hopper is heaped"
-                )
-        elif c.call == "not_heaped":
-            late = line.look_at[-1] - 1.0
-            if not any(t >= late for t in seen):
-                ck.bad(
-                    f"{at}: not_heaped needs a cited tile with the target ringed at or after "
-                    f"{late:.1f} s (its last hopper tile is {line.look_at[-1]:.1f} s): a robot "
-                    "can fill up out there. If no late tile shows the hopper, say cannot_see"
-                )
-        elif not frames and len(sheets) < IMAGE_CAP:
-            ck.bad(f"{at}: cannot_see needs the hopper tiles you looked at cited (inside the trip)")
-        return
     if (m := INTENT_WORD.search(c.text)) is not None:
         ck.bad(
             f"{at}: {m.group(0)!r} reads what the robot meant; an overrule stands only on what a "
@@ -2991,15 +3043,13 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
         and c.other_bumper is not None
     }
     _check_episodes(ck, answer, sheets, reread)
-    for d in led.driving:
-        if d.kind == "loaded_trip" and d.id not in calls:
-            ck.bad(f"line_calls: trip line {d.id} has no hopper call")
+    _check_hoppers(ck, answer, sheets)
     for c in answer.line_calls:
         line = ck.lines.get(c.line)
         if line is None:
             ck.bad(f"line call {c.line}: no ledger line {c.line}")
             continue
-        _check_call(ck, c, line, sheets)
+        _check_call(ck, c, line)
     for d in led.driving:
         c = calls.get(d.id)
         s = d.split
@@ -3014,15 +3064,21 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
             )
 
     # what code charges, then the text checks that lean on it
-    ch = charges(led, calls, answer.episodes, ck.by_id, ctx.target, ctx.match.target_alliance)
+    rulings = {r.line: _hopper_ruling(r.tiles) for r in answer.hoppers}
+    heaped = {k: t for k, (_, t) in rulings.items() if t is not None}
+    al = ctx.match.target_alliance
+    ch = charges(led, calls, heaped, answer.episodes, ck.by_id, ctx.target, al)
     for d in led.driving:
         c = calls.get(d.id)
+        trip = rulings.get(d.id, ("cannot_see", None))[0] if d.kind == "loaded_trip" else None
         if ch.line.get(d.id, 0.0) > 0:
             ck.charged_lines.append(d)
-        elif c is None and d.default == "cleared" and d.kind != "loaded_trip":
+        elif c is None and d.default == "cleared" and trip is None:
             ck.cleared_lines.append((d, "cleared by its default"))
-        elif c is not None and c.call in ("misplaced", "not_heaped"):
+        elif c is not None and c.call == "misplaced":
             ck.cleared_lines.append((d, c.call))
+        elif trip == "not_heaped":
+            ck.cleared_lines.append((d, trip))
     ck.pinned = [
         s
         for e, cost in zip(answer.episodes, ch.pin, strict=True)
@@ -3042,6 +3098,11 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
             own = line.facts if isinstance(line, DrivingLine) else [line.fact]
             read = [c.other_bumper] if c.other_bumper is not None else []
             text(f"line call {c.line}", c.text, [*c.cites, *own], read, claims=False)
+    for r in answer.hoppers:
+        if (line := ck.lines.get(r.line)) is not None and isinstance(line, DrivingLine):
+            times = [ck.frame_t(f"frame:{x.t}") for x in r.tiles]
+            served = [f"frame:{t:.1f}" for t in times if t is not None]
+            text(f"hoppers {r.line}", r.text, [*served, *line.facts], claims=False)
     names = [g.skill for g in answer.skills]
     if sorted(names) != sorted(SKILLS):
         ck.bad(f"skills: need exactly one each of {list(SKILLS)}, got {names}")
@@ -3204,8 +3265,25 @@ def grade(run: RunDir) -> None:
         for g in sorted(answer.skills, key=lambda g: SKILLS.index(g.skill))
     ]
     calls = {c.line: c for c in answer.line_calls}
+    hoppers = {r.line: r for r in answer.hoppers}
     scored: list[ScoredCall] = []
     for line in [*ctx.led.driving, *ctx.led.readiness]:
+        if (r := hoppers.get(line.id)) is not None:
+            call, at = _hopper_ruling(r.tiles)
+            scored.append(
+                ScoredCall(
+                    line=line.id,
+                    default=line.default,
+                    call=call,
+                    charged_total_s=ch.line.get(line.id, 0.0),
+                    heaped_at=at,
+                    hopper_tiles=r.tiles,
+                    corner_bumper=r.corner_bumper,
+                    text=resolved[f"hoppers {line.id}"],
+                    cites=[f"frame:{x.t:.1f}" for x in r.tiles],
+                )
+            )
+            continue
         c = calls.get(line.id)
         scored.append(
             ScoredCall(
@@ -3214,7 +3292,6 @@ def grade(run: RunDir) -> None:
                 call=c.call if c else None,
                 charged_total_s=ch.line.get(line.id, 0.0),
                 charged_s=c.charged_s if c else None,
-                heaped_at=c.heaped_at if c else None,
                 corner_bumper=c.corner_bumper if c else None,
                 text=resolved[f"line call {line.id}"]
                 if c

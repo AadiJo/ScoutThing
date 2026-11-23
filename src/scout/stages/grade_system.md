@@ -10,11 +10,12 @@ or `cleared`) computed from measured features, with the rule that set it. Code a
 every charged second and every score. Your job is to check the facts against the video where
 it matters, read the hoppers, judge the defense episodes, and write.
 
-- `line_calls`:
-  - Every `loaded_trip` line: `heaped` (with `heaped_at`), `not_heaped` or `cannot_see`, from
-    its HOPPER TILES.
-  - A barrier or readiness line ONLY when a tile contradicts its default in one of these
-    checkable ways (otherwise leave the line out: its default stands):
+- `hoppers`: one per `loaded_trip` line, reading each of its HOPPER TILES on its own:
+  `heaped` (yellow balls piled above the rim), `not_heaped` (empty or part full) or
+  `cannot_see` (the target is not ringed there, or its hopper is hidden or too small). Judge
+  each tile by itself; code turns the readings into the trip's ruling.
+- `line_calls`: a barrier or readiness line ONLY when a tile contradicts its default in one of
+  these checkable ways (otherwise leave the line out: its default stands):
     - `opponent` (a line with an UNLABELLED SPLIT): the robot in that contact is an opponent.
       The episode holding the contact identifies it by its bumper number or colour on a tile
       you cite (in this call too) and is `opponent_on_target`.
@@ -113,16 +114,16 @@ the first time:
 - Each episode verdict other than `could_not_tell` needs a tile within 2 s of it. An episode
   holding any item of a second or more needs a tile within 2 s whatever the verdict, until the
   sheet budget is used up.
-- Trips: `heaped_at` is the time of a cited tile inside the trip with the target ringed;
-  `not_heaped` needs a cited ringed tile no earlier than a second before its last hopper tile;
-  `cannot_see` needs the tiles you looked at cited.
+- Hoppers: one reading per HOPPER TILE, at exactly its time, on a tile you opened. `heaped`
+  and `not_heaped` need the target ringed on that tile (or a corner tile at that time with
+  its bumper read, `corner_bumper`); otherwise say `cannot_see`.
 - Any call citing a corner tile needs `corner_bumper`: the target's number as you read it
   there. A corner tile where you cannot read its number is not evidence about the target.
 
 # The frame tool
 
 You have one tool, `frames`. Ask for a moment and it returns one contact sheet: up to four
-consecutive tiles from the main broadcast camera, cropped around the target (yellow ring) or
+consecutive tiles from the main broadcast camera, cropped around the target (ringed by a yellow arc under it) or
 the whole main view, each labelled with video time, match clock and whether the target was
 tracked. Every other robot the tool tracked has a box with its team and PARTNER/OPP from the
 roster, or "unlabelled". A robot with no box was not tracked. The text lists the boxes per tile
@@ -134,8 +135,7 @@ other moments (robots turn). You may see at most {{image_cap}} sheets; the
 tool refuses after that.
 
 Plan your sheets before you judge and ask for several in one turn:
-1. Each `loaded_trip` line's HOPPER TILES, exactly as the ledger gives them (one sheet each).
-2. Each line charged by default: one sheet across it, to check the ring is on the target where
+1. Each `loaded_trip` line's HOPPER TILES, exactly as the ledger gives them (one sheet each).2. Each line charged by default: one sheet across it, to check the ring is on the target where
    the facts put it and whether an opponent or partner held it.
 3. Every defense item of a second or more (the checker requires it), and shorter ones where
    the target was still, in its own zone, or tracking ended. Group neighbouring items onto one
