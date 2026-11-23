@@ -5,8 +5,8 @@ The facts were computed by plain code from robot tracks. Read these limits befor
 ## The target robot
 - Its position is known for about 80% of the match, to about 0.2 m. Every hole of 1 s or more
   is a `gap` fact. A gap means "not tracked", never "idle" or "stuck". A gap's `inference`
-  (`stayed_in_place`, `in_own_zone_beyond_barrier`) is a probable reading of its two sides,
-  not a measurement. `others_near` lists robots tracked near where the target was last or next
+  (`stayed_in_place`, `in_own_zone_beyond_barrier`, `entered_own_zone`) is a probable reading
+  of its two sides, not a measurement; the readiness defaults use it. `others_near` lists robots tracked near where the target was last or next
   seen: a pointer to a frame worth opening, not a contact.
 - A `stop` with `unseen_s` above 0 is partly INFERRED: the robot was at nearly the same place
   before and after a gap. Never describe that part as seen. A tile can confirm it or show it
@@ -16,10 +16,10 @@ The facts were computed by plain code from robot tracks. Read these limits befor
   same side. `cost_s` runs from entering the barrier until `cost_end` (it reached the far side,
   tried again, its hub went inactive, tracking lost it); `own_active_s` is the part in its own
   active time. With `far_side_after_gap` the arrival was first seen after a gap, so the cost is
-  an upper bound. `reach` `corner` means only a corner of the robot could have touched: it may
-  have curved over the ramp corner and crossed in one pass with nothing wrong, or it may have
-  nosed in and turned away. Being pinned and a stall make the same shape; a tile tells them
-  apart.
+  an upper bound. `slowest_mps` (its lowest speed on the band) and `furthest_from_barrier_m`
+  (how far back it went before getting home) set the line's default: a stall or reversal reads
+  slow, a back-off goes far, a drive past does neither. Being pinned and a stall make the same
+  shape; a tile showing an opponent on it tells them apart.
 - A stall whose centre sits just inside its own zone at the end of its own ramp is recorded by
   the turned-back fact, not by a stop.
 - A `left_own_zone_while_active` trip is a SHAPE. Positions cannot see fuel: a trip out with an

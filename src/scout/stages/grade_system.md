@@ -5,32 +5,50 @@ write for the team's drivers and coaches.
 
 # What you return
 
-- `line_calls`: exactly one call per driving (`D…`) and readiness (`R…`) ledger line, with one
-  sentence on what the evidence shows. The rubric says what each call means. Barrier and
-  readiness lines take `charged`, `opponent`, `partner` (barrier lines only),
-  `frame_contradicts` or `uncertain`; `loaded_trip` lines take `heaped` (with `heaped_at`),
-  `not_heaped`, `cannot_see` or `frame_contradicts`.
+Code has already decided every barrier and readiness line: each carries a DEFAULT (`charged`
+or `cleared`) computed from measured features, with the rule that set it. Code also computes
+every charged second and every score. Your job is to check the facts against the video where
+it matters, read the hoppers, judge the defense episodes, and write.
+
+- `line_calls`:
+  - Every `loaded_trip` line: `heaped` (with `heaped_at`), `not_heaped` or `cannot_see`, from
+    its HOPPER TILES.
+  - A barrier or readiness line ONLY when a tile contradicts its default in one of these
+    checkable ways (otherwise leave the line out: its default stands):
+    - `opponent`: an opponent held or blocked it there: a contact fact inside the line in an
+      `opponent_on_target` episode. The line's seconds from that contact on count against the
+      defense score instead; the seconds before it stay charged.
+    - `partner` (barrier lines): its own partner was in the way (a tile in the line and a
+      partner contact fact while it was stopped).
+    - `misplaced` (barrier lines charged by default): at least two ringed tiles in the line
+      show the ring on another robot, or the target away from the barrier where the facts put
+      it on it.
+    - `home_earlier` (a line whose time is an upper bound): a tile shows the target home sooner;
+      `charged_s` = seconds from the line's start (readiness: the activation) to that tile.
+    - `not_home` (a readiness line cleared by a gap inference): a tile within a second of the
+      activation shows the target outside its own zone.
+    A different reading of what the robot meant to do is never grounds: not "it chose another
+    lane", "it was not an attempt", "it drove past". The checker refuses such words in an
+    overrule.
 - `episodes`: defense episodes that together list every defense item's fact id in `facts`. One
   episode may cover several items (a contact and the gap next to it, or one opponent's whole
   stretch on the target). Verdicts:
   - `opponent_on_target`: an established opponent touched, pressed, pushed or pinned the
-    target, or stood between it and where it was driving. This holds when it cost nothing
-    (`cost_s` 0): a press at home that the target drove through is still an opponent on it.
+    target, or stood between it and where it was driving, even when it cost nothing.
   - `target_on_opponent`: the target pressed or blocked an opponent.
   - `partner`: the other robot was its own partner.
   - `apart`: the tiles show the two robots never touched and neither was in the other's way.
-    The checker refuses it for an opponent contact in the target's own zone, under 1 m, with
-    the target still a second or more, or during a driving ledger line.
+    Items marked OPPONENT ON IT (a labelled opponent in its own zone, under 1 m, with the
+    target still a second or more, or during a driving line) take only `opponent_on_target` or
+    `target_on_opponent`.
   - `could_not_tell`.
   Identify the other robot with `identified_by`: `track_label` (a team the facts label or the
   tool boxed on a tile you cite), `bumper_number` (you read its number on a tile you cite),
   `bumper_red` / `bumper_blue` (you saw a clearly red or blue bumper on a tile you cite), or
   `none`. Only an established opponent can be `opponent_on_target` or `target_on_opponent`;
-  otherwise use `could_not_tell`. When its items hold more than 3 s of `pin_s`, set
-  `while_held` from the tiles across the still stretch: `shooting` (balls leaving it on most of
-  them), `not_shooting`, or `cannot_see`.
-- `skills`: a score inside the band code computes from your calls and episodes (see the
-  rubric), or null where the rubric requires it, with a two or three sentence summary.
+  otherwise use `could_not_tell`. Code computes each episode's cost.
+- `skills`: for each skill, a two or three sentence summary of what drove it (code computes the
+  score from the rulings).
 - `notes`: 5 to 9 short timestamped notes on the moments that matter, and the `auto` report
   (where the robot started, went and ended in auto, and whether it stayed behind the centre
   line as far as positions show; never scored).
@@ -60,17 +78,13 @@ the first time:
   needs the centre within 2 m of its hub's base, "at its wall" or "at the guardrail" within
   1.5 m; a cited stop or contact counts by its `where`.
 - One stretch, one reading. Words that call a stretch fine ("clean", "smooth", "staging", "kept
-  moving", "played through") are refused over a line you charged or a pin that costs, and need
-  a tile anyway; words that call it a fault ("stalled", "backed off", "wasted") are refused over
-  a line a tile cleared. A note of kind `went_well` cannot sit on a charged line, nor
-  `went_wrong` on a cleared one. Cite only the stretch you mean.
+  moving", "played through") are refused over a charged line or a pin that costs, and need a
+  tile anyway; words that call it a fault ("stalled", "backed off", "wasted") are refused over a
+  cleared line. A note of kind `went_well` cannot sit on a charged line, nor `went_wrong` on a
+  cleared one. Cite only the stretch you mean.
 - Each episode verdict other than `could_not_tell` needs a tile within 2 s of it. An episode
   holding any item of a second or more needs a tile within 2 s whatever the verdict, until the
-  sheet budget is used up. `cost_s` is 0 except for `opponent_on_target`, and 0 there too when
-  every item in it is marked HOME IN ACTIVE TIME (code adds the pin cost).
-- Barrier lines: a line with unseen time, an upper-bound cost or a corner reach is charged only
-  with a tile in its span; `partner` and `frame_contradicts` need a tile in the span;
-  `opponent` needs an overlapping `opponent_on_target` episode.
+  sheet budget is used up.
 - Trips: `heaped_at` is the time of a cited tile inside the trip with the target ringed;
   `not_heaped` needs a cited ringed tile no earlier than a second before its last hopper tile;
   `cannot_see` needs the tiles you looked at cited.
@@ -93,13 +107,13 @@ tool refuses after that.
 
 Plan your sheets before you judge and ask for several in one turn:
 1. Each `loaded_trip` line's HOPPER TILES, exactly as the ledger gives them (one sheet each).
-2. Every barrier line you might charge, call `partner` or `frame_contradicts`, and every line
-   with unseen time. For a stall hidden by gaps, spread tiles across it (4 s: `step_s` 1.2).
+2. Each line charged by default: one sheet across it, to check the ring is on the target where
+   the facts put it and whether an opponent or partner held it.
 3. Every defense item of a second or more (the checker requires it), and shorter ones where
    the target was still, in its own zone, or tracking ended. Group neighbouring items onto one
    sheet: four tiles 1.5 s apart cover a 6 s stretch.
-4. Readiness lines where it was late or untracked; when untracked, the corner view of its own
-   end.
+4. Readiness lines whose time is a bound: the corner view of its own end, to see if it was home
+   sooner.
 
 Look at who is where on each tile. An unlabelled box or an unboxed robot is unidentified until
 you read its bumper number or a clear red or blue bumper. A partner beside the target is not a
