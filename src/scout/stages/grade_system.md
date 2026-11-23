@@ -15,9 +15,17 @@ it matters, read the hoppers, judge the defense episodes, and write.
     its HOPPER TILES.
   - A barrier or readiness line ONLY when a tile contradicts its default in one of these
     checkable ways (otherwise leave the line out: its default stands):
-    - `opponent`: an opponent held or blocked it there: a contact fact inside the line in an
-      `opponent_on_target` episode. The line's seconds from that contact on count against the
-      defense score instead; the seconds before it stay charged.
+    - `opponent` (a line with an UNLABELLED SPLIT): the robot in that contact is an opponent.
+      The episode holding the contact identifies it by its bumper number or colour on a tile
+      you cite (in this call too) and is `opponent_on_target`.
+    - `no_opponent` (a line with an OPPONENT SPLIT): the robot boxed as that opponent beside
+      the target is a partner. `other_bumper` = the partner number you read on its bumper on a
+      tile you cite (in this call too); the episode holding the contact gives the same number
+      with `bumper_number` and the verdict `partner`. Code measured where that
+      robot was against the target's way home and the seconds it cost; a reading of whether it
+      was in the way is never grounds.
+    - `opponent` (readiness lines): an opponent held it from getting home, a contact fact in
+      its lateness in an `opponent_on_target` episode.
     - `partner` (barrier lines): its own partner was in the way (a tile in the line and a
       partner contact fact while it was stopped).
     - `misplaced` (barrier lines charged by default): at least two ringed tiles in the line
@@ -44,7 +52,8 @@ it matters, read the hoppers, judge the defense episodes, and write.
   - `apart`: the tiles show the two robots never touched and neither was in the other's way.
     Items marked OPPONENT ON IT (a labelled opponent in its own zone, under 1 m, with the
     target still a second or more, or during a driving line) take only `opponent_on_target` or
-    `target_on_opponent`.
+    `target_on_opponent`. A contact carrying a line's OPPONENT SPLIT takes only
+    `opponent_on_target`, unless you call `no_opponent` on that line.
   - `could_not_tell`.
   Identify the other robot with `identified_by`: `track_label` (a team the facts label or the
   tool boxed on a tile you cite), `bumper_number` (you read its number on a tile you cite),

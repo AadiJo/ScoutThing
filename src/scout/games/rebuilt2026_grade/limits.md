@@ -27,8 +27,9 @@ The facts were computed by plain code from robot tracks. Read these limits befor
   the cost is an upper bound). `slowest_mps` (its lowest speed on the band) and
   `furthest_from_barrier_m` (how far back it went before getting home) set the line's default:
   a stall, a reversal and a slow turn-away all read slow, a back-off goes far, a drive past does
-  neither. Only `stopped_s` says it stood still. Being pinned and a stall make the same shape; a
-  tile showing an opponent on it tells them apart.
+  neither. Only `stopped_s` says it stood still. Being pinned and a stall make the same shape;
+  the line's opponent split tells them apart from where the tracked robots were. A robot the
+  tracker missed is in no contact and no split: a note may say what the tile shows.
 - A stall whose centre sits just inside its own zone at the end of its own ramp is recorded by
   the turned-back fact, not by a stop.
 - A `left_own_zone_while_active` trip starts where it was seen leaving, or, when it left inside

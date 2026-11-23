@@ -60,6 +60,24 @@ class _Model(BaseModel):
 DrivingKind = Literal["turned_back", "barrier_stop", "barrier_stay", "slow_crossing", "loaded_trip"]
 
 
+class OpponentSplit(_Model):
+    """The part of a charged barrier line an opponent cost: a robot in a contact inside the
+    line came between the target and its own wall. Code computes it from positions."""
+
+    contact: str
+    """The contact fact (the earliest such one in the line)."""
+    team: int | None
+    """That robot's team label; None when unlabelled: then the split applies only when the
+    grader establishes it as an opponent on a tile (`opponent`). A labelled opponent's split
+    applies by default."""
+    t: float
+    """When that robot came close (or the line's start, if later): `seconds` run from here."""
+    seconds: float
+    """Seconds of the line's `lost_s` that count against handling_defense instead of driving."""
+    why: str
+    """The measures and thresholds that set `seconds`."""
+
+
 class DrivingLine(_Model):
     """One stretch the driving rubric may charge, from the facts."""
 
@@ -92,6 +110,9 @@ class DrivingLine(_Model):
     """`loaded_trip` only: the tile times at which to read the hopper (served at zoom 2)."""
     opponent_contacts: list[str]
     """Contact facts in the line's span with an opponent or unlabelled robot."""
+    split: OpponentSplit | None
+    """Charged barrier lines: the seconds a robot between it and home cost (see
+    `OpponentSplit`); None when no such robot was measured."""
     partner_contacts: list[str]
     """Contact facts in the line's span with only labelled partners."""
     text: str
@@ -180,6 +201,7 @@ class Coverage(_Model):
 
 Call = Literal[
     "opponent",
+    "no_opponent",
     "partner",
     "misplaced",
     "home_earlier",
@@ -190,9 +212,10 @@ Call = Literal[
     "cannot_see",
 ]
 """Overrules of a barrier or readiness line's default, each needing a checkable contradiction:
-`opponent` (an opponent held or blocked it; needs a contact inside the line in an
-`opponent_on_target` episode; the line's seconds from that contact on move to the defense
-score), `partner` (barrier lines: its own partner was
+`opponent` (barrier lines: the unlabelled robot of the line's `split` is established as an
+opponent on a tile, so the split applies; readiness lines: an opponent held it),
+`no_opponent` (a labelled robot's split: its bumper read on a tile, `other_bumper`, is not an
+opponent's, so the split does not apply), `partner` (barrier lines: its own partner was
 in the way; needs a tile and a partner contact), `misplaced` (barrier lines charged by
 default: ringed tiles show the facts put the target in the wrong place, or the ring on another
 robot), `home_earlier` (a line whose time is an upper bound: a tile shows it home sooner;
@@ -225,6 +248,11 @@ class LineCall(_Model):
         default=None,
         description="Required when the call cites a corner camera tile, or calls home or "
         "not_home on a not_judged line: the target's bumper number as you read it there.",
+    )
+    other_bumper: int | None = Field(
+        default=None,
+        description="no_opponent only: the team number you read on the bumper of the robot the "
+        "line's OPPONENT SPLIT names, on a cited tile where the tool boxed it beside the target.",
     )
     text: Text = Field(description="One sentence: what the tiles show.")
     cites: Cites
@@ -336,8 +364,8 @@ class ScoredEpisode(DefenseEpisode):
     pin_cost_s: float
     """Its share of held still time beyond the allowance (see rubric.md)."""
     total_cost_s: float
-    """`pin_cost_s` plus the seconds of barrier lines called `opponent` from its first contact
-    in them: what the defense score counts."""
+    """`pin_cost_s` plus the `split` seconds of barrier lines whose split contact it holds:
+    what the defense score counts."""
 
 
 class Note(AgentNote):
@@ -404,7 +432,7 @@ class Grade(StageFile):
     """The grade for the target team. Auto is reported but not scored. Text fields have
     their `{...}` references resolved."""
 
-    schema_version: Literal[6] = 6
+    schema_version: Literal[7] = 7
     team: int
     rubric_version: str
     coverage: Coverage
