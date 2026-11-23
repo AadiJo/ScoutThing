@@ -6,15 +6,20 @@ For each camera panel in `match.json`:
 1. Decode the match (auto start to teleop end) once at 0.5 Hz, grey, and take the median
    of each quarter. Robots and game pieces move, so each median shows the bare field.
    The optical centre is expected at the frame centre for a panel that is the top of a
-   full-frame picture (official broadcasts) and at the panel centre otherwise (`View`).
+   full-frame picture (official broadcasts). Any other panel is a crop whose offset is
+   unknown: solves start from several principal-point rows, and no rung holds the
+   principal point at a guess (`View`).
 2. Decode tag36h11 in each quarter median at 2x, 3x and 4x, without decimation. A tag
    is trusted only if it decodes in at least 2 of the 4 quarters (so it was in view for
    a good share of the match) with corners that agree; its corners are the median of
    every hit. Tags seen in fewer quarters are reported as suspect and not used.
-3. Tags only: fit a ladder of lens models, most constrained first (`LensModel`). A freer
-   model needs enough tags, a field spread of at least 2 m, a plausible pose and a lens
-   that reaches every pixel of the panel, and it is kept only if it is clearly better
-   (`_freer_wins`).
+3. Tags only: fit a ladder of lens models, most constrained first (`LensModel`), ending
+   with a fisheye lens. A freer model needs enough tags, a field spread of at least 2 m, a
+   plausible pose and a lens that reaches every pixel of the panel, and it is kept only if
+   it passes every gate where the current one fails, or is clearly better (`_replaces`).
+   Every fit also solves the corner inset (`Fit.inset`): the decoder puts the corners of
+   small, blurred tags a fixed fraction of a pixel inside the black square, and left
+   unmodelled that bias bends the lens.
 4. Locate undecoded tags. Most tags are too small to decode (about 1.5 px per data bit)
    but their white frames are plain. For each structure of camera-facing tags (a pair
    on a wall or hub face, or a single tag) the fit predicts the tag centres; the frames
@@ -30,12 +35,14 @@ For each camera panel in `match.json`:
    tags-only fit and a grid of (k1, k2) with focal length and pose solved from the tags;
    the one whose projected lines lie best on bright ridges of the median starts an
    alternation of finding ridge points near each projected line (in a shrinking search
-   band) and refitting tags and lines together. Tags are located as in step 4.
+   band) and refitting tags and lines together. A rail whose fitted height reaches its
+   bound has latched onto another ridge and is dropped. Tags are located as in step 4.
+   The kept lens is chosen from a short ladder ending with the fisheye lens.
 6. Validate by leaving each group of neighbouring tags out (tags on one structure are
    grouped, or the held-out tag would be pinned by its neighbour), refitting (with the
    lines, if any), casting its points onto the plane at their own height, and measuring
-   the error in metres. Of the main-view fits that pass every gate, the one with the
-   lowest held-out error is kept.
+   the error in metres. The tags-and-lines fit is kept when it passes every gate, else
+   the tags-only fit (`_pick`).
 
 The main view must pass every gate or the stage raises `NeedsInput`. A corner view that
 cannot be calibrated is left out. `calibration_check.jpg` shows the field lines and tag
@@ -69,7 +76,13 @@ from scout.games.rebuilt2026 import (
     Rect,
 )
 from scout.run import NeedsInput, RunDir, Stage
-from scout.schemas.calibration import Calibration, CameraCalibration, LensModel, LineFit
+from scout.schemas.calibration import (
+    FISHEYE_MODELS,
+    Calibration,
+    CameraCalibration,
+    LensModel,
+    LineFit,
+)
 from scout.schemas.common import VIEW_NAMES, PixelRect, ViewName
 from scout.schemas.video import VideoInfo
 from scout.video import THREADS, frames
@@ -94,7 +107,7 @@ MIN_SPREAD_M = 2.0
 FREER_GAIN = 0.8
 HOLDOUT_CAP_M = 1.0
 
-LADDER: tuple[LensModel, ...] = ("pp_k1", "cy_k1", "c_k1", "c_k2")
+LADDER: tuple[LensModel, ...] = ("pp_k1", "cy_k1", "c_k1", "c_k2", "c_kb3")
 FREE: dict[LensModel, tuple[str, ...]] = {
     "pp_k1": ("f", "k1"),
     "cy_k1": ("f", "cy", "k1"),
@@ -102,8 +115,10 @@ FREE: dict[LensModel, tuple[str, ...]] = {
     "c_k2": ("f", "cx", "cy", "k1", "k2"),
     "pp_k2": ("f", "k1", "k2"),
     "c_k3": ("f", "cx", "cy", "k1", "k2", "k3"),
+    "c_kb3": ("f", "cx", "cy", "k1", "k2", "k3"),
 }
-DIST_TERMS = ("k1", "k2", "p1", "p2", "k3")
+POLY_TERMS = ("k1", "k2", "p1", "p2", "k3")
+FISHEYE_TERMS = ("k1", "k2", "k3", "k4")
 MIN_TAGS: dict[LensModel, int] = {
     "pp_k1": 4,
     "cy_k1": 5,
@@ -111,8 +126,20 @@ MIN_TAGS: dict[LensModel, int] = {
     "c_k2": 8,
     "pp_k2": 4,
     "c_k3": 4,
+    "c_kb3": 8,
 }
 COVER_MARGIN = 1.02  # the lens must reach 2% past the panel's farthest corner
+# Inward direction of each decoded corner (bottom-left, bottom-right, top-right, top-left;
+# image y down) for the fitted corner inset (`Fit.inset`).
+CORNER_INWARD = np.array([[1.0, -1.0], [-1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]])
+# Principal-point rows tried for a cropped panel, in panel heights from its centre. The crop
+# offset is unknown (CapCity: the optical centre is 0.2 panel heights below), and seeds from
+# the panel centre alone fell into a far camera with k1 > 0 on two CapCity clips.
+CROP_ROWS = (-0.5, -0.25, 0.0, 0.25, 0.5)
+# Rungs that hold the principal point where the solve started. For a cropped panel that is
+# a guessed row, so they are not tried: one held at the panel's bottom edge passed every
+# gate on a CapCity clip with the camera 0.6 m off.
+HELD_CENTRE: frozenset[LensModel] = frozenset({"pp_k1", "pp_k2"})
 
 # Field lines (main view). Guardrail top: the field_wireframe asset's perimeter tubes at
 # z 0.487 m, 0.058-0.061 m outside the field edge, beside wall tops at 0.483 m, 0.007 m
@@ -122,6 +149,10 @@ COVER_MARGIN = 1.02  # the lens must reach 2% past the panel's farthest corner
 RAIL_Z_M = 0.487
 RAIL_OUT_M = 0.035
 RAIL_HEIGHT_FREE_M = 0.15
+# A rail whose fitted height reaches the bound is not the rail but another ridge (CapCity's
+# far rail: the scorer tables or the wall foot, 20 px apart from clip to clip); it is
+# dropped and the fit redone without it.
+RAIL_AT_BOUND_M = 0.98 * RAIL_HEIGHT_FREE_M
 LINE_END_M = 0.15  # stay this far from the corners, where rails bend and posts stand
 LINE_MARGIN_PX = 12  # ridge points stay this far inside the panel and below the scoreboard
 LINE_STEP_PX = 12.0  # spacing of ridge points along a line's image curve
@@ -149,7 +180,8 @@ GRID_MAX_RMS_PX = 4.0  # a grid start must still fit the decoded tags roughly
 SCORE_PX = {False: 3.0, True: 8.0}  # start scoring band: fixed line, free-height rail
 
 # Trust gates. A view failing any of these is not written.
-# Tag reprojection. Good fits reach 0.4-1.7 px on the test videos; past 2 px the lens model
+# Tag reprojection. Good fits reach 0.4-1.9 px on the test videos (CapCity tags and lines:
+# 1.2-1.9, of which the day-2 hub tags alone carry 2.5-3 px); past 2 px the lens model
 # cannot follow the picture or a located tag sits on the wrong frame, and one point 6 px
 # off is a wrong match or an end of the field the lens does not reach.
 MAX_RMS_PX = 2.0
@@ -191,6 +223,9 @@ class View:
     box: tuple[float, float, float, float]
     """(x0, y0, x1, y1) where ridge points may lie: inside the panel by LINE_MARGIN_PX and
     below a scoreboard drawn over it."""
+    centre_known: bool
+    """The optical centre is known to be near `centre` (full-frame picture); otherwise
+    `centre` is only the panel centre, and rungs that hold it there are not tried."""
 
     @classmethod
     def of(cls, rect: PixelRect, info: VideoInfo, scoreboard: PixelRect) -> View:
@@ -198,8 +233,8 @@ class View:
         of a full-frame camera picture with the scoreboard and corner panels drawn over it
         (official broadcasts: the bow of the guardrails puts the optical centre within
         about 40 px of the frame centre on all three), so its optical centre is the frame
-        centre. Any other panel is taken as centred on its own centre (a crop whose offset
-        is unknown; on CapCity the free fits put it 95 px below)."""
+        centre. Any other panel is a crop whose offset is unknown (on CapCity the free fits
+        put the centre 85 px below the panel centre); seeds try several rows."""
         full = rect.y == 0 and rect.x == 0 and rect.w == info.width
         mid = (rect.x + rect.w / 2, rect.y + rect.h / 2)
         centre = (info.width / 2, info.height / 2) if full else mid
@@ -208,7 +243,13 @@ class View:
             top = scoreboard.y + scoreboard.h
         m = LINE_MARGIN_PX
         box = (rect.x + m, top + m, rect.x + rect.w - m, rect.y + rect.h - m)
-        return cls(rect, centre, (info.width, info.height), box)
+        return cls(rect, centre, (info.width, info.height), box, full)
+
+    def seed_centres(self) -> list[tuple[float, float]]:
+        """Principal points to start solves from: `centre`, or for a crop CROP_ROWS."""
+        if self.centre_known:
+            return [self.centre]
+        return [(self.centre[0], self.centre[1] + a * self.rect.h) for a in CROP_ROWS]
 
 
 @dataclass(frozen=True)
@@ -243,9 +284,19 @@ class Fit:
     """Fitted height offset of each of `lines` (0 for a line whose height is known)."""
     line_err: tuple[F64, ...] = ()
     """Signed distance in px of each line's ridge points from its projection."""
+    inset: tuple[float, float] = (0.0, 0.0)
+    """Fitted (x, y) px by which decoded corners sit inside the projected black square:
+    the decoder's corners of small, blurred tags are biased inward (CapCity: 0.2 and
+    1.0 px on every clip, the same for tags 11 to 18 px tall, so it is not geometry)."""
+    dropped: tuple[str, ...] = ()
+    """Free-height field lines left out because their fit reached RAIL_AT_BOUND_M."""
 
     def camera(self) -> Camera:
         return Camera.from_calibration(_to_schema(self, {}, {}, 0.0))
+
+    @property
+    def fisheye(self) -> bool:
+        return self.model in FISHEYE_MODELS
 
     def offset(self, name: str) -> float:
         """Fitted height offset of the field line `name` (0 when it was not fitted)."""
@@ -556,12 +607,29 @@ def _match_structure(pred: F64, found: F64, radius: float) -> list[F64 | None]:
 # --- solving -------------------------------------------------------------------
 
 
-def _points(tags: dict[int, Tag], ids: tuple[int, ...]) -> tuple[F64, F64]:
-    return np.concatenate([tags[t].obj for t in ids]), np.concatenate([tags[t].img for t in ids])
+@dataclass(frozen=True)
+class Points:
+    """The tag points of a fit: field points (N, 3), image points (N, 2), and the inward
+    direction (N, 2) of each decoded corner (0 for a located tag's centre)."""
+
+    obj: F64
+    img: F64
+    inward: F64
 
 
-def _project(obj: F64, k: F64, dist: F64, rvec: F64, tvec: F64) -> F64:
-    uv, _ = cv2.projectPoints(obj, rvec, tvec, k, dist)
+def _points(tags: dict[int, Tag], ids: tuple[int, ...]) -> Points:
+    return Points(
+        np.concatenate([tags[t].obj for t in ids]),
+        np.concatenate([tags[t].img for t in ids]),
+        np.concatenate([np.zeros((1, 2)) if tags[t].located else CORNER_INWARD for t in ids]),
+    )
+
+
+def _project(obj: F64, model: LensModel, k: F64, dist: F64, rvec: F64, tvec: F64) -> F64:
+    if model in FISHEYE_MODELS:
+        uv, _ = cv2.fisheye.projectPoints(obj.reshape(-1, 1, 3), rvec, tvec, k, dist[:4])
+    else:
+        uv, _ = cv2.projectPoints(obj, rvec, tvec, k, dist)
     return np.asarray(uv, np.float64).reshape(-1, 2)
 
 
@@ -572,19 +640,26 @@ def _finish(
     rvec: F64,
     tvec: F64,
     ids: tuple[int, ...],
-    obj: F64,
-    img: F64,
+    pts: Points,
     lines: tuple[LinePoints, ...] = (),
     dz: tuple[float, ...] = (),
+    inset: tuple[float, float] = (0.0, 0.0),
 ) -> Fit:
-    err = np.linalg.norm(_project(obj, k, dist, rvec, tvec) - img, axis=1)
+    pred = _project(pts.obj, model, k, dist, rvec, tvec) + pts.inward * np.array(inset)
+    err = np.linalg.norm(pred - pts.img, axis=1)
     rms, worst = float(np.sqrt(np.mean(err**2))), float(err.max())
-    line_err = tuple(_line_resid(lines, dz, k, dist, rvec, tvec))
-    return Fit(model, k, dist, rvec, tvec, ids, rms, worst, lines, dz, line_err)
+    line_err = tuple(_line_resid(lines, dz, model, k, dist, rvec, tvec))
+    return Fit(model, k, dist, rvec, tvec, ids, rms, worst, lines, dz, line_err, inset)
 
 
 def _line_resid(
-    lines: tuple[LinePoints, ...], dz: tuple[float, ...], k: F64, dist: F64, rvec: F64, tvec: F64
+    lines: tuple[LinePoints, ...],
+    dz: tuple[float, ...],
+    model: LensModel,
+    k: F64,
+    dist: F64,
+    rvec: F64,
+    tvec: F64,
 ) -> list[F64]:
     """Per line, the signed distance (px) of each ridge point from the line's projection,
     along the projected curve's normal. First order in the point's slide along the line,
@@ -592,16 +667,16 @@ def _line_resid(
     out: list[F64] = []
     for lp, d in zip(lines, dz, strict=True):
         p = lp.line.points(lp.s, d)
-        q0 = _project(p, k, dist, rvec, tvec)
-        t = _project(lp.line.points(lp.s + 0.02, d), k, dist, rvec, tvec) - q0
+        q0 = _project(p, model, k, dist, rvec, tvec)
+        t = _project(lp.line.points(lp.s + 0.02, d), model, k, dist, rvec, tvec) - q0
         t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-12
         out.append(np.sum((lp.img - q0) * np.stack([-t[:, 1], t[:, 0]], 1), axis=1))
     return out
 
 
-def _seeds(obj: F64, img: F64, view: View, ids: tuple[int, ...]) -> list[Fit]:
-    """Starting cameras from OpenCV's calibrateCamera (principal point at the view's
-    optical centre guess, square pixels, k1 only) over a few focal lengths, best first."""
+def _seeds(pts: Points, view: View, ids: tuple[int, ...]) -> list[Fit]:
+    """Starting cameras from OpenCV's calibrateCamera (principal point held at each of the
+    view's seed centres, square pixels, k1 only) over a few focal lengths, best first."""
     flags = (
         cv2.CALIB_USE_INTRINSIC_GUESS
         | cv2.CALIB_ZERO_TANGENT_DIST
@@ -611,70 +686,79 @@ def _seeds(obj: F64, img: F64, view: View, ids: tuple[int, ...]) -> list[Fit]:
         | cv2.CALIB_FIX_ASPECT_RATIO
     )
     out: list[Fit] = []
-    cx, cy = view.centre
     w = view.rect.w
-    for f0 in (0.3 * w, 0.5 * w, 0.9 * w):
-        for k10 in (0.0, -0.2):
-            k0 = np.array([[f0, 0, cx], [0, f0, cy], [0, 0, 1]])
-            try:
-                _, k, d, rv, tv = cv2.calibrateCamera(
-                    [obj.astype(np.float32)],
-                    [img.astype(np.float32)],
-                    view.frame,
-                    k0,
-                    np.array([k10, 0, 0, 0, 0], np.float64),
-                    flags=flags,
-                )
-            except cv2.error:
-                continue
-            dist = np.zeros(5)
-            dist[0] = float(np.asarray(d).reshape(-1)[0])
-            rvec = np.asarray(rv[0], np.float64).reshape(3)
-            tvec = np.asarray(tv[0], np.float64).reshape(3)
-            out.append(_finish("pp_k1", np.asarray(k, np.float64), dist, rvec, tvec, ids, obj, img))
+    for cx, cy in view.seed_centres():
+        for f0 in (0.3 * w, 0.5 * w, 0.9 * w):
+            for k10 in (0.0, -0.2):
+                k0 = np.array([[f0, 0, cx], [0, f0, cy], [0, 0, 1]])
+                try:
+                    _, k, d, rv, tv = cv2.calibrateCamera(
+                        [pts.obj.astype(np.float32)],
+                        [pts.img.astype(np.float32)],
+                        view.frame,
+                        k0,
+                        np.array([k10, 0, 0, 0, 0], np.float64),
+                        flags=flags,
+                    )
+                except cv2.error:
+                    continue
+                dist = np.zeros(5)
+                dist[0] = float(np.asarray(d).reshape(-1)[0])
+                rvec = np.asarray(rv[0], np.float64).reshape(3)
+                tvec = np.asarray(tv[0], np.float64).reshape(3)
+                k = np.asarray(k, np.float64)
+                out.append(_finish("pp_k1", k, dist, rvec, tvec, ids, pts))
     return sorted(out, key=lambda f: f.rms)
 
 
 def _refine(
     model: LensModel,
     start: Fit,
-    obj: F64,
-    img: F64,
+    pts: Points,
     ids: tuple[int, ...],
     lines: tuple[LinePoints, ...] = (),
 ) -> Fit:
-    """Least-squares refit of pose and `model`'s free lens parameters from `start`.
-    Distortion terms the model does not free are zero; the rest start from `start`, as does
-    the principal point when the model does not free it. With `lines`, their ridge points
-    are fitted too (soft-L1, so a stray ridge point cannot pull the fit) along with the
-    height of each free-height line."""
+    """Least-squares refit of pose, `model`'s free lens parameters and the corner inset
+    from `start`. Distortion terms the model does not free are zero; the rest start from
+    `start` (from zero when `start` is the other lens family), as does the principal point
+    when the model does not free it. With `lines`, their ridge points are fitted too
+    (soft-L1, so a stray ridge point cannot pull the fit) along with the height of each
+    free-height line. The result keeps `start`'s dropped lines."""
     names = FREE[model]
+    fisheye = model in FISHEYE_MODELS
+    terms = FISHEYE_TERMS if fisheye else POLY_TERMS
+    same = fisheye == start.fisheye
     base = {"f": start.k[0, 0], "cx": start.k[0, 2], "cy": start.k[1, 2]}
-    base |= {n: float(start.dist[i]) if n in names else 0.0 for i, n in enumerate(DIST_TERMS)}
+    base |= {n: float(start.dist[i]) if same and n in names else 0.0 for i, n in enumerate(terms)}
     free_dz = [i for i, lp in enumerate(lines) if lp.line.free_height]
     n_lens = 6 + len(names)
+    n_pre = n_lens + 2  # pose, lens, then the corner inset
 
-    def unpack(x: F64) -> tuple[F64, F64, F64, F64, tuple[float, ...]]:
+    def unpack(x: F64) -> tuple[F64, F64, F64, F64, tuple[float, ...], tuple[float, float]]:
         v = base | dict(zip(names, (float(a) for a in x[6:n_lens]), strict=True))
         k = np.array([[v["f"], 0, v["cx"]], [0, v["f"], v["cy"]], [0, 0, 1]], np.float64)
-        dist = np.array([v[n] for n in DIST_TERMS], np.float64)
+        dist = np.array([v[n] for n in terms], np.float64)
         dz = [0.0] * len(lines)
-        for i, d in zip(free_dz, x[n_lens:], strict=True):
+        for i, d in zip(free_dz, x[n_pre:], strict=True):
             dz[i] = float(d)
-        return k, dist, x[:3].copy(), x[3:6].copy(), tuple(dz)
+        inset = (float(x[n_lens]), float(x[n_lens + 1]))
+        return k, dist, x[:3].copy(), x[3:6].copy(), tuple(dz), inset
 
     def resid(x: F64) -> F64:
-        k, dist, rv, tv, dz = unpack(x)
-        tag = (_project(obj, k, dist, rv, tv) - img).reshape(-1)
-        return np.concatenate([tag, *_line_resid(lines, dz, k, dist, rv, tv)])
+        k, dist, rv, tv, dz, inset = unpack(x)
+        pred = _project(pts.obj, model, k, dist, rv, tv) + pts.inward * np.array(inset)
+        tag = (pred - pts.img).reshape(-1)
+        return np.concatenate([tag, *_line_resid(lines, dz, model, k, dist, rv, tv)])
 
-    x0 = np.concatenate([start.rvec, start.tvec, [base[n] for n in names]])
+    x0 = np.concatenate([start.rvec, start.tvec, [base[n] for n in names], start.inset])
     if not lines:
         sol = least_squares(resid, x0, method="lm", x_scale="jac")
-        return _finish(model, *unpack(np.asarray(sol.x, np.float64))[:4], ids, obj, img)
+        k, dist, rv, tv, _, inset = unpack(np.asarray(sol.x, np.float64))
+        fit = _finish(model, k, dist, rv, tv, ids, pts, inset=inset)
+        return replace(fit, dropped=start.dropped)
     h = RAIL_HEIGHT_FREE_M * 0.999
     dz0 = [float(np.clip(start.offset(lines[i].line.name), -h, h)) for i in free_dz]
-    lo = np.r_[np.full(n_lens, -np.inf), np.full(len(free_dz), -RAIL_HEIGHT_FREE_M)]
+    lo = np.r_[np.full(n_pre, -np.inf), np.full(len(free_dz), -RAIL_HEIGHT_FREE_M)]
     sol = least_squares(
         resid,
         np.r_[x0, dz0],
@@ -683,8 +767,9 @@ def _refine(
         x_scale="jac",
         bounds=(lo, -lo),
     )
-    k, dist, rv, tv, dz = unpack(np.asarray(sol.x, np.float64))
-    return _finish(model, k, dist, rv, tv, ids, obj, img, lines, dz)
+    k, dist, rv, tv, dz, inset = unpack(np.asarray(sol.x, np.float64))
+    fit = _finish(model, k, dist, rv, tv, ids, pts, lines, dz, inset)
+    return replace(fit, dropped=start.dropped)
 
 
 def _plausible(fit: Fit, corners: dict[int, F64], obj: F64) -> str | None:
@@ -720,7 +805,7 @@ def _covers(fit: Fit, view: View) -> str | None:
         [[r.x, r.y], [r.x + r.w, r.y], [r.x, r.y + r.h], [r.x + r.w, r.y + r.h]], np.float64
     )
     need = float(np.max(np.linalg.norm(corners - fit.k[:2, 2], axis=1))) / fit.k[0, 0]
-    reach = reach_radius(fit.dist)
+    reach = reach_radius(fit.dist, fit.fisheye)
     if reach < need * COVER_MARGIN:
         return f"lens folds at radius {reach:.2f}, inside the panel (radius {need:.2f})"
     return None
@@ -736,8 +821,7 @@ def _holdout(fit: Fit, tags: dict[int, Tag], corners: dict[int, F64]) -> dict[in
         if len(rest) < 3:
             out.update(dict.fromkeys(group, math.inf))
             continue
-        obj, img = _points(tags, rest)
-        cam = _refine(fit.model, fit, obj, img, rest, fit.lines).camera()
+        cam = _refine(fit.model, fit, _points(tags, rest), rest, fit.lines).camera()
         for t in group:
             xy = cam.to_field(tags[t].img, tags[t].obj[:, 2])
             err = float(np.mean(np.linalg.norm(xy - tags[t].obj[:, :2], axis=1)))
@@ -759,26 +843,43 @@ def _freer_wins(cand: Fit, cand_h: dict[int, float], best: Fit, best_h: dict[int
     return clearly_held or clearly_rms
 
 
+def _replaces(
+    cand: Fit, cand_h: dict[int, float], best: Fit, best_h: dict[int, float], spread: float
+) -> bool:
+    """A freer lens that passes every gate replaces one that fails a gate (the gates include
+    the held-out test, so passing is not overfitting); otherwise `_freer_wins` decides. On
+    CapCity a k1-k2 lens failing the RMS gate kept out a fisheye lens that passed all."""
+    cand_ok = not _problems(cand, cand_h, spread)
+    best_ok = not _problems(best, best_h, spread)
+    if cand_ok != best_ok:
+        return cand_ok
+    return _freer_wins(cand, cand_h, best, best_h)
+
+
 def _solve(
     tags: dict[int, Tag], corners: dict[int, F64], view: View, start: Fit | None = None
 ) -> tuple[Fit | None, dict[int, float], list[str]]:
-    """Climb the tags-only lens ladder from each seed in turn: `start` (an earlier fit
-    with its principal point moved back to the view's centre), then calibrateCamera solves.
-    Each rung starts from the one below. The first rung that is plausible and covers the
-    panel is the base; a freer rung replaces it only if `_freer_wins`. Returns the chosen
-    fit, its hold-out errors and the reasons it should not be trusted (empty when it passes
-    every gate)."""
+    """Climb the tags-only lens ladder from each seed in turn: `start` (an earlier fit,
+    with its principal point moved back to the view's centre when that is known), then
+    calibrateCamera solves. Each rung starts from the one below. The first rung that is
+    plausible and covers the panel is the base; a freer rung replaces it only if
+    `_replaces`. Returns the chosen fit, its hold-out errors and the reasons it should not
+    be trusted (empty when it passes every gate)."""
     ids = tuple(sorted(tags))
     spread = _spread(list(ids), corners)
     if len(ids) < MIN_TAGS["pp_k1"]:
         return None, {}, [f"only {len(ids)} usable tags (need {MIN_TAGS['pp_k1']})"]
-    obj, img = _points(tags, ids)
-    seeds = _seeds(obj, img, view, ids)
+    pts = _points(tags, ids)
+    seeds = _seeds(pts, view, ids)
     if start is not None:
         k = start.k.copy()
-        k[0, 2], k[1, 2] = view.centre
-        dist = np.array([start.dist[0], 0, 0, 0, 0], np.float64)
-        seeds.insert(0, Fit("pp_k1", k, dist, start.rvec, start.tvec, ids, 0.0, 0.0))
+        if view.centre_known:
+            k[0, 2], k[1, 2] = view.centre
+        # A fisheye start has no k1 of the polynomial; the ladder starts with k1 = 0.
+        k1 = 0.0 if start.fisheye else start.dist[0]
+        dist = np.array([k1, 0, 0, 0, 0], np.float64)
+        fit = Fit("pp_k1", k, dist, start.rvec, start.tvec, ids, 0.0, 0.0, inset=start.inset)
+        seeds.insert(0, fit)
     best: Fit | None = None
     holdout: dict[int, float] = {}
     why = "no seed solve converged"
@@ -787,13 +888,15 @@ def _solve(
         for i, model in enumerate(LADDER):
             if len(ids) < MIN_TAGS[model] or (i > 0 and spread < MIN_SPREAD_M):
                 break
-            cand = prev = _refine(model, prev, obj, img, ids)
-            reason = _plausible(cand, corners, obj) or _covers(cand, view)
+            if model in HELD_CENTRE and not view.centre_known:
+                continue
+            cand = prev = _refine(model, prev, pts, ids)
+            reason = _plausible(cand, corners, pts.obj) or _covers(cand, view)
             if reason:
                 why = f"{model}: {reason}"
                 continue
             h = _holdout(cand, tags, corners)
-            if best is None or _freer_wins(cand, h, best, holdout):
+            if best is None or _replaces(cand, h, best, holdout, spread):
                 best, holdout = cand, h
         if best is not None:
             break
@@ -843,8 +946,7 @@ def _relocate(
     while True:
         tags = decoded | located
         ids = tuple(sorted(tags))
-        obj, img = _points(tags, ids)
-        new = _refine(fit.model, fit, obj, img, ids, fit.lines)
+        new = _refine(fit.model, fit, _points(tags, ids), ids, fit.lines)
         err = {
             t: float(
                 np.max(np.linalg.norm(new.camera().project(tags[t].obj) - tags[t].img, axis=1))
@@ -926,12 +1028,14 @@ def _ridge(ridge: NDArray[np.float32], uv: F64, nrm: F64, radius: float) -> tupl
 def _line_points(
     fit: Fit, ridge: NDArray[np.float32], box: tuple[float, float, float, float], radius: float
 ) -> tuple[LinePoints, ...]:
-    """For each field line, the strongest ridge within `radius` px of its projection at
-    each sample, kept where it is clearly a ridge (MIN_RIDGE and half the line's median
-    strength); lines with fewer than MIN_LINE_POINTS are left out."""
+    """For each field line not in `fit.dropped`, the strongest ridge within `radius` px of
+    its projection at each sample, kept where it is clearly a ridge (MIN_RIDGE and half the
+    line's median strength); lines with fewer than MIN_LINE_POINTS are left out."""
     cam = fit.camera()
     out: list[LinePoints] = []
     for line in FIELD_LINES:
+        if line.name in fit.dropped:
+            continue
         s, uv, nrm = _curve(cam, line, fit.offset(line.name), box)
         if len(s) < MIN_LINE_POINTS:
             continue
@@ -960,16 +1064,17 @@ def _line_score(
 
 
 def _grid_starts(tags: dict[int, Tag], corners: dict[int, F64], view: View) -> list[Fit]:
-    """`pp_k2` cameras for a grid of (k1, k2), focal length and pose solved from `tags`,
-    that are plausible, cover the panel and fit the tags within GRID_MAX_RMS_PX. Tags in
-    two rows leave focal length and distortion tied; the grid spans that tie."""
+    """`pp_k2` cameras for a grid of (k1, k2), focal length and pose solved from `tags`
+    (principal point held at the best seed's), that are plausible, cover the panel and fit
+    the tags within GRID_MAX_RMS_PX. Tags in two rows leave focal length and distortion
+    tied; the grid spans that tie."""
     ids = tuple(sorted(tags))
-    obj, img = _points(tags, ids)
-    seeds = _seeds(obj, img, view, ids)
+    pts = _points(tags, ids)
+    seeds = _seeds(pts, view, ids)
     if not seeds:
         return []
     seed = seeds[0]
-    cx, cy = view.centre
+    cx, cy = seed.k[0, 2], seed.k[1, 2]
     out: list[Fit] = []
     for k1 in GRID_K1:
         for k2 in GRID_K2:
@@ -977,13 +1082,13 @@ def _grid_starts(tags: dict[int, Tag], corners: dict[int, F64], view: View) -> l
 
             def resid(x: F64, dist: F64 = dist) -> F64:
                 k = np.array([[x[6], 0, cx], [0, x[6], cy], [0, 0, 1]])
-                return (_project(obj, k, dist, x[:3], x[3:6]) - img).reshape(-1)
+                return (_project(pts.obj, "pp_k2", k, dist, x[:3], x[3:6]) - pts.img).reshape(-1)
 
             x0 = np.r_[seed.rvec, seed.tvec, seed.k[0, 0]]
             x = np.asarray(least_squares(resid, x0, method="lm").x, np.float64)
             k = np.array([[x[6], 0, cx], [0, x[6], cy], [0, 0, 1]])
-            fit = _finish("pp_k2", k, dist, x[:3], x[3:6], ids, obj, img)
-            bad = _plausible(fit, corners, obj) or _covers(fit, view)
+            fit = _finish("pp_k2", k, dist, x[:3], x[3:6], ids, pts)
+            bad = _plausible(fit, corners, pts.obj) or _covers(fit, view)
             if bad is None and fit.rms <= GRID_MAX_RMS_PX:
                 out.append(fit)
     return out
@@ -997,14 +1102,27 @@ def _icp(
     rounds: tuple[tuple[float, LensModel], ...],
 ) -> Fit | None:
     """Alternate finding ridge points near the projected lines and refitting tags and lines,
-    over `rounds` of (search band px, model). None when fewer than 2 lines are found."""
+    over `rounds` of (search band px, model). A free-height line whose fit reaches
+    RAIL_AT_BOUND_M is dropped for good and the round refitted without it. None when fewer
+    than 2 lines are left."""
     ids = tuple(sorted(tags))
-    obj, img = _points(tags, ids)
+    pts = _points(tags, ids)
     for radius, model in rounds:
         lines = _line_points(fit, ridge, box, radius)
         if len(lines) < 2:
             return None
-        fit = _refine(model, fit, obj, img, ids, lines)
+        fit = _refine(model, fit, pts, ids, lines)
+        off = {
+            lp.line.name
+            for lp, d in zip(fit.lines, fit.dz, strict=True)
+            if lp.line.free_height and abs(d) >= RAIL_AT_BOUND_M
+        }
+        if off:
+            lines = tuple(lp for lp in lines if lp.line.name not in off)
+            if len(lines) < 2:
+                return None
+            fit = replace(fit, dropped=tuple(sorted({*fit.dropped, *off})))
+            fit = _refine(model, fit, pts, ids, lines)
     return fit
 
 
@@ -1021,6 +1139,10 @@ def _line_path(
     camera exists or the lines are not found."""
     if len(decoded) < MIN_TAGS["pp_k2"]:
         return None
+    if tag_fit is not None and tag_fit.fisheye:
+        # The alternation refits polynomial lenses; start it from the nearest one.
+        ids = tuple(sorted(decoded))
+        tag_fit = _refine("c_k2", tag_fit, _points(decoded, ids), ids)
     starts = _grid_starts(decoded, corners, view) + ([tag_fit] if tag_fit else [])
     if not starts:
         return None
@@ -1034,23 +1156,26 @@ def _line_path(
         fit = _icp(fit, tags, ridge, view.box, LOCATE_ICP_ROUNDS)
     if fit is None:
         return None
-    # Principal point held at the view's expected centre (pp_k2), then free (c_k2), then
-    # k3 too (c_k3, which on the Championship lenses folds inside the panel and is refused).
+    # Principal point held at the view's expected centre (pp_k2, only when that centre is
+    # known), then free (c_k2), then k3 too (c_k3, which on the Championship and CapCity
+    # lenses folds inside the panel and is refused), then the fisheye lens (c_kb3).
     ids = tuple(sorted(tags))
-    obj, img = _points(tags, ids)
-    k = fit.k.copy()
-    k[0, 2], k[1, 2] = view.centre
-    held = _refine("pp_k2", replace(fit, k=k), obj, img, ids, fit.lines)
-    ladder = (held, _refine("c_k2", fit, obj, img, ids, fit.lines), fit)
+    pts = _points(tags, ids)
+    free = _refine("c_k2", fit, pts, ids, fit.lines)
+    ladder = [free, fit, _refine("c_kb3", free, pts, ids, fit.lines)]
+    if view.centre_known:
+        k = fit.k.copy()
+        k[0, 2], k[1, 2] = view.centre
+        ladder.insert(0, _refine("pp_k2", replace(fit, k=k), pts, ids, fit.lines))
     spread = _spread(list(ids), corners)
-    reasons = {c.model: _plausible(c, corners, obj) or _covers(c, view) for c in ladder}
+    reasons = {c.model: _plausible(c, corners, pts.obj) or _covers(c, view) for c in ladder}
     good = [(c, _holdout(c, tags, corners)) for c in ladder if reasons[c.model] is None]
     if not good:
         why = "; ".join(f"{m} with field lines: {r}" for m, r in reasons.items())
         return ViewResult(None, {}, spread, [why], tags, [])
     best, holdout = good[0]
     for cand, h in good[1:]:
-        if _freer_wins(cand, h, best, holdout):
+        if _replaces(cand, h, best, holdout, spread):
             best, holdout = cand, h
     return ViewResult(best, holdout, spread, _problems(best, holdout, spread), tags, [])
 
@@ -1071,6 +1196,7 @@ def _to_schema(
         model=fit.model,
         tags=[t for t in fit.tags if t in tags and not tags[t].located],
         located=[t for t in fit.tags if t in tags and tags[t].located],
+        corner_inset_px=[round(v, 3) for v in fit.inset],
         lines={
             lp.line.name: LineFit(
                 n_points=len(e),
@@ -1219,26 +1345,32 @@ def _report(name: ViewName, res: ViewResult) -> str:
     n, rms, inl = f.line_stats()
     lines = (
         f"lines {[lp.line.name for lp in f.lines]} ({n} points, rms {rms:.2f} px, {inl:.0%} "
-        f"within {LINE_INLIER_PX:g} px)\n"
+        f"within {LINE_INLIER_PX:g} px; dropped {list(f.dropped)})\n"
         if f.lines
         else "no field lines\n"
     )
+    terms = FISHEYE_TERMS if f.fisheye else POLY_TERMS
+    lens = ", ".join(f"{n} {v:.4f}" for n, v in zip(terms, f.dist, strict=True) if v != 0.0)
     status = "ok" if not res.problems else "REJECTED (" + "; ".join(res.problems) + ")"
     return (
         f"{name}: {status}\n  model {f.model}, tags {list(f.tags)} (located {located}), "
         f"spread {res.spread:.1f} m, rms {f.rms:.2f} px, max {f.max:.2f} px, f {f.k[0, 0]:.0f}, "
-        f"c ({f.k[0, 2]:.0f}, {f.k[1, 2]:.0f}), k1 {f.dist[0]:.4f}, k2 {f.dist[1]:.4f}\n  {lines}"
+        f"c ({f.k[0, 2]:.0f}, {f.k[1, 2]:.0f}), {lens}, corner inset ({f.inset[0]:.2f}, "
+        f"{f.inset[1]:.2f}) px\n  {lines}"
         f"  camera ({c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f}) m; held-out error m {held}; "
         f"suspect tags {res.suspect}"
     )
 
 
 def _pick(tags_only: ViewResult, lined: ViewResult) -> ViewResult:
-    """Of the two main-view results, one that passes every gate, the lower capped mean
-    held-out error first; with neither passing, the one with fewer problems, lines first."""
+    """Of the two main-view results, the first that passes every gate, lines first; with
+    neither passing, the one with fewer problems, lines first. Held-out error is measured
+    only at tags, so it cannot compare the two: the lines pin the untagged near edge, where
+    a tags-only fit that wins at the tags can be wrong (on CapCity a tags-only lens with the
+    lower held-out error disagreed with the other matches' lenses by 10 px there)."""
     ok = [r for r in (lined, tags_only) if r.fit is not None and not r.problems]
     if ok:
-        return min(ok, key=lambda r: _mean(r.holdout))
+        return ok[0]
     fitted = [r for r in (lined, tags_only) if r.fit is not None]
     return min(fitted, key=lambda r: len(r.problems)) if fitted else lined
 
