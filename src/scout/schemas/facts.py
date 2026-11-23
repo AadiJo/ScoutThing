@@ -441,26 +441,45 @@ class StopFact(_Fact):
 
 # --- trips out ------------------------------------------------------------------
 
+TripEnd = Literal["home", "track_lost", "hub_went_inactive", "match_end"]
+
 
 class TripData(_Model):
     left: Seen
-    """Last tracked position in its own zone before leaving."""
+    """Last tracked position before the trip: in its own zone, or outside it when the trip
+    follows a gap long enough for it to have gone home and come back (`start_gap`)."""
     left_unseen_s: float
     """Untracked time between `left` and the first position outside. 0: seen leaving, and the
     trip starts at `left`. Above 0: when it left is not known (a lost track or a lost label
     looks the same), and the trip starts at the first position seen outside."""
+    start_gap: str | None
+    """The gap fact before the trip when it follows an untracked stretch outside its zone long
+    enough to go home and back (HOME_RUN_MPS, HOME_STAY_S) with nothing placing it out: the
+    trip before ended at that gap (`track_lost`), since it may have been home in it."""
     own_active_left_s: float
     """Own-active time remaining at the trip's start."""
     back: Seen | None
     """First tracked position back in its own zone, if before its own-active time ended."""
     home: Arrival | None
     """When it got home (see `Arrival`; earlier than `back` when a crossing or a gap's
-    inference shows it crossing home before it was tracked there). The trip ends here."""
+    inference shows it crossing home before it was tracked there). The trip ends here, unless
+    `home.by` is `after_gap`: then it ends where it was last tracked out (`track_lost`) and
+    `home.t` only bounds when it got there."""
+    end: TripEnd
+    """What ended the trip. `home`: `home.t`, seen or estimated. `track_lost`: the last
+    position tracked outside its zone before a gap with nothing placing it out (no
+    `inference`, or the gap runs to the match end), a gap ending in its own zone with no
+    crossing or inference to time it (`home.by` `after_gap`), or a gap long enough to go home
+    and back (`start_gap` of the next trip): it was not seen home, and the unseen time is not
+    counted as time out. `hub_went_inactive` / `match_end`: tracked (or placed by a gap's
+    `stayed_in_place`) outside its zone when its own-active time ended or the match ended."""
+    end_gap: str | None
+    """With `track_lost`: the gap fact that begins at the trip's end."""
     at_active_end: Seen | None
     """When not back before its own-active time ended: the tracked position nearest that
     moment (within 1 s), else None."""
     duration_s: float
-    """From the trip's start to `home.t`, or to the end of its own-active time."""
+    """From the trip's start to its end (`end`)."""
     unseen_s: float
     """Untracked time inside `duration_s`."""
     furthest: Seen
@@ -694,7 +713,7 @@ FactKind = Literal[
 class Facts(StageFile):
     """All facts for one team, sorted by `t_start`, plus match-wide coverage."""
 
-    schema_version: Literal[6] = 6
+    schema_version: Literal[7] = 7
     team: int
     alliance: Alliance
     clock_rate: float

@@ -1,4 +1,4 @@
-Rubric version: draft-7
+Rubric version: draft-8
 
 # The three skills and the scale
 
@@ -48,6 +48,9 @@ The tiles span only the part of the trip from which a heaped hopper could still 
   `opponent_on_target` episode already covers, less the time to get home from where it was
   (1.2 s plus half a second per metre outside its zone, at least 3 s), less 3 s more for the
   doubt in one hopper reading. `not_heaped` and `cannot_see`: not charged.
+- A trip's end is when it got home, or, when it was not seen home, where it was last tracked
+  out (unseen time is never charged). A robot tracked out until its hub went off or the match
+  ended is charged to then.
 
 Charged seconds T = charged barrier lines + heaped trips as above.
 - 9-10: T at most 0.5 s.

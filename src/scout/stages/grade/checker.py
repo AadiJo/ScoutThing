@@ -23,7 +23,15 @@ from scout.games.rebuilt2026 import (
 )
 from scout.run import RunDir
 from scout.schemas.common import Alliance
-from scout.schemas.facts import ContactFact, CrossingTurnedBackFact, Fact, Facts, GapFact, StopFact
+from scout.schemas.facts import (
+    ContactFact,
+    CrossingTurnedBackFact,
+    Fact,
+    Facts,
+    GapFact,
+    StopFact,
+    TripFact,
+)
 from scout.schemas.grade import (
     Coverage,
     DefenseEpisode,
@@ -35,7 +43,7 @@ from scout.schemas.grade import (
 from scout.schemas.match import MatchInfo
 from scout.stages.grade.base import fmt, overlap, union_s
 from scout.stages.grade.clock import clock, relation
-from scout.stages.grade.ledgers import Ledgers, ledgers, stalled
+from scout.stages.grade.ledgers import STALL_MPS, Ledgers, ledgers, stalled
 from scout.stages.grade.scores import coverage, episode_span
 from scout.stages.grade.tracks import Target, load_tracks
 
@@ -119,6 +127,33 @@ LOST_WORD = re.compile(
 )
 """Words reading a stop as lost time: refused over a stop in its own zone in its own active
 time, where a robot shoots (the rubric does not charge it)."""
+CHARGE_WORD = re.compile(r"\b(charges?|charged|charging|costs?|costed|costing)\b", re.I)
+NONE_WORD = re.compile(r"\b(nothing|none|zero|no|neither|nor)\b", re.IGNORECASE)
+"""A skill summary that says something was charged or cost (without "no", "nothing", ...)
+needs that skill to have charged seconds."""
+DOUBT_WORD = re.compile(
+    r"\b(?:true|real|actual) score\b|\bscore (?:may|might|could)\b|\b(?:may|might|could) be "
+    r"(?:too )?(?:high|low)(?:er)?\b",
+    re.IGNORECASE,
+)
+"""A summary doubting its score: only where code flags the score as low coverage."""
+START_WORD = re.compile(
+    r"\b(?:start(?:ed|s)?|began|begins) (?:auto )?(?:in|at|on|near|by|from|behind|beside|"
+    r"under|out|inside|outside)\b|\bstart(?:ing)? (?:position|spot|point|place)\b",
+    re.IGNORECASE,
+)
+"""Where the robot started auto: known only when it was tracked from auto's first moment."""
+NOT_HOME_WORD = re.compile(
+    r"\b(?:not|never) (?:seen |tracked )?(?:getting |got |get |gets |back )?(?:back )?"
+    r"(?:home|in(?:to)? its (?:own )?zone)\b|\bstill out\b|\bstranded\b|\b(?:finished|ended) "
+    r"(?:the match )?(?:out|outside)\b",
+    re.IGNORECASE,
+)
+LOST_TRACK_WORD = re.compile(
+    r"\b(?:tracking lost|lost (?:track|by tracking)|untracked|last (?:seen|tracked))\b", re.I
+)
+"""Over a trip that ended where tracking lost it (`end` `track_lost`), a sentence saying it did
+not get home or stayed out must say that tracking lost it: it was not seen staying out."""
 PLACE_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bcent(?:re|er)[ -]?line\b|\bmidfield\b", re.I), "centre line"),
     (re.compile(r"\bred (?:hub|bump|ramp|trench)", re.I), "red barrier"),
@@ -425,7 +460,10 @@ class Checker:
         """No claim beyond what was seen: absence and count claims over time with untracked
         stretches say "seen" or "tracked" (and need half of it tracked); a quoted stop or hold
         that was partly inferred quotes its inferred part too; "stall" needs the robot measured
-        stopped (`ledgers.stalled`); a stop at home in its own active time is not lost time."""
+        stopped (`ledgers.stalled`), and "not a stall" over an attempt that slowed to STALL_MPS
+        or less is refused too (a short stall hides in that speed); a trip that ended where
+        tracking lost it is not said to have stayed out or missed getting home without saying
+        tracking lost it; a stop at home in its own active time is not lost time."""
         at = item.at
         cited = [f for c in item.cites if (f := self.by_id.get(c)) is not None]
         scope = item.scope if item.scope is not None else self.spans_of(item.cites)
@@ -474,21 +512,38 @@ class Checker:
                 )
         bare = REF.sub(" ", text)
         turned = [f for f in cited if isinstance(f, CrossingTurnedBackFact)]
-        m = STALL_WORD.search(bare)
-        if (
-            m is not None
-            and not NEGATED.search(bare[: m.start()])
-            and turned
-            and not any(isinstance(f, StopFact) for f in cited)
-            and not any(
-                stalled(f.data, self.ctx.facts.thresholds.get("STOP_MPS", 0.3)) for f in turned
-            )
-        ):
-            self.bad(
-                f"{at}: {m.group(0)!r}, but {', '.join(f.id for f in turned)} was never measured "
-                f"stopped on the band; say what fired, e.g. slowed to "
-                f"{{{turned[0].id}.slowest_mps}} m/s, or that it turned away"
-            )
+        stop_mps = self.ctx.facts.thresholds.get("STOP_MPS", 0.3)
+        unmeasured = [f for f in turned if not stalled(f.data, stop_mps)]
+        for m in STALL_WORD.finditer(bare):
+            if not unmeasured or any(isinstance(f, StopFact) for f in cited):
+                break
+            if not NEGATED.search(bare[: m.start()]):
+                if len(unmeasured) == len(turned):
+                    self.bad(
+                        f"{at}: {m.group(0)!r}, but {', '.join(f.id for f in turned)} was never "
+                        f"measured stopped on the band; say what fired, e.g. slowed to "
+                        f"{{{turned[0].id}.slowest_mps}} m/s, or that it turned away"
+                    )
+                    break
+                continue
+            slow = [f for f in unmeasured if (f.data.slowest_mps or 0.0) <= STALL_MPS]
+            if slow:
+                self.bad(
+                    f"{at}: it denies a stall ({m.group(0)!r}) over {slow[0].id}, which slowed "
+                    f"to {{{slow[0].id}.slowest_mps}} m/s on the band: a short stall hides in "
+                    "that speed. Say what was measured: slowed to that speed, not measured "
+                    "stopped"
+                )
+                break
+        lost = [f for f in cited if isinstance(f, TripFact) and f.data.end == "track_lost"]
+        for sentence in SENTENCE.split(bare) if lost else []:
+            if (m := NOT_HOME_WORD.search(sentence)) and not LOST_TRACK_WORD.search(sentence):
+                self.bad(
+                    f"{at}: {m.group(0)!r}, but {lost[0].id} ended where tracking lost it "
+                    f"outside its zone ({lost[0].data.end_gap}): it was not seen staying out "
+                    "either. Say where it was last tracked and that tracking lost it there"
+                )
+                break
         home = [
             f
             for f in cited

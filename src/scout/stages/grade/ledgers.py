@@ -273,13 +273,14 @@ def stalled(d: CrossingTurnedBackData, stop_mps: float) -> bool:
 def _turned_back_default(d: CrossingTurnedBackData, stop_mps: float) -> tuple[Ruling, str]:
     """A turned-back attempt is charged when it slowed on the band or went well back from the
     barrier afterwards; a drive past keeps its pace and stays close. The reason names the
-    measure that fired, and calls it a stall only when the robot was measured stopped."""
+    measure that fired, and calls it a stall only when the robot was measured stopped; it never
+    denies a stall, which a slow speed read over a second can hide."""
     slow, far = d.slowest_mps, d.furthest_from_barrier_m
     kind = (
         f"stopped {fmt(d.stopped_s)} s on the band: a stall"
         if stalled(d, stop_mps)
-        else f"never under {stop_mps:g} m/s there and stopped {fmt(d.stopped_s)} s: a slow "
-        "turn-away, not a stall"
+        else f"not measured stopped (never under {stop_mps:g} m/s there, stopped "
+        f"{fmt(d.stopped_s)} s)"
     )
     if slow is None or slow <= STALL_MPS:
         what = (
@@ -291,7 +292,7 @@ def _turned_back_default(d: CrossingTurnedBackData, stop_mps: float) -> tuple[Ru
     if far is not None and far >= BACKED_OFF_M:
         return "charged", (
             f"went {fmt(far)} m back from the barrier (charged at {BACKED_OFF_M:g} m or more), "
-            f"slowest {fmt(slow)} m/s: a back-off or turn-away, not a stall"
+            f"slowest {fmt(slow)} m/s: a back-off or turn-away, not measured stopped"
         )
     return "cleared", (
         f"drive past: slowest {fmt(slow)} m/s (over {STALL_MPS:g}) and at most "
@@ -520,13 +521,22 @@ def ledgers(facts: Facts, match: MatchInfo, target: Target, others: Others) -> L
             continue
         d = f.data
         past = d.past_centre_line_m
+        ending = {
+            "home": "then back home",
+            "track_lost": f"then tracking lost it outside its zone ({d.end_gap}): not seen home "
+            "and not seen staying out, so the trip ends where it was last seen out",
+            "hub_went_inactive": "still tracked out when its active time ended",
+            "match_end": "still tracked out when the match ended",
+        }[d.end]
         text = (
             f"out of its own zone in its own active time {fmt(d.duration_s)} s "
-            f"({fmt(d.unseen_s)} s unseen), furthest {fmt(abs(past))} m "
-            f"{'past' if past >= 0 else 'short of'} the centre line, "
-            + ("then back home" if d.back is not None else "not back before its active time ended")
+            f"({fmt(d.unseen_s)} s unseen)"
+            + (f", from the end of {d.start_gap} (long enough to have gone home)"
+               if d.start_gap else "")
+            + f", furthest {fmt(abs(past))} m {'past' if past >= 0 else 'short of'} the centre "
+            f"line, {ending}"
             + (f"; stops out: {', '.join(d.stop_ids)}" if d.stop_ids else "")
-        )
+        )  # fmt: skip
         raw.append(
             _Raw(f.t_start, f.t_end, "loaded_trip", [f.id], d.duration_s, d.unseen_s, text,
                  "cleared", "no hopper reading yet", look=look)
