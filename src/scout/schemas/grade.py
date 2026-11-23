@@ -1,16 +1,18 @@
 """`grade.json`, written by the grade stage: absolute 1-10 driving scores with evidence.
 
 Before the grader runs, code builds two ledgers from facts.json: the driving ledger (every
-turned-back crossing, stop or stay on a barrier and slow crossing in teleop, with the seconds
-it cost) and the readiness ledger (every real hub activation, with how late the target was).
-It also lists the defense items: every teleop contact with a robot not known to be a partner,
-and every gap or inferred stop in the target's own active time with such a robot near.
+turned-back attempt toward home, stop or stay on a barrier, slow crossing and trip out of its
+own zone in its own active time, with the active seconds it could cost) and the readiness
+ledger (every real hub activation, with how late the target was). It also lists the defense
+items: every teleop contact with a robot not known to be a partner, and every gap or inferred
+stop in the target's own active time with such a robot near.
 
 A coding agent writes `GradeAnswer` (its JSON schema is handed to `claude --json-schema`):
-one call per ledger line (charged or not, and why), defense episodes that account for every
-defense item, the three scores, notes and an auto report. The stage checks it, computes each
-skill's band from the calls and episodes (the score must sit inside it), resolves the
-`{...}` references in the text, and wraps it into `Grade`.
+one call per ledger line (charged or not, and why; a hopper reading for each trip), defense
+episodes that account for every defense item, the three scores, notes and an auto report. The
+stage checks it, computes each line's charged seconds and each episode's cost, and from them
+each skill's band (the score must sit inside it), resolves the `{...}` references in the text,
+and wraps it into `Grade`.
 
 Citations (`cites`) are fact ids from facts.json (`stop-03`) or `frame:<video seconds>`
 for a moment the frame tool really served (`frame:92.8`). Free text may not contain numbers:
@@ -36,6 +38,9 @@ Cites = list[str]
 Text = str
 """Free text: no digits except shift numbers and team numbers the grader may name; every
 number comes from a `{...}` reference to a fact field, a ledger field or a served frame."""
+View = Literal["target", "full", "corner_left", "corner_right"]
+"""Frame tool views: a crop of the main camera around the target, the whole main camera, or
+one of the two uncalibrated corner camera panels (no ring, no boxes)."""
 
 
 class _Model(BaseModel):
@@ -44,28 +49,35 @@ class _Model(BaseModel):
 
 # --- ledgers (computed by code) ---------------------------------------------------------
 
-DrivingKind = Literal["turned_back", "barrier_stop", "barrier_stay", "slow_crossing"]
+DrivingKind = Literal["turned_back", "barrier_stop", "barrier_stay", "slow_crossing", "loaded_trip"]
 
 
 class DrivingLine(_Model):
-    """One moment the driving rubric may charge, from the facts."""
+    """One stretch the driving rubric may charge, from the facts."""
 
     id: str
     """`D1`, `D2`, ... in time order."""
     kind: DrivingKind
     facts: list[str]
-    """The fact behind the line first, then facts folded into it (a stop on the barrier
-    during a turned-back crossing)."""
+    """The fact behind the line first, then facts folded into it (a stop during a turned-back
+    attempt)."""
     t_start: float
     t_end: float
     phase: str | None
-    own_hub_active: bool | None
     lost_s: float
-    """Seconds the rubric charges if the line is charged: `seconds_to_across` of a turned-back
-    crossing (its time on the barrier when it never got across), the stop or stay's duration,
-    or a slow crossing's time on the barrier."""
+    """Barrier lines: seconds of its own active time the line costs when charged (a
+    turned-back attempt's `own_active_s`, a stop's `own_active_s`, the active part of a stay's
+    or slow crossing's `excess_s`). `loaded_trip`: the trip's seconds out of its own zone in
+    its own active time, the most it could cost."""
+    bound: bool
+    """True when `lost_s` is an upper bound: the arrival home was first seen after a gap."""
     unseen_s: float
     """Part of the line's time inferred across tracking gaps."""
+    corner_reach: bool
+    """A turned-back attempt where only a corner of the robot could have touched the
+    barrier: it may be a curving drive past it with no stall."""
+    look_at: list[float]
+    """`loaded_trip` only: the tile times at which to read the hopper (served at zoom 2)."""
     opponent_contacts: list[str]
     """Contact facts in the line's span with an opponent or unlabelled robot."""
     partner_contacts: list[str]
@@ -100,19 +112,33 @@ class DefenseItem(_Model):
     t_start: float
     t_end: float
     home_active: bool
-    """The target was in its own zone during its own active time: being pressed there is
-    playing through, so an episode made only of such items costs 0 s."""
+    """The target was in its own zone during its own active time: an opponent pressing it
+    there costs only its pin time (`pin_s`), never route time."""
+    pin_s: float
+    """Seconds the target was nearly still in this item (inferred still time counted half);
+    an episode's pin cost is its items' sum beyond the rubric's allowance."""
     text: str
 
 
 # --- the agent's answer -----------------------------------------------------------------
 
-Call = Literal["charged", "opponent", "hub_inactive", "partner", "frame_contradicts", "uncertain"]
-"""`charged`: self-inflicted. `opponent`: an opponent held it (needs an overlapping
-`opponent_on_target` episode). `hub_inactive`: staging while its hub was off (driving only,
-needs `own_hub_active` false). `partner`: its own partner was in the way (driving only, needs a
-frame). `frame_contradicts`: a frame shows the facts' shape is wrong (needs a frame in the
-line's span). `uncertain`: the evidence cannot decide; counts half."""
+Call = Literal[
+    "charged",
+    "opponent",
+    "partner",
+    "frame_contradicts",
+    "uncertain",
+    "heaped",
+    "not_heaped",
+    "cannot_see",
+]
+"""Barrier and readiness lines: `charged` (self-inflicted), `opponent` (an opponent held it;
+needs an overlapping `opponent_on_target` episode), `partner` (its own partner was in the way;
+barrier lines only, needs a tile and a partner contact), `frame_contradicts` (a tile shows the
+facts' shape is wrong), `uncertain` (the evidence cannot decide; counts half).
+`loaded_trip` lines: `heaped` (a tile shows a heaped hopper; `heaped_at` says from when),
+`not_heaped` (empty or part full on the trip's late tiles), `cannot_see` (the hopper cannot
+be read on any tile), or `frame_contradicts`."""
 
 
 class LineCall(_Model):
@@ -123,17 +149,27 @@ class LineCall(_Model):
     charged_s: float | None = Field(
         default=None,
         ge=0.0,
-        description="Driving lines only: seconds charged when less than lost_s (a frame in "
-        "the line's span must show why). Null charges lost_s.",
+        description="Barrier lines whose lost_s is an upper bound only: the seconds from the "
+        "line's start to a cited tile that shows the target home, when that is earlier. Null "
+        "charges lost_s.",
+    )
+    heaped_at: float | None = Field(
+        default=None,
+        description="heaped only: video time of the earliest cited tile in the trip where the "
+        "hopper is heaped.",
+    )
+    corner_bumper: int | None = Field(
+        default=None,
+        description="Required when the call cites a corner camera tile: the target's bumper "
+        "number as you read it there.",
     )
     text: Text = Field(description="One sentence: what the evidence shows.")
     cites: Cites
 
 
-Verdict = Literal[
-    "opponent_on_target", "target_on_opponent", "partner", "pass_no_holdup", "could_not_tell"
-]
+Verdict = Literal["opponent_on_target", "target_on_opponent", "partner", "apart", "could_not_tell"]
 IdentifiedBy = Literal["track_label", "bumper_number", "bumper_red", "bumper_blue", "none"]
+WhileHeld = Literal["not_shooting", "shooting", "cannot_see"]
 
 
 class DefenseEpisode(_Model):
@@ -149,8 +185,14 @@ class DefenseEpisode(_Model):
     )
     cost_s: float = Field(
         ge=0.0,
-        description="opponent_on_target only: seconds the opponent cost the target (0 when "
-        "it kept shooting or kept its route). 0 for every other verdict.",
+        description="opponent_on_target only: seconds the opponent cost it in getting home or "
+        "onto its route (0 when it kept its route, and 0 when home in its own active time). "
+        "Pin time is computed by code from pin_s and while_held. 0 for every other verdict.",
+    )
+    while_held: WhileHeld | None = Field(
+        default=None,
+        description="opponent_on_target with pin_s in its items: what the tiles across the "
+        "still stretch show. Null otherwise.",
     )
     text: Text
     cites: Cites = Field(min_length=1)
@@ -217,6 +259,22 @@ class ScoredSkill(SkillGrade):
     score must be null."""
 
 
+class ScoredCall(LineCall):
+    """A line call in grade.json, with the seconds code charged for it."""
+
+    charged_total_s: float
+    """Seconds this call adds to the driving total or is the readiness lateness."""
+
+
+class ScoredEpisode(DefenseEpisode):
+    """An episode in grade.json, with its cost as code computed it."""
+
+    pin_cost_s: float
+    """Its items' `pin_s` beyond the allowance, scaled by `while_held`."""
+    total_cost_s: float
+    """The larger of `cost_s` and `pin_cost_s`: what the defense score counts."""
+
+
 class Note(AgentNote):
     """A note in grade.json: the agent's note with its references resolved, plus the match
     clock the stage computed."""
@@ -231,6 +289,8 @@ class TileRecord(_Model):
 
     t: float
     """Video seconds, as the agent may cite it."""
+    tracked: bool
+    """The target was tracked at this moment and ringed (main-camera tiles only)."""
     teams_marked: list[int]
     """Labelled teams the tool boxed on this tile."""
     teams_near: list[int]
@@ -244,7 +304,7 @@ class FrameSheet(_Model):
 
     image: str
     """Path relative to the run folder."""
-    view: Literal["target", "full"]
+    view: View
     zoom: int
     tiles: list[TileRecord]
 
@@ -279,15 +339,15 @@ class Grade(StageFile):
     """The grade for the target team. Auto is reported but not scored. Text fields have
     their `{...}` references resolved."""
 
-    schema_version: Literal[3] = 3
+    schema_version: Literal[4] = 4
     team: int
     rubric_version: str
     skills: list[ScoredSkill]
     driving_ledger: list[DrivingLine]
     readiness_ledger: list[ReadinessLine]
     defense_items: list[DefenseItem]
-    line_calls: list[LineCall]
-    episodes: list[DefenseEpisode]
+    line_calls: list[ScoredCall]
+    episodes: list[ScoredEpisode]
     notes: list[Note]
     auto: AutoReport
     run: RunRecord

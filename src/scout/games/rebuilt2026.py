@@ -12,6 +12,7 @@ The match stage maps it to video seconds using the measured auto and teleop star
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -132,6 +133,39 @@ def barrier_at(x: float, y: float, margin_m: float) -> tuple[Alliance, Lane] | N
             lane: Lane = "bump" if BUMPS[0].y0 <= y <= BUMPS[1].y1 else "trench"
             return alliance, lane
     return None
+
+
+ROBOT_HALF_DIAGONAL_M = ROBOT_FOOTPRINT_M / 2 * 2**0.5
+"""Furthest a corner of the square footprint can be from the robot's centre (0.672 m)."""
+
+
+def lane_at(y: float) -> Lane | None:
+    """The lane a robot at field y would cross a barrier by; None beside a hub face."""
+    hub = HUBS["blue"]
+    if hub.y0 < y < hub.y1:
+        return None
+    return "bump" if BUMPS[0].y0 <= y <= BUMPS[1].y1 else "trench"
+
+
+def barrier_edge_m(x: float, alliance: Alliance) -> float:
+    """Distance along x from field x to the bumps' depth of `alliance`'s barrier; 0 inside."""
+    x0, x1 = BARRIER_X[alliance]
+    return max(0.0, x0 - x, x - x1)
+
+
+def rect_distance_m(r: Rect, x: float, y: float) -> float:
+    """Distance from field point (x, y) to the nearest point of `r`; 0 inside."""
+    return math.hypot(max(0.0, r.x0 - x, x - r.x1), max(0.0, r.y0 - y, y - r.y1))
+
+
+def own_wall_m(x: float, alliance: Alliance) -> float:
+    """Distance from field x to `alliance`'s own driver-station wall."""
+    return x if alliance == "blue" else FIELD_LENGTH_M - x
+
+
+def guardrail_m(y: float) -> float:
+    """Distance from field y to the nearer side guardrail."""
+    return min(y, FIELD_WIDTH_M - y)
 
 
 # --- match timing -------------------------------------------------------------

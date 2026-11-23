@@ -9,10 +9,12 @@ Phases in video seconds, with the hubs active in each:
 {{phases}}
 
 The target's own hub is active in: {{own_active}}
+The corner camera panel showing its own end: {{home_view}}
 
 # Driving ledger
 
-One call per line. `lost_s` is what a charged line costs.
+One call per line. A barrier line's `lost_s` is what it costs when charged; a `loaded_trip`
+line is costed from its hopper tiles (see the rubric).
 
 {{driving_ledger}}
 

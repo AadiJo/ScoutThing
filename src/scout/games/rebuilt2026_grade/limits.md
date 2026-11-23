@@ -10,17 +10,24 @@ The facts were computed by plain code from robot tracks. Read these limits befor
   seen: a pointer to a frame worth opening, not a contact.
 - A `stop` with `unseen_s` above 0 is partly INFERRED: the robot was at nearly the same place
   before and after a gap. Never describe that part as seen. A tile can confirm it or show it
-  wrong. `start` / `end` say whether the stop's edges were seen.
-- A `crossing_turned_back` is a SHAPE: onto a bump or trench and back out the same side, then
-  `seconds_to_across` until it got across some other way (null: not within 8 s). Staging while
-  its hub is off and being pinned make the same shape as a stall. Several tries can be folded
-  into one fact, which overstates `seconds_to_across`; a tile can show that.
-- A `left_own_zone_while_active` trip is a SHAPE too. A trip to get more fuel looks exactly
-  like a wasted trip; the facts cannot tell them apart. Describe where it went, how long it
-  took and, if a tile shows the hopper, what the tile shows. Never call the trip itself good,
-  wasted, a reload or a feed.
+  wrong. `start` / `end` say whether the stop's edges were seen. Say where a stop or contact
+  was from its `where` distances (`own_hub_m`, `own_wall_m`, `guardrail_m`), not from its zone.
+- A `crossing_turned_back` is one attempt: onto (or against) a bump or trench and back out the
+  same side. `cost_s` runs from entering the barrier until `cost_end` (it reached the far side,
+  tried again, its hub went inactive, tracking lost it); `own_active_s` is the part in its own
+  active time. With `far_side_after_gap` the arrival was first seen after a gap, so the cost is
+  an upper bound. `reach` `corner` means only a corner of the robot could have touched: it may
+  have curved over the ramp corner and crossed in one pass with nothing wrong, or it may have
+  nosed in and turned away. Being pinned and a stall make the same shape; a tile tells them
+  apart.
+- A stall whose centre sits just inside its own zone at the end of its own ramp is recorded by
+  the turned-back fact, not by a stop.
+- A `left_own_zone_while_active` trip is a SHAPE. Positions cannot see fuel: a trip out with an
+  empty hopper (to get more) and a trip with a heaped hopper (that should have gone home) look
+  the same. The hopper tiles decide it. Never call the trip a reload, a feed or a waste; say
+  what the tiles show.
 - `zone_visit` with zone `on_barrier`: part of the robot was over a bump or trench for at
-  least 2.5 s.
+  least 2.5 s; `excess_s` is the time beyond a normal 1.2 s crossing.
 - All speeds are real (broadcast clock rate already corrected).
 
 ## The other robots
@@ -32,17 +39,23 @@ The facts were computed by plain code from robot tracks. Read these limits befor
   detector's guess and can be wrong. An unlabelled robot may be a partner or an opponent.
 - A `contact` says who was moving toward whom (`target_closing_mps`, `other_closing_mps`),
   never who was defending: a robot driving its own route into a waiting robot also closes. The
-  target may be the one blocking.
+  target may be the one blocking. `still_s` is how long the target was nearly still in it
+  (`still_unseen_s` of that inferred across gaps): held, or holding itself, positions cannot
+  say which.
 - A contact `end` of `unknown_other_track_lost` or `unknown_target_track_lost` means tracking
   stopped. It does NOT mean anyone left or got free.
 - On a tile, a robot with no box was not tracked: no fact knows about it. Black or very dark
   bumpers are not a colour reading; do not call such a robot a partner or an opponent from its
   colour.
 
-## What positions cannot show
-- Fuel, shots, whether a shot went in, or points. A tile can show a heaped or empty hopper or
-  balls leaving; say so and cite it. Never claim fuel or shots without a tile.
+## What tiles can and cannot show
+- At zoom 2 a heaped hopper (yellow balls piled above the rim) reads apart from an empty or part
+  full one on about four tiles in five; behind the hub, behind a referee or at the far side it
+  often cannot be read. Say `cannot_see` then, do not guess.
+- Fuel, shots and points never come from positions. A tile can show a heaped or empty hopper or
+  balls leaving; say so and cite it.
+- The corner camera panels are not calibrated: nothing is ringed or boxed there. A robot there
+  is the target only where you read its bumper number.
 - Purpose. "Reloading", "collecting", "feeding", "waiting", "trying to" are guesses about why;
   the checker rejects them. Say where it went and what a tile shows.
-- Defense on a moving target inside a gap, or a robot that only pokes its front onto a ramp.
 - Auto is the robot's code, not the driver: report it, do not score it.

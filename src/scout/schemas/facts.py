@@ -29,10 +29,17 @@ Barrier = Literal["blue", "red"]
 """Which hub's line of bumps and trenches: the one between that alliance's zone and the
 neutral zone."""
 Place = Zone | Literal["on_barrier"]
-"""A zone, or `on_barrier`: part of the robot over a bump or trench (centre within half a
-robot of the bumps' depth) for a stay of at least PERCH_MIN_S."""
+"""A zone, or `on_barrier`: on the barrier band (see `Facts.notes`) for a stay of at least
+PERCH_MIN_S. A centre inside the own zone is never on a barrier."""
 BumperColor = Literal["red", "blue", "unknown"]
 Relation = Literal["partner", "opponent", "unknown"]
+Reach = Literal["centre", "footprint", "corner"]
+"""How close the robot centre came to a barrier's bumps or trench (depth, along x): `centre`
+within BAND_MARGIN_M (the centre was on it, to position accuracy); `footprint` within half a
+robot (PERCH_M), so part of the robot was over it whatever its heading; `corner` within half
+the robot's diagonal (CORNER_M), so only a corner could have been, and only if the robot was
+turned; such a pass counts only when the robot was driving toward the bumps (HEADING_MPS).
+Tracks carry no heading, and positions are about 0.2 m accurate."""
 
 
 class _Model(BaseModel):
@@ -46,6 +53,24 @@ class Seen(_Model):
     x: float
     y: float
     zone: Zone
+
+
+class Where(_Model):
+    """A place in plain measures, from the robot centre: say where it was from these, not
+    from the zone name alone."""
+
+    x: float
+    y: float
+    zone: Zone
+    """Zone of the centre itself (no hysteresis)."""
+    into_own_zone_m: float
+    """Signed distance of the centre past its own zone line (negative: outside it)."""
+    own_hub_m: float
+    """Centre to the nearest point of its own hub's base."""
+    own_wall_m: float
+    """Centre to its own alliance (driver-station) wall."""
+    guardrail_m: float
+    """Centre to the nearer side guardrail."""
 
 
 class Coverage(_Model):
@@ -172,12 +197,17 @@ class ZoneVisitData(_Model):
     went_to: Place | Literal["untracked", "match_end"]
     path_length_m: float
     mean_speed_mps: float | None
+    excess_s: float | None
+    """Set when `zone` is `on_barrier`: `duration_s` beyond NORMAL_CROSSING_S, the slowest
+    normal pass across the band (0 when within it)."""
+    own_active_s: float
+    """Part of the visit in teleop time with the target's own hub active."""
 
 
 class ZoneVisitFact(_Fact):
     """One stay in one zone, or on a barrier, with jitter across the zone line merged
     (ZONE_HYST_M). Barrier stays shorter than PERCH_MIN_S count toward the zone the centre
-    was in; crossings cover them."""
+    was in (a crossing covers them)."""
 
     kind: Literal["zone_visit"] = "zone_visit"
     data: ZoneVisitData
@@ -219,11 +249,16 @@ class CrossingData(_Model):
     mean_speed_mps: float | None
     measured_s: float
     """Part of `observed_s` backed by detector boxes; the rest is interpolated."""
+    excess_s: float
+    """`time_on_barrier_s` (or `observed_s` when an edge was unseen, so a lower bound) beyond
+    NORMAL_CROSSING_S, the slowest normal pass across the band; 0 when within it."""
+    own_active_s: float
+    """Part of the pass in teleop time with the target's own hub active."""
 
 
 class CrossingFact(_Fact):
-    """The target was seen on a bump or trench band (centre within BAND_MARGIN_M of the
-    bumps' depth): what it crossed, how long it took, how long it was stopped there."""
+    """The target was seen on a barrier band (see `Facts.notes`): what it crossed, how long
+    it took, how long it was stopped there."""
 
     kind: Literal["crossing"] = "crossing"
     data: CrossingData
@@ -247,54 +282,75 @@ class CrossingInGapFact(_Fact):
     data: CrossingInGapData
 
 
+CostEnd = Literal[
+    "reached_far_side", "tried_again", "hub_went_inactive", "track_lost", "match_end", "came_back"
+]
+
+
 class CrossingTurnedBackData(_Model):
     barrier: Barrier
     lane: Lane
-    """Lane of the first attempt."""
     y_m: float
-    """Median y on the barrier during the first attempt."""
+    """Median y on the barrier during the attempt."""
     side: Zone
     """The zone it came from and went back to."""
-    attempts: int
-    """Passes onto this barrier from `side` that came back out to `side` before it got
-    across (consecutive tries are one fact)."""
+    far_side: Zone
+    """The zone across the barrier from `side`: where it was heading."""
+    toward_home: bool
+    """True when `far_side` is nearer its own wall (into its own zone, or out of the
+    opponent's zone): then the cost runs until it got there."""
+    reach: Reach
+    """How close the centre came to the barrier (see `Reach`)."""
+    nearest_edge_m: float
+    """Closest the centre came to the bumps' or trench's depth along x (0: over it)."""
     reached_far_edge: bool
-    """True when the robot centre got past the far edge of the band but never fully off the
-    barrier (less than half a robot clear), then came back."""
+    """True when the centre got past the far edge of the band but never more than half a
+    robot clear of the bumps' depth (so part of it stayed over them), then came back."""
     time_on_barrier_s: float
-    """From first entering the band to last leaving it back to `side`."""
+    """From entering the band to leaving it back to `side`."""
     stopped_s: float
     """Part of that with speed below STOP_MPS, including time inferred across bridged gaps
     (see `unseen_s`)."""
     unseen_s: float
-    """Untracked time inside the attempt that was bridged (robot at nearly the same place
-    either side)."""
+    """Untracked time on the band that was bridged (robot at nearly the same place either
+    side)."""
     min_speed_mps: float | None
+    far_side_t: float | None
+    """First tracked time in `far_side` (off the barrier) after turning back; None if never
+    before the match ended."""
+    far_side_after_gap: bool
+    """True when that first time came right after a gap: it got there at most then."""
+    seconds_to_far_side: float | None
+    """From entering the band to `far_side_t` (an upper bound when `far_side_after_gap`)."""
     across_id: str | None
-    """The `crossing` or `crossing_in_gap` fact by which it next got across this barrier
-    from `side`, within REROUTE_MAX_S of turning back; None if it did not."""
-    across_lane: Lane | None
-    across_y_m: float | None
-    across_seen: bool | None
-    """False when `across_id` is a crossing_in_gap: it was across by then, maybe earlier."""
-    seconds_to_across: float | None
-    """From first entering the band on this attempt to leaving the band on the far side by
-    `across_id` (an upper bound when `across_seen` is False); None when it did not get
-    across within REROUTE_MAX_S."""
-    own_hub_active: bool | None
-    """Whether the target's own hub was active when the attempt began."""
+    """The `crossing` or `crossing_in_gap` fact of this barrier by which it got to
+    `far_side` within the cost window; None if none."""
+    cost_s: float
+    """The fact's span: from entering the band to `cost_end`."""
+    cost_end: CostEnd
+    """What ended the span. Toward home: the earliest of `reached_far_side`, `tried_again`
+    (its next attempt on this barrier from `side` began), `hub_went_inactive` (the end of the
+    first own-active stretch ending after it began), `track_lost` (the last sample before an
+    untracked stretch longer than BRIDGE_MAX_S: how long it really took is unknown, at least
+    this) and `match_end`. Away from home: `came_back`
+    (the span is the attempt itself: it was back on the side nearer home)."""
+    own_active_s: float
+    """Part of `cost_s` in teleop time with the target's own hub active."""
+    furthest_from_barrier_m: float | None
+    """After turning back and within the span: the furthest the centre got from the bumps'
+    depth along x, on `side` (a reroute or going elsewhere)."""
     contact_ids: list[str]
-    """Contact facts overlapping the attempt and the way round."""
+    """Contact facts overlapping the span."""
     nearest_tracked_m: float | None
     """Closest other tracked robot while on the barrier; a robot the tracker missed may
     have been closer."""
 
 
 class CrossingTurnedBackFact(_Fact):
-    """The target drove onto a bump or trench and came back out the side it came from,
-    and what happened next. Spans from entering the barrier to getting across (or to coming
-    back off it when it did not get across). The shape only: whether it was blocked,
-    stuck, staging or changing its mind is not known from positions."""
+    """The target went onto (or with `reach` `corner`, possibly against) a barrier and came
+    back out the side it came from. One attempt per fact: attempts are never chained. Spans
+    from entering the band to `cost_end`. The shape only: whether it was blocked, stuck,
+    staging or changing its mind is not known from positions."""
 
     kind: Literal["crossing_turned_back"] = "crossing_turned_back"
     data: CrossingTurnedBackData
@@ -318,13 +374,19 @@ class StopData(_Model):
     gaps_bridged: int
     moved_across_gaps_m: float | None
     """Largest straight-line move across a bridged gap; None when no gap was bridged."""
-    x: float
-    y: float
-    zone: Zone
-    on_barrier: Barrier | None
-    """Set when part of the robot was over a bump or trench (centre within half a robot of
-    the bumps' depth), outside the hub faces."""
+    where: Where
+    """Median tracked position of the stop."""
+    own_active_s: float
+    """Part of the stop in teleop time with the target's own hub active."""
+    barrier: Barrier
+    """The nearer barrier (along x)."""
+    barrier_edge_m: float
+    """Centre to that barrier's bumps' depth along x (0: over it)."""
     lane: Lane | None
+    """Lane of that barrier at the stop's y; None beside a hub face."""
+    on_barrier: Barrier | None
+    """Set when the centre was on that barrier's band (see `Facts.notes`); never when the
+    centre was in its own zone, whatever part of the robot reached the barrier."""
     start: StopStart
     """`seen_slowing`: seen arriving. `began_while_unseen`: the stop starts inside a bridged
     gap, so when it began is not known within that gap. `first_seen_already_stopped`: first
@@ -453,11 +515,21 @@ class ContactData(_Model):
     min_distance_m: float
     target_zone: Place
     """Where the target was when the contact began."""
+    where: Where
+    """Median tracked position of the target during the contact."""
     before: SpeedWindow
     during: SpeedWindow
     after: SpeedWindow
+    still_s: float
+    """Time during the contact, in STILL_WINDOW_S windows, that the target moved slower
+    than STILL_MPS (nearly still). Includes `still_unseen_s`."""
+    still_unseen_s: float
+    """Part of `still_s` where the target was untracked and the straight line between its
+    positions either side of the gap was that slow: inferred, a robot can leave and come back
+    unseen."""
     longest_still_s: float
-    """Longest run during the contact with target speed below STOP_MPS (tracked samples)."""
+    """Longest unbroken run of such windows (seen or inferred): how long it was held, or held
+    itself, nearly still beside this robot. Positions cannot say which."""
     end: ContactEnd
     """How the closeness ended. `target_moved_away` / `other_moved_away`: both tracked and
     that robot moved further in the next second. `unknown_*_track_lost`: tracking lost that
@@ -585,7 +657,7 @@ FactKind = Literal[
 class Facts(StageFile):
     """All facts for one team, sorted by `t_start`, plus match-wide coverage."""
 
-    schema_version: Literal[3] = 3
+    schema_version: Literal[4] = 4
     team: int
     alliance: Alliance
     clock_rate: float
