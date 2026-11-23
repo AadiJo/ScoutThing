@@ -34,7 +34,11 @@ The facts were computed by plain code from robot tracks. Read these limits befor
   the turned-back fact, not by a stop.
 - A `left_own_zone_while_active` trip starts where it was seen leaving, or, when it left inside
   a gap (`left_unseen_s` above 0), at the first position seen outside its zone: when it really
-  left is not known. It ends at `home` (`arrived`-style evidence). A trip is a SHAPE. Positions cannot see fuel: a trip out with an
+  left is not known. It counts only time it was seen out (or placed out by a gap's
+  `inference`): it ends at `home` when that is seen or estimated (`arrived`-style evidence),
+  else where it was last tracked out (`end` `track_lost`: not seen home, and not seen staying
+  out either), and a gap inside it long enough to go home and back ends it there (the next trip
+  has that gap as `start_gap`). A trip is a SHAPE. Positions cannot see fuel: a trip out with an
   empty hopper (to get more) and a trip with a heaped hopper (that should have gone home) look
   the same. The hopper tiles decide it. Never call the trip a reload, a feed or a waste; say
   what the tiles show.

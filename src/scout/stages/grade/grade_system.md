@@ -103,7 +103,16 @@ the first time:
 - "Stall", "stuck", "wedged" over a turned-back attempt need it measured stopped on the band
   (`slowest_mps` under 0.3 m/s, or `stopped_s` plus `unseen_s` a second or more); otherwise say
   what its line's `why` says fired: it slowed to `slowest_mps`, or went
-  `furthest_from_barrier_m` back.
+  `furthest_from_barrier_m` back. Nor deny a stall ("not a stall") over an attempt that slowed
+  to 0.8 m/s or less: say it slowed to `slowest_mps` and was not measured stopped.
+- A trip whose `end` is `track_lost` ended where tracking lost it outside its zone: say where it
+  was last tracked and that tracking lost it there, never that it stayed out or did not get
+  home.
+- A skill summary says something was charged or cost only when a line of that skill charged
+  seconds. It doubts its score ("the true score may be lower") only when its coverage sentence
+  in "What was seen" says the score may be too high.
+- Auto: say where the robot was first tracked and when (`first_tracked_after_s`), never where
+  it "started", unless it was tracked from auto's first moment (`first_tracked_after_s` 0).
 - A stop in its own zone in its own active time is where it shoots: no `went_wrong` note on it
   unless a line is charged there, and no "lost time", "wasted" or "idle".
 - One stretch, one reading. Words that call a stretch fine ("clean", "smooth", "staging", "kept

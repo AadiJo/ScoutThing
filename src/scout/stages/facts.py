@@ -104,6 +104,7 @@ from scout.schemas.facts import (
     StopFact,
     StopStart,
     TripData,
+    TripEnd,
     TripFact,
     Waypoint,
     Where,
@@ -209,6 +210,17 @@ OWN_BOTH_MAX_S = 10.0
 matches such gaps (bridged ones aside) run 1.0 to 8.8 s, mostly behind the far side of the
 own hub where the bumper is hidden; much longer, a robot can go out, collect and come back
 unseen."""
+HOME_RUN_MPS = 3.0
+HOME_STAY_S = TRIP_MIN_S
+"""A gap inside a trip, outside its zone on both sides with nothing placing it out, splits the
+trip when it is at least long enough to drive home and back at HOME_RUN_MPS (from where it was
+last seen, and to where it was next seen) with HOME_STAY_S at home: it may have been home, so
+that time is not counted as time out. HOME_RUN_MPS is above the 99th percentile of the target's
+tracked speed on the sixteen matches (2.9 m/s; 95th 2.5), so a shorter gap could not have held
+a visit home. HOME_STAY_S is the shortest stay that counts, as TRIP_MIN_S is the shortest trip.
+On the sixteen matches three such gaps sit inside trips: one of 9.8 s needing 3.6 s (the film
+study has the robot home shooting in it), one of 1.8 s needing 2.6 s (the film study has it
+driving round the ramp, out), one of 1.1 s needing 4.3 s."""
 
 THRESHOLDS: dict[str, float] = {
     "GAP_S": GAP_S,
@@ -244,6 +256,8 @@ THRESHOLDS: dict[str, float] = {
     "NEAR_BARRIER_M": NEAR_BARRIER_M,
     "OWN_INFER_MIN_S": OWN_INFER_MIN_S,
     "OWN_BOTH_MAX_S": OWN_BOTH_MAX_S,
+    "HOME_RUN_MPS": HOME_RUN_MPS,
+    "HOME_STAY_S": HOME_STAY_S,
 }
 
 CHECK_IMAGE = "facts_check.jpg"
@@ -1594,15 +1608,28 @@ def _own_active_spans(match: MatchInfo) -> list[tuple[float, float]]:
     return out
 
 
+def _could_go_home(ctx: Ctx, g: GapSpan) -> bool:
+    """A gap between two positions outside the own zone long enough to drive home and back
+    (see HOME_RUN_MPS)."""
+    p = ctx.path
+    sides = [k for k in (g.before, g.after) if k is not None]
+    run = sum(_to_zone_m(ctx, float(p.x[k]), "own") for k in sides)
+    return g.b - g.a >= run / HOME_RUN_MPS + HOME_STAY_S - 1e-6
+
+
 def _trip_facts(
     ctx: Ctx, stops: Sequence[StopFact], passes: Sequence[Pass], gaps: Sequence[GapSpan]
 ) -> list[Fact]:
     """Each time the target left its own zone during own-active time, until it got home
-    (`_arrival`) or that time ended. A robot perched on its barrier is not home. When it left
-    unseen (across a gap: a lost label looks the same as a lost track), the trip starts at the
-    first position seen outside, so a trip never starts at the edge of a gap."""
+    (`_arrival`) or that time ended, counting only time it was seen out or placed out by a
+    gap's inference (see `TripData.end`). A robot perched on its barrier is not home. When it
+    left unseen (across a gap: a lost label looks the same as a lost track), the trip starts at
+    the first position seen outside, so a trip never starts at the edge of a gap; a gap inside
+    it long enough to go home and back (`_could_go_home`) with nothing placing it out ends the
+    trip there, and the next one starts after it."""
     p = ctx.path
     home = [z == "own" and pl_ != "on_barrier" for z, pl_ in zip(p.zone, ctx.place, strict=True)]
+    gap_id = {g.before: f"gap-{n:02d}" for n, g in enumerate(gaps, 1) if g.before is not None}
     out: list[Fact] = []
     for sa, sb in ctx.active:
         i = 0
@@ -1611,71 +1638,129 @@ def _trip_facts(
             if not (home[i] and not home[i + 1] and sa <= p.t[start] < sb):
                 i += 1
                 continue
-            t_left = float(p.t[start])
-            found = _arrival(ctx, t_left, lambda k: home[k], "own", passes, gaps)
+            found = _arrival(ctx, float(p.t[start]), lambda k: home[k], "own", passes, gaps)
             back_i = found[1] if found else None
             back = found is not None and found[0].t <= sb
-            t_end = found[0].t if back and found else sb
             nxt = back_i if back_i is not None else len(p.t)
-            if t_end - t_left < TRIP_MIN_S - 1e-6:
-                i = nxt
-                continue
-            outside = np.arange(i + 1, nxt)
-            outside = outside[p.t[outside] <= t_end]
-            if not len(outside):
-                i = nxt
-                continue
-            depth = [ctx.toward_own(-float(p.x[k])) for k in outside.tolist()]
-            far_k = int(np.argmax(depth))
-            far = int(outside[far_k])
-            back_k = (
-                far_k + 1 + int(np.argmin(depth[far_k + 1 :])) if far_k + 1 < len(depth) else None
-            )
-            past = (
-                float(p.x[far]) - CENTER_LINE_X_M
-                if ctx.alliance == "blue"
-                else CENTER_LINE_X_M - float(p.x[far])
-            )
-            out_t = p.t[outside]
-            fidx = _f_span(ctx, float(out_t[0]), float(out_t[-1]))
-            fx = ctx.filled.x
-            fidx = fidx[[ctx.raw_zone(float(fx[k])) != "own" for k in fidx.tolist()]]
-            _, slow = _f_still_s(ctx, fidx, SLOW_MPS)
-            tracked = len(_in_span(ctx, t_left, t_end)) * ctx.dt
-            at_end = None
-            if not back:
-                k = int(np.argmin(np.abs(p.t - sb)))
-                at_end = ctx.seen(k) if abs(p.t[k] - sb) <= 1.0 else None
-            data = TripData(
-                left=ctx.seen(i),
-                left_unseen_s=_r(0.0 if p.link[i] else p.t[i + 1] - p.t[i]),
-                own_active_left_s=_r(sb - t_left),
-                back=ctx.seen(back_i) if back and back_i is not None else None,
-                home=found[0] if back and found else None,
-                at_active_end=at_end,
-                duration_s=_r(t_end - t_left),
-                unseen_s=_r(max(0.0, t_end - t_left + ctx.dt - tracked)),
-                furthest=ctx.seen(far),
-                past_centre_line_m=_r(past),
-                nearest_home_after_furthest=(
-                    None if back_k is None else ctx.seen(int(outside[back_k]))
-                ),
-                stop_ids=[
-                    s.id
-                    for s in stops
-                    if s.t_start < t_end and s.t_end > t_left and s.data.where.zone != "own"
-                ],
-                longest_below_slow_s=_r(slow),
-                path_length_m=_r(_path_length(ctx, _in_span(ctx, t_left, t_end)), 1),
-            )
-            n = len(out) + 1
-            out.append(
-                TripFact.model_validate(
-                    {**_common(ctx, f"trip-{n:02d}", t_left, t_end), "data": data}
-                )
-            )
+            # where it ends, counting only time seen (or placed) out; `last`: the last sample
+            # tracked out when it ends at a gap with nothing placing it (`track_lost`)
+            end: TripEnd
+            last: int | None = None
+            t_end = sb
+            if back and found and back_i is not None:
+                if found[0].by == "after_gap":
+                    last = back_i - 1
+                end, t_end = "home", found[0].t
+            else:
+                hole = next(
+                    (g for g in gaps if g.a < sb and (sb < g.b or g.after is None)
+                     and g.before is not None and g.before >= start),
+                    None,
+                )  # fmt: skip
+                if hole is not None and (hole.after is None or _inference(ctx, hole) is None):
+                    last = hole.before
+                end = "match_end" if sb >= ctx.t1 - 1e-6 else "hub_went_inactive"
+            if last is not None:
+                end, t_end = "track_lost", float(p.t[last])
+            # gaps it may have spent at home end one trip; the next starts after the gap
+            left_i, first_i, start_gap = i, i + 1, None
+            for g in gaps:
+                if not (
+                    g.before is not None
+                    and g.after is not None
+                    and g.before >= start
+                    and g.b < t_end - 1e-6
+                    and _inference(ctx, g) is None
+                    and _could_go_home(ctx, g)
+                ):
+                    continue
+                cut = gap_id[g.before]
+                trip = _trip(ctx, stops, len(out) + 1, sb, left_i, first_i, nxt, g.a,
+                             "track_lost", cut, start_gap, None, None)  # fmt: skip
+                out += [trip] if trip is not None else []
+                left_i, first_i, start_gap = g.before, g.after, cut
+            end_gap = gap_id.get(last) if last is not None else None
+            trip = _trip(
+                ctx, stops, len(out) + 1, sb, left_i, first_i, nxt, t_end, end, end_gap,
+                start_gap, found if back else None, back_i,
+            )  # fmt: skip
+            out += [trip] if trip is not None else []
             i = nxt
     return out
+
+
+def _trip(
+    ctx: Ctx,
+    stops: Sequence[StopFact],
+    n: int,
+    sb: float,
+    i: int,
+    first: int,
+    nxt: int,
+    t_end: float,
+    end: TripEnd,
+    end_gap: str | None,
+    start_gap: str | None,
+    found: tuple[Arrival, int] | None,
+    back_i: int | None,
+) -> TripFact | None:
+    """One trip fact: last position before it at path index `i`, first position out at
+    `first` (or `i` when seen leaving), positions out before `nxt`, ending at `t_end` before
+    own-active time ends at `sb`; `found` is its arrival home when it got there. None when
+    shorter than TRIP_MIN_S."""
+    p = ctx.path
+    start = i if p.link[i] else first
+    t_left = float(p.t[start])
+    back = found is not None
+    if t_end - t_left < TRIP_MIN_S - 1e-6:
+        return None
+    outside = np.arange(first, nxt)
+    outside = outside[p.t[outside] <= t_end]
+    if not len(outside):
+        return None
+    depth = [ctx.toward_own(-float(p.x[k])) for k in outside.tolist()]
+    far_k = int(np.argmax(depth))
+    far = int(outside[far_k])
+    back_k = far_k + 1 + int(np.argmin(depth[far_k + 1 :])) if far_k + 1 < len(depth) else None
+    past = (
+        float(p.x[far]) - CENTER_LINE_X_M
+        if ctx.alliance == "blue"
+        else CENTER_LINE_X_M - float(p.x[far])
+    )
+    out_t = p.t[outside]
+    fidx = _f_span(ctx, float(out_t[0]), float(out_t[-1]))
+    fx = ctx.filled.x
+    fidx = fidx[[ctx.raw_zone(float(fx[k])) != "own" for k in fidx.tolist()]]
+    _, slow = _f_still_s(ctx, fidx, SLOW_MPS)
+    tracked = len(_in_span(ctx, t_left, t_end)) * ctx.dt
+    at_end = None
+    if not back and end != "track_lost":
+        k = int(np.argmin(np.abs(p.t - sb)))
+        at_end = ctx.seen(k) if abs(p.t[k] - sb) <= 1.0 else None
+    data = TripData(
+        left=ctx.seen(i),
+        left_unseen_s=_r(0.0 if p.link[i] else p.t[i + 1] - p.t[i]),
+        start_gap=start_gap,
+        own_active_left_s=_r(sb - t_left),
+        back=ctx.seen(back_i) if found is not None and back_i is not None else None,
+        home=found[0] if found is not None else None,
+        end=end,
+        end_gap=end_gap,
+        at_active_end=at_end,
+        duration_s=_r(t_end - t_left),
+        unseen_s=_r(max(0.0, t_end - t_left + ctx.dt - tracked)),
+        furthest=ctx.seen(far),
+        past_centre_line_m=_r(past),
+        nearest_home_after_furthest=None if back_k is None else ctx.seen(int(outside[back_k])),
+        stop_ids=[
+            s.id
+            for s in stops
+            if s.t_start < t_end and s.t_end > t_left and s.data.where.zone != "own"
+        ],
+        longest_below_slow_s=_r(slow),
+        path_length_m=_r(_path_length(ctx, _in_span(ctx, t_left, t_end)), 1),
+    )
+    return TripFact.model_validate({**_common(ctx, f"trip-{n:02d}", t_left, t_end), "data": data})
 
 
 # --- contacts -------------------------------------------------------------------------
@@ -2107,7 +2192,10 @@ def _notes(ctx: Ctx, coverage: Coverage, sources: set[str]) -> list[str]:
         "the strip from each outer bump to the guardrail at the bumps' depth. Arrivals home "
         "(`arrived`, a trip's `home`, a hub_on's `reached`) first seen after a gap are "
         "estimated when a crossing or a gap's inference shows the robot going there; else they "
-        "are upper bounds (`after_gap`). Trips that left inside a gap start where first seen out.",
+        "are upper bounds (`after_gap`). Trips that left inside a gap start where first seen out; "
+        "a trip counts only time seen or placed out, so one that went unseen with nothing "
+        "placing it out or timing its arrival home ends where it was last seen out (`end` "
+        "`track_lost`: not seen home, not seen staying out).",
         f"Positions are robot centres, about 0.2 m accurate. Zone lines use the centre with "
         f"{ZONE_HYST_M} m hysteresis, or {ZONE_DWELL_S:g} s on the other side; `where` "
         "gives distances to the own hub, own wall and guardrail: describe places from those.",

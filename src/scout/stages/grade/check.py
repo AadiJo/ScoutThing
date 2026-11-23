@@ -7,12 +7,23 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from scout.schemas.facts import StopFact
+from scout.schemas.facts import AutoRouteFact, StopFact
 from scout.schemas.grade import SKILLS, DrivingLine, FrameSheet, GradeAnswer, LineCall, SkillName
-from scout.stages.grade.base import overlap
+from scout.stages.grade.base import fmt, overlap
 from scout.stages.grade.check_calls import check_call, check_hoppers, hopper_ruling
 from scout.stages.grade.check_episodes import check_episodes
-from scout.stages.grade.checker import Checker, GradeContext, Item
+from scout.stages.grade.checker import (
+    CHARGE_WORD,
+    DOUBT_WORD,
+    NEGATED,
+    NONE_WORD,
+    REF,
+    SENTENCE,
+    START_WORD,
+    Checker,
+    GradeContext,
+    Item,
+)
 from scout.stages.grade.clock import own_active
 from scout.stages.grade.scores import Charges, Scored, charges, episode_span, scores, split_applies
 
@@ -140,14 +151,31 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
     names = [g.skill for g in answer.skills]
     if sorted(names) != sorted(SKILLS):
         ck.bad(f"skills: need exactly one each of {list(SKILLS)}, got {names}")
+    sc = scores(led, answer.episodes, ch, ctx.coverage)
+    charged: dict[SkillName, bool] = {
+        "driving": ch.driving_s > 0,
+        "shift_readiness": any(ch.line.get(r.id, 0.0) > 0 for r in led.readiness),
+        "handling_defense": True,
+    }
     for g in answer.skills:
         for c in g.cites:
             ck.span(c, f"skill {g.skill}")
         text(f"skill {g.skill} summary", g.summary, g.cites, roles=False, scope=scopes[g.skill])
+        flagged = (s := sc.get(g.skill)) is not None and s.low_coverage
+        _summary_claims(ck, f"skill {g.skill} summary", g.summary, charged[g.skill], flagged)
     for c in answer.auto.cites:
         ck.span(c, "auto")
     text("auto", answer.auto.text, answer.auto.cites, roles=False,
          scope=[(m.auto_start_t, m.auto_end_t)])  # fmt: skip
+    route = next((f.data for f in ck.by_id.values() if isinstance(f, AutoRouteFact)), None)
+    begun = route is None or route.first_tracked is None or route.first_tracked_after_s > 0
+    if begun and (hit := START_WORD.search(REF.sub(" ", answer.auto.text))) is not None:
+        when = f"{fmt(route.first_tracked_after_s)} s into auto" if route else "never"
+        ck.bad(
+            f"auto: {hit.group(0)!r} says where it started, but it was first tracked {when}: "
+            "say where it was first tracked and when ({auto-route.first_tracked_after_s} s into "
+            "auto, citing auto-route), not where it started"
+        )
     for k, n in enumerate(answer.notes):
         at = f"note {k + 1} (t={n.t})"
         found = [s for c in n.cites if (s := ck.span(c, at)) is not None]
@@ -185,8 +213,27 @@ def check_answer(raw: object, ctx: GradeContext, sheets: list[FrameSheet]) -> Ch
             )
         text(at, n.text, n.cites, n.bumpers_read)
     problems = ck.problems
-    sc = scores(led, answer.episodes, ch, ctx.coverage)
     return Checked(answer if not problems else None, problems, sc, ch, resolved)
+
+
+def _summary_claims(ck: Checker, at: str, summary: str, charged: bool, flagged: bool) -> None:
+    """A skill summary says something was charged or cost only when its skill charged seconds,
+    and doubts its score ("the true score may be lower") only when code flagged the score as
+    low coverage: unseen time is never charged, and the coverage sentence says what was seen."""
+    for sentence in [] if charged else SENTENCE.split(REF.sub("#", summary)):
+        hit = CHARGE_WORD.search(sentence)
+        if hit and not NEGATED.search(sentence[: hit.start()]) and not NONE_WORD.search(sentence):
+            ck.bad(
+                f"{at}: {hit.group(0)!r} says something was charged, but no line of this skill "
+                "charged any seconds: say nothing was charged"
+            )
+            break
+    if not flagged and (hit := DOUBT_WORD.search(summary)) is not None:
+        ck.bad(
+            f"{at}: {hit.group(0)!r} doubts the score, but code did not flag it as low "
+            "coverage; unseen time is never charged and the coverage sentence already says "
+            "what was seen: drop the doubt"
+        )
 
 
 def retry_prompt(problems: list[str]) -> str:
