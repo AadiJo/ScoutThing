@@ -20,6 +20,10 @@ LabelSource = Literal[
     "votes",
     "appearance",
     "appearance_continuity",
+    "corner_digits",
+    "corner_overlap",
+    "corner_handoff",
+    "corner_carried",
     "no_reads",
     "below_rule",
     "conflict",
@@ -42,6 +46,12 @@ LabelSource = Literal[
 - `appearance_continuity`: the same with a looser appearance bar, allowed because the stretch
   also continues a track labelled that team (same track, or the only track that ended or
   began where and when this one starts or ends).
+- `corner_digits`, `corner_overlap`, `corner_handoff`: a corner track (follow stage,
+  `corner_identity.json`) named from number reads on its own boxes, from a labelled main-view
+  track it ran on top of, or from a labelled main-view track that ended (or began) where it
+  began (or ended). See `scout.stages.follow`.
+- `corner_carried`: in corner_identity.json on a main-view track: a stretch identify left
+  unlabelled (not `conflict`) on which a labelled corner track rode, the only robot there.
 - `no_reads` (team null): no bumper read joins this stretch of track.
 - `below_rule` (team null): reads join it, but not enough agreeing named reads.
 - `conflict` (team null): the track holds named reads of two teams around this stretch, or
@@ -119,8 +129,9 @@ class TeamEvidence(BaseModel):
     vote_reads: int = Field(ge=0)
     """Main-view reads joined to a track that count as votes for the team (see `votes`)."""
     corner_votes: int = Field(ge=0)
-    """Corner-view reads that count as votes; corners are not tracked, so they label nothing,
-    but many of them with no label means the robot was readable only there."""
+    """Corner-view reads that count as votes; tracks.parquet has no corner tracks, so they
+    label nothing here (the follow stage labels its corner tracks with them), but many of them
+    with no label means the robot was readable only there."""
     votes_off: bool
     """True when a `votes` label of this team clashed with another track's label of it (so
     another robot also reads as it), and none of its reads counted as votes in this match."""
@@ -139,6 +150,19 @@ class Identity(StageFile):
     conflicts: list[ClaimConflict]
     teams: list[TeamEvidence] = Field(default_factory=list[TeamEvidence])
     """One entry per roster team, in roster order (empty in files written before it existed)."""
+
+
+CORNER_IDENTITY_FILE = "corner_identity.json"
+"""File name of `CornerIdentity` in a run folder, beside `identity.json`."""
+
+
+class CornerIdentity(StageFile):
+    """Label segments written by the follow stage: of the corner tracks
+    (`corner_tracks.parquet`), and `corner_carried` segments on main-view tracks. Read them
+    with the main view's through `scout.positions.load_positions`."""
+
+    schema_version: Literal[1] = 1
+    segments: list[LabelSegment]
 
 
 READER_NAME = "s1_digits"

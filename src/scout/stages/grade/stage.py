@@ -240,6 +240,8 @@ STAGE = Stage(
         r.match_json,
         r.tracks,
         r.identity_json,
+        r.corner_tracks,
+        r.corner_identity_json,
         r.calibration_json,
         r.video,
         r.settings_json,
