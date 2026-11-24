@@ -32,10 +32,10 @@ from scout.schemas.common import SchemaError, atomic_write
 from scout.schemas.detections import read_detections
 from scout.schemas.facts import Facts
 from scout.schemas.grade import Grade
-from scout.schemas.identity import Identity, read_reads
+from scout.schemas.identity import CORNER_IDENTITY_FILE, CornerIdentity, Identity, read_reads
 from scout.schemas.manifest import Answers, Manifest, Settings, StageRecord, StageStatus
 from scout.schemas.match import MatchInfo
-from scout.schemas.tracks import read_tracks
+from scout.schemas.tracks import CORNER_TRACKS_FILE, read_tracks
 from scout.schemas.video import VideoInfo
 
 RUNS_DIR = ROOT / "runs"
@@ -81,6 +81,8 @@ class RunDir:
         self.tracks = path / "tracks.parquet"
         self.identity_json = path / "identity.json"
         self.reads = path / "reads.parquet"
+        self.corner_tracks = path / CORNER_TRACKS_FILE
+        self.corner_identity_json = path / CORNER_IDENTITY_FILE
         self.facts_json = path / "facts.json"
         self.overlay = path / "overlay.mp4"
         self.grade_json = path / "grade.json"
@@ -266,6 +268,8 @@ def schema_checks(run: RunDir) -> list[tuple[Path, Callable[[Path], object]]]:
         (run.tracks, read_tracks),
         (run.identity_json, Identity.load),
         (run.reads, read_reads),
+        (run.corner_tracks, read_tracks),
+        (run.corner_identity_json, CornerIdentity.load),
         (run.facts_json, Facts.load),
         (run.grade_json, Grade.load),
     ]

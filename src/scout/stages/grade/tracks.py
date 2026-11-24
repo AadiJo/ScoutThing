@@ -1,6 +1,6 @@
-"""Tracked samples: the target's and every other robot's, from tracks.parquet and
-identity.json (`load_tracks`), and how long the target needs to get home from where it was
-(`home_allow`)."""
+"""Tracked samples: the target's and every other robot's, main view and corner cameras
+(`scout.positions`, `load_tracks`), and how long the target needs to get home from where it
+was (`home_allow`)."""
 
 from __future__ import annotations
 
@@ -11,11 +11,10 @@ import polars as pl
 from numpy.typing import NDArray
 
 from scout.games.rebuilt2026 import ALLIANCE_ZONE_DEPTH_M, own_wall_m
+from scout.positions import load_positions
 from scout.run import RunDir
 from scout.schemas.common import Alliance
-from scout.schemas.identity import Identity
 from scout.schemas.match import MatchInfo
-from scout.schemas.tracks import read_tracks
 
 F64 = NDArray[np.float64]
 I64 = NDArray[np.int64]
@@ -58,10 +57,10 @@ class Others:
 def load_tracks(run: RunDir, match: MatchInfo) -> tuple[Target, Others]:
     """The target: samples inside identity segments labelled with it, minus frames two
     tracks both claim. Others: every other sample, with its label."""
-    ident = Identity.load(run.identity_json)
-    tracks = read_tracks(run.tracks)
+    pos = load_positions(run)
+    tracks = pos.tracks
     target = match.target_team
-    named = [s for s in ident.segments if s.team is not None]
+    named = [s for s in pos.segments if s.team is not None]
     seg = pl.DataFrame(
         {
             "track_id": [s.track_id for s in named],

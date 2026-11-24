@@ -26,12 +26,11 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from scout.games.rebuilt2026 import BUMPER_CENTER_HEIGHT_M
+from scout.positions import load_positions
 from scout.run import RunDir
 from scout.schemas.calibration import Calibration
 from scout.schemas.common import VIEW_NAMES, ViewName
-from scout.schemas.identity import Identity
 from scout.schemas.match import MatchInfo
-from scout.schemas.tracks import read_tracks
 from scout.schemas.truth import Truth, TruthRobot, TruthSample
 from scout.schemas.video import VideoInfo
 from scout.video import frame_time
@@ -127,10 +126,12 @@ class Session:
         }
 
     def tracks_json(self) -> list[dict[str, object]]:
-        """Measured pipeline samples per track with their labelled stretches."""
-        df = read_tracks(self.run.tracks).filter(state="measured").sort("track_id", "frame")
+        """Measured pipeline samples per track (main view and corner cameras; corner tracks'
+        boxes are on their corner panel) with their labelled stretches."""
+        pos = load_positions(self.run)
+        df = pos.tracks.filter(state="measured").sort("track_id", "frame")
         labels: dict[int, list[tuple[int, int, int]]] = {}
-        for s in Identity.load(self.run.identity_json).segments:
+        for s in pos.segments:
             if s.team is not None:
                 labels.setdefault(s.track_id, []).append((s.frame_start, s.frame_end, s.team))
         out: list[dict[str, object]] = []

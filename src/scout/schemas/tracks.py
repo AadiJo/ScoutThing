@@ -1,5 +1,8 @@
 """`tracks.parquet`, written by the track stage: robot tracks in field metres, one row per
-track per sampled frame where the track exists.
+track per sampled frame where the track exists. `corner_tracks.parquet`, written by the follow
+stage, has the same columns: robots placed through a corner camera in frames where the main
+view had no sample of them (`view` is the corner view, `track_id` at least
+`CORNER_TRACK_ID_BASE`). Read both through `scout.positions.load_positions`.
 
 A track is one robot for as long as the track stage is sure it is the same robot. Tracks
 end wherever that is in doubt (crossings, occlusion, long gaps), so one robot usually has
@@ -57,6 +60,10 @@ TRACKS = TableSpec(
         "partial": pl.Boolean(),
     },
 )
+
+CORNER_TRACKS_FILE = "corner_tracks.parquet"
+CORNER_TRACK_ID_BASE = 1_000_000
+"""Corner track ids start here, clear of the track stage's."""
 
 read_tracks = TRACKS.read
 write_tracks = TRACKS.write

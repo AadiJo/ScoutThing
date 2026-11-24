@@ -12,6 +12,11 @@ The facts were computed by plain code from robot tracks. Read these limits befor
   reading of its two sides, not a measurement; the readiness defaults use it. `others_near`
   lists robots tracked near where the target was last or next seen: a pointer to a frame worth
   opening, not a contact.
+- Some positions come from a corner camera, where the main camera lost the robot near a
+  corner camera (the notes give the seconds). They are about 0.3 m accurate, never on a bump,
+  and carry the team only where its number or a hand-off from the main camera showed it.
+  Crossings come from the main camera only. A served main-camera tile at such a moment rings
+  where the robot was, but the main camera may not show it there; the corner tile can.
 - Nothing the tool did not see is known: a trip, stall or crossing inside a gap leaves no
   fact. Counts of trips or crossings are counts of what was tracked.
 - A `stop` with `unseen_s` above 0 is partly INFERRED: the robot was at nearly the same place

@@ -1,4 +1,5 @@
-"""facts: reads tracks.parquet, identity.json, match.json.
+"""facts: reads tracks.parquet, identity.json, corner_tracks.parquet, corner_identity.json,
+match.json.
 
 Writes facts.json (see `scout.schemas.facts`): timed, measured events for the target
 team's robot, and `facts_check.jpg`, a match timeline with the phases, the target's place,
@@ -7,8 +8,9 @@ its speed and every fact, for a person to check against the video.
 Steps:
 
 1. The target's path is every track sample inside an identity segment labelled with the
-   target team, in time order, within the match (auto start to teleop end). Frames where
-   two tracks both claim the target are dropped and reported as a gap, never averaged.
+   target team, in time order, within the match (auto start to teleop end), from the main
+   view and the corner cameras (`scout.positions`). Frames where two tracks both claim the
+   target are dropped and reported as a gap, never averaged.
 2. Samples further apart than GAP_S are not linked: nothing is measured across them, and
    the hole is a `gap` fact. Speed is the straight-line distance over SPEED_WINDOW_S of
    consecutive samples, so it is never taken across a missing sample, times the match's
@@ -20,12 +22,18 @@ Steps:
 4. Zones use the robot centre with ZONE_HYST_M of hysteresis at each zone line. Stays are
    `zone_visit` facts; a stay of PERCH_MIN_S or more with part of the robot over a bump or
    trench is its own `on_barrier` visit. Bump and trench passes are judged from measured
-   (boxed) samples only: seen on the barrier is a `crossing`, last seen one side and next
-   seen the other is a `crossing_in_gap`, and a pass that came back out the side it came
-   from is folded with the crossing that next got it across into `crossing_turned_back`.
+   (boxed) main-view samples only: seen on the barrier is a `crossing`, last seen one side
+   and next seen the other is a `crossing_in_gap`, and a pass that came back out the side it
+   came from is folded with the crossing that next got it across into `crossing_turned_back`.
 5. Other robots are every other track in the same frame. They are only the robots the
    tracker followed, so facts give the closest tracked robot and the count tracked, and
    never claim a robot was absent.
+
+Corner-camera positions (a quarter to a third of a metre off, never on a bump) take part in
+everything except crossings, which are judged from main-view boxes only; a contact with a
+corner position on either side needs the robots within CORNER_CONTACT_M rather than
+CONTACT_M. Their speeds agree with the main view's (hide test: 0.02 m/s median, 0.15 m/s 90th
+percentile apart, the same stop call 95% of the time), so stops use them as they are.
 """
 
 from __future__ import annotations
@@ -61,6 +69,7 @@ from scout.games.rebuilt2026 import (
     rect_distance_m,
     zone_of,
 )
+from scout.positions import load_positions
 from scout.run import RunDir, Stage
 from scout.schemas.common import ALLIANCES, Alliance
 from scout.schemas.facts import (
@@ -111,9 +120,8 @@ from scout.schemas.facts import (
     ZoneVisitData,
     ZoneVisitFact,
 )
-from scout.schemas.identity import Identity
 from scout.schemas.match import MatchInfo
-from scout.schemas.tracks import read_tracks
+from scout.schemas.tracks import CORNER_TRACK_ID_BASE
 
 F64 = NDArray[np.float64]
 I64 = NDArray[np.int64]
@@ -173,6 +181,10 @@ STILL_WINDOW_S = 1.0
 CONTACT_M = 1.6
 """Centre distance for a contact: touching robots are 0.95 m (side by side) to 1.34 m
 (corner to corner) apart, plus 0.2 m accuracy on each."""
+CORNER_CONTACT_M = 1.3
+"""Centre distance for a contact when either robot is placed by a corner camera: touching
+robots read 0.95 to 1.34 m apart, and a corner position is up to about 0.4 m off (90th
+percentile), so the allowance for error is dropped rather than doubled."""
 CONTACT_BRIDGE_S = 0.5
 """Contact samples closer in time than this are one contact (bumpers bounce apart)."""
 CONTACT_GAP_MAX_S = 6.0
@@ -241,6 +253,7 @@ THRESHOLDS: dict[str, float] = {
     "STILL_MPS": STILL_MPS,
     "STILL_WINDOW_S": STILL_WINDOW_S,
     "CONTACT_M": CONTACT_M,
+    "CORNER_CONTACT_M": CORNER_CONTACT_M,
     "CONTACT_BRIDGE_S": CONTACT_BRIDGE_S,
     "CONTACT_GAP_MAX_S": CONTACT_GAP_MAX_S,
     "CONTACT_EDGE_S": CONTACT_EDGE_S,
@@ -286,6 +299,9 @@ class Path:
     x: F64
     y: F64
     measured: B
+    """A main-view box backs the sample."""
+    corner: B
+    """A corner camera placed the sample."""
     track: I64
     link: B
     bridged: B
@@ -414,8 +430,8 @@ class Ctx:
 def _load(run: RunDir) -> Ctx:
     """Read the inputs and build the target's path and the other tracks."""
     match = MatchInfo.load(run.match_json)
-    ident = Identity.load(run.identity_json)
-    tracks = read_tracks(run.tracks)
+    pos = load_positions(run)
+    tracks = pos.tracks
     t0, t1 = match.auto_start_t, match.teleop_end_t
     rate = match.clock_rate or 1.0
     some = tracks.filter(pl.col("t") > 0).row(0, named=True)
@@ -426,10 +442,10 @@ def _load(run: RunDir) -> Ctx:
 
     seg = pl.DataFrame(
         {
-            "track_id": [s.track_id for s in ident.segments if s.team is not None],
-            "f0": [s.frame_start for s in ident.segments if s.team is not None],
-            "f1": [s.frame_end for s in ident.segments if s.team is not None],
-            "team": [s.team for s in ident.segments if s.team is not None],
+            "track_id": [s.track_id for s in pos.segments if s.team is not None],
+            "f0": [s.frame_start for s in pos.segments if s.team is not None],
+            "f1": [s.frame_end for s in pos.segments if s.team is not None],
+            "team": [s.team for s in pos.segments if s.team is not None],
         },
         schema={"track_id": pl.Int32, "f0": pl.Int64, "f1": pl.Int64, "team": pl.Int64},
     )
@@ -443,7 +459,10 @@ def _load(run: RunDir) -> Ctx:
     rows = tracks.filter(pl.col("t").is_between(t0, t1)).join(
         labels, on=["track_id", "frame"], how="left"
     )
-    claims = [s for s in ident.segments if s.team == target]
+    # Two main-view tracks claiming the target over overlapping stretches conflict there. A
+    # corner track never has a sample where the main view has the target (follow stage), so
+    # with one it is only frames where two tracks both have a target sample.
+    claims = [s for s in pos.segments if s.team == target and s.track_id < CORNER_TRACK_ID_BASE]
     conflicts = [
         (max(a.frame_start, b.frame_start), min(a.frame_end, b.frame_end))
         for k, a in enumerate(claims)
@@ -452,6 +471,11 @@ def _load(run: RunDir) -> Ctx:
         and max(a.frame_start, b.frame_start) <= min(a.frame_end, b.frame_end)
     ]
     mine = rows.filter(pl.col("team") == target)
+    both = np.unique(
+        mine.group_by("frame").agg(pl.len()).filter(pl.col("len") > 1)["frame"].to_numpy()
+    ).astype(np.int64)
+    for seg in np.split(both, np.flatnonzero(np.diff(both) > step) + 1) if len(both) else []:
+        conflicts.append((int(seg[0]), int(seg[-1])))
     for f0, f1 in conflicts:
         mine = mine.filter(~pl.col("frame").is_between(f0, f1))
     mine = mine.sort("frame")
@@ -472,7 +496,8 @@ def _load(run: RunDir) -> Ctx:
         t=t,
         x=x,
         y=y,
-        measured=(mine["state"] == "measured").to_numpy(),
+        measured=((mine["state"] == "measured") & (mine["view"] == "main")).to_numpy(),
+        corner=(mine["view"] != "main").fill_null(False).to_numpy(),
         track=mine["track_id"].to_numpy().astype(np.int64),
         link=link,
         bridged=bridged,
@@ -808,7 +833,10 @@ def _near_in_gap(
         for tid, ox, oy in ctx.others.by_frame.get(f, []):
             d = min(math.hypot(ox - ex, oy - ey) for ex, ey in ends)
             labelled = (tid, f) in ctx.others.team
-            if d <= CONTACT_M and (d >= SAME_ROBOT_M or labelled):
+            corner = tid >= CORNER_TRACK_ID_BASE or any(
+                bool(p.corner[j]) for j in (j0, j1) if j is not None
+            )
+            if d <= (CORNER_CONTACT_M if corner else CONTACT_M) and (d >= SAME_ROBOT_M or labelled):
                 out.setdefault(tid, []).append((f, d, True))
     return out
 
@@ -1880,13 +1908,21 @@ class Piece:
     hits: dict[int, list[tuple[int, float, bool]]]
 
 
+def _contact_m(ctx: Ctx, i: int, tid: int) -> float:
+    """Contact distance between target sample i and track `tid`: CORNER_CONTACT_M when a
+    corner camera placed either."""
+    return CORNER_CONTACT_M if ctx.path.corner[i] or tid >= CORNER_TRACK_ID_BASE else CONTACT_M
+
+
 def _contact_facts(ctx: Ctx) -> list[ContactFact]:
     """Contacts from close tracked samples, joined across target gaps three ways: the same
     robot close on both sides of a gap, a contact's robots near the target's spot inside
     the gap next to it, and robots beside a still target's spot in a bridged gap."""
     p = ctx.path
     near = [_nearest(ctx, i) for i in range(len(p.t))]
-    close = np.array([bool(n) and n[0][0] <= CONTACT_M for n in near], np.bool_)
+    close = np.array(
+        [any(d <= _contact_m(ctx, i, tid) for d, tid in n) for i, n in enumerate(near)], np.bool_
+    )
     gaps = [j for j in np.flatnonzero(~p.link).tolist() if p.t[j + 1] - p.t[j] <= CONTACT_GAP_MAX_S]
 
     def key(tid: int, hits: list[tuple[int, float, bool]]) -> tuple[str, int]:
@@ -1909,7 +1945,7 @@ def _contact_facts(ctx: Ctx) -> list[ContactFact]:
         seen_hits: dict[int, list[tuple[int, float, bool]]] = {}
         for i in range(a, b + 1):
             for d, tid in near[i]:
-                if d <= CONTACT_M:
+                if d <= _contact_m(ctx, i, tid):
                     seen_hits.setdefault(tid, []).append((int(p.frame[i]), d, False))
         q = Piece(float(p.t[a]), float(p.t[b]), seen_hits)
         mine = keys(q)
@@ -1993,7 +2029,7 @@ def _contact_facts(ctx: Ctx) -> list[ContactFact]:
         _, lo, hi = _others_range(ctx, ta, tb)
         last = int(idx[-1])
         last_near = min(
-            ((d, tid) for d, tid in near[last] if d <= CONTACT_M),
+            ((d, tid) for d, tid in near[last] if d <= _contact_m(ctx, last, tid)),
             default=(0.0, max(robots, key=lambda r: r.last_close_t).track_id),
         )
         span = tb - ta + ctx.dt
@@ -2196,7 +2232,11 @@ def _notes(ctx: Ctx, coverage: Coverage, sources: set[str]) -> list[str]:
         "a trip counts only time seen or placed out, so one that went unseen with nothing "
         "placing it out or timing its arrival home ends where it was last seen out (`end` "
         "`track_lost`: not seen home, not seen staying out).",
-        f"Positions are robot centres, about 0.2 m accurate. Zone lines use the centre with "
+        f"Positions are robot centres, about 0.2 m accurate; "
+        f"{float(ctx.path.corner.sum()) * ctx.dt:.0f} s of the target's come from a corner camera "
+        "(where the main camera lost it: behind or beside a hub, in a corner), about 0.3 m "
+        "accurate and never on a bump; crossings are judged from main-camera boxes only. "
+        "Zone lines use the centre with "
         f"{ZONE_HYST_M} m hysteresis, or {ZONE_DWELL_S:g} s on the other side; `where` "
         "gives distances to the own hub, own wall and guardrail: describe places from those.",
         f"Speeds are per real second (video speeds x clock rate {ctx.rate:.4f}); times and "
@@ -2229,11 +2269,7 @@ def build(run: RunDir) -> tuple[Facts, Ctx]:
     ]
     facts.sort(key=lambda f: (f.t_start, f.kind != "phase", f.id))
     coverage = _coverage(ctx, ctx.t0, ctx.t1, gaps)
-    sources = {
-        s.source
-        for s in Identity.load(run.identity_json).segments
-        if s.team == ctx.match.target_team
-    }
+    sources = {s.source for s in load_positions(run).segments if s.team == ctx.match.target_team}
     out = Facts(
         team=ctx.match.target_team,
         alliance=ctx.alliance,
@@ -2418,7 +2454,13 @@ def facts(run: RunDir) -> None:
 
 STAGE = Stage(
     "facts",
-    inputs=lambda r: (r.tracks, r.identity_json, r.match_json),
+    inputs=lambda r: (
+        r.tracks,
+        r.identity_json,
+        r.corner_tracks,
+        r.corner_identity_json,
+        r.match_json,
+    ),
     outputs=lambda r: (r.facts_json,),
     fn=facts,
 )

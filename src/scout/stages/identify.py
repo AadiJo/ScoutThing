@@ -11,9 +11,10 @@ Reading: one ffmpeg decode pass at the detector's SAMPLE_HZ. Each detector box i
 number reader and each measured track box for the appearance embedder on the CPU; full
 batches go to the GPU in half precision. Only one decoded frame is held at a time.
 
-Labelling: named reads are sparse anchors on tracks (tracks are main view only, so corner
-reads never label). A few agreeing reads label a stretch of a track, which may carry on
-past them while the weaker reads do not contradict; named reads of two teams on one track
+Labelling: named reads are sparse anchors on tracks (tracks.parquet is main view only, so
+corner reads never label here; the follow stage uses them for the corner tracks). A few
+agreeing reads label a stretch of a track, which may carry on past them while the weaker
+reads do not contradict; named reads of two teams on one track
 mark a change of robot, and the stretch between them stays null. A null stretch (not
 `conflict`) where one team holds nearly all of many confident reads on its own alliance's
 bumper colour is labelled `votes` (`_label_votes`): some bumper sets defeat the free read

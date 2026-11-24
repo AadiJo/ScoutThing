@@ -1,10 +1,13 @@
-"""render: reads video, tracks.parquet, identity.json, calibration.json, match.json.
+"""render: reads video, tracks.parquet, identity.json, corner_tracks.parquet,
+corner_identity.json, calibration.json, match.json.
 
-Writes overlay.mp4: the full match video with the tracking drawn on the main panel, and a
-top-down field map with every tracked robot in place of the sponsor card between the two
-corner views. Also writes `overlay_check.jpg`, a contact sheet of a few rendered frames at
-moments chosen from the data (start, auto, the most crowded sample, the longest
-interpolated stretch, a robot behind a hub, teleop, endgame, end).
+Writes overlay.mp4: the full match video with the tracking drawn on the main panel, robots
+placed through a corner camera boxed on that corner panel, and a top-down field map with
+every tracked robot in place of the sponsor card between the two corner views (corner-camera
+positions as squares, main-view ones as dots). Also writes `overlay_check.jpg`, a contact
+sheet of a few rendered frames at moments chosen from the data (start, auto, the most crowded
+sample, the longest interpolated stretch, a robot behind a hub, the target's longest
+corner-camera stretch, teleop, endgame, end).
 
 One `scout.video.frames` decode pass at OUTPUT_HZ runs in a reader thread, the main
 thread draws, and a writer thread converts each frame to I420 and pipes it into an
@@ -32,17 +35,18 @@ from typing import IO
 
 import cv2
 import numpy as np
+import polars as pl
 from numpy.typing import NDArray
 
 from scout.assets import asset
 from scout.camera import Camera
 from scout.games.rebuilt2026 import FIELD_LENGTH_M, FIELD_WIDTH_M, HUBS, ROBOT_FOOTPRINT_M
+from scout.positions import load_positions
 from scout.run import RunDir, Stage
 from scout.schemas.common import Alliance, PixelRect
 from scout.schemas.detections import SAMPLE_HZ
-from scout.schemas.identity import Identity, LabelSegment
+from scout.schemas.identity import LabelSegment
 from scout.schemas.match import MatchInfo
-from scout.schemas.tracks import read_tracks
 from scout.schemas.video import VideoInfo
 from scout.video import FFMPEG, Frame, frames
 
@@ -80,6 +84,8 @@ TARGET_RING = 2
 HUB_RING = 3
 DASH_ON, DASH_OFF = 6, 5
 DOT_R = 6
+CORNER_R = 5
+"""Half side of the square marking a corner-camera position on the map."""
 TARGET_DOT_R = 8
 STATUS_H = 22
 LEGEND_H = 18
@@ -97,6 +103,8 @@ class _Track:
 
     track_id: int
     color: str
+    view: str
+    """`main`, or the corner view that placed it (its boxes are on that panel)."""
     frames: NDArray[np.int64]
     xy: F64
     box: F64
@@ -147,9 +155,9 @@ class _Timer:
         return now
 
 
-def _load_tracks(path: Path, gap_frames: int) -> list[_Track]:
-    """Every track in tracks.parquet, sorted by frame, with gap-free runs marked."""
-    df = read_tracks(path).sort("track_id", "frame")
+def _load_tracks(df: pl.DataFrame, gap_frames: int) -> list[_Track]:
+    """Every track (`scout.positions` columns), sorted by frame, with gap-free runs marked."""
+    df = df.sort("track_id", "frame")
     out: list[_Track] = []
     for (tid,), g in df.group_by("track_id", maintain_order=True):
         fr = g["frame"].to_numpy().astype(np.int64)
@@ -161,6 +169,7 @@ def _load_tracks(path: Path, gap_frames: int) -> list[_Track]:
             _Track(
                 track_id=int(str(tid)),
                 color=str(g["color"][0]),
+                view=str(g["view"].drop_nulls().first() or "main"),
                 frames=fr,
                 xy=g.select("x", "y").to_numpy().astype(np.float64),
                 box=g.select("x1", "y1", "x2", "y2")
@@ -330,12 +339,38 @@ def _draw_video(panel: Image, offset: PixelRect, poses: Sequence[_Pose], cam: Ca
         _text(panel, tag, (max(PAD, anchor_x), y), fg, bg, scale)
 
 
+def _draw_corner(panel: Image, offset: PixelRect, poses: Sequence[_Pose]) -> None:
+    """Boxes on a corner panel for the robots that corner camera placed, labelled like the
+    main panel's. Target last."""
+    shift = np.tile(np.array([offset.x, offset.y], np.float64), 2)
+    for p in sorted(poses, key=lambda p: (p.is_target, p.label is not None)):
+        if p.box is None:
+            continue
+        color = COLORS[p.track.color]
+        x1, y1, x2, y2 = (round(v) for v in p.box - shift)
+        if p.is_target:
+            r = TARGET_RING + BOX_THICK
+            cv2.rectangle(panel, (x1 - r, y1 - r), (x2 + r, y2 + r), TARGET, TARGET_RING)
+        cv2.rectangle(panel, (x1, y1), (x2, y2), color, BOX_THICK)
+        tag = p.label if p.label else f"t{p.track.track_id}"
+        scale = TEXT_SCALE if p.label else SMALL_SCALE
+        (_, h), _ = cv2.getTextSize(tag, FONT, scale, 1)
+        y = y1 - PAD - TARGET_RING - 2
+        if y - h - PAD < 0:
+            y = y2 + h + PAD + TARGET_RING + 2
+        fg, bg = (
+            (BLACK, TARGET) if p.is_target else ((WHITE, color) if p.label else (GREY, BACKING))
+        )
+        _text(panel, tag, (max(PAD, x1), y), fg, bg, scale)
+
+
 def _draw_map(
     card: Image, geom: _MapGeom, poses: Sequence[_Pose], hubs: Sequence[Alliance] | None
 ) -> None:
     """Active hubs outlined (white outside the alliance colour, which alone vanishes on
     the map art's coloured stripes), then each robot's trail and dot, filled when measured and
-    hollow when interpolated; labels beside the dots. Target last."""
+    hollow when interpolated, or a white-edged square when a corner camera placed it; labels
+    beside them. Target last."""
     for name in hubs or ():
         hub = HUBS[name]
         c = geom.to_px(np.array([[hub.x0, hub.y0], [hub.x1, hub.y1]]))
@@ -358,8 +393,14 @@ def _draw_map(
         r = TARGET_DOT_R if p.is_target else DOT_R
         if p.is_target:
             cv2.circle(card, (cx, cy), r + TARGET_RING + 1, TARGET, TARGET_RING, cv2.LINE_AA)
-        cv2.circle(card, (cx, cy), r, BLACK, -1 if p.box is not None else 2, cv2.LINE_AA)
-        cv2.circle(card, (cx, cy), r - 1, color, -1 if p.box is not None else 2, cv2.LINE_AA)
+        if p.track.view != "main":
+            q = CORNER_R + (TARGET_DOT_R - DOT_R if p.is_target else 0)
+            cv2.rectangle(card, (cx - q - 1, cy - q - 1), (cx + q + 1, cy + q + 1), BLACK, 2)
+            cv2.rectangle(card, (cx - q, cy - q), (cx + q, cy + q), color, -1)
+            cv2.rectangle(card, (cx - q, cy - q), (cx + q, cy + q), WHITE, 1)
+        else:
+            cv2.circle(card, (cx, cy), r, BLACK, -1 if p.box is not None else 2, cv2.LINE_AA)
+            cv2.circle(card, (cx, cy), r - 1, color, -1 if p.box is not None else 2, cv2.LINE_AA)
         fg, bg = (BLACK, TARGET) if p.is_target else (WHITE if p.label else GREY, BACKING)
         _text(card, p.label or f"t{p.track.track_id}", (cx + r + 5, cy + 4), fg, bg, SMALL_SCALE)
 
@@ -414,17 +455,26 @@ def _draw_status(
     shown = any(p.is_target for p in poses)
     x = _text(card, f"target {match.target_team}", (8, y), BLACK, TARGET, SMALL_SCALE)
     note = "" if shown else "not labelled now   "
-    legend = f"{note}solid = measured   dashed / hollow = interpolated   t# = unlabelled"
+    legend = (
+        f"{note}solid = measured   dashed / hollow = interpolated   square = corner camera   "
+        "t# = unlabelled"
+    )
     cv2.putText(card, legend, (x + 4, y), FONT, SMALL_SCALE, GREY, 1, cv2.LINE_AA)
     return hubs
 
 
 def _check_frames(
-    tracks: Sequence[_Track], match: MatchInfo, info: VideoInfo, cam: Camera, step: int
+    tracks: Sequence[_Track],
+    match: MatchInfo,
+    info: VideoInfo,
+    cam: Camera,
+    step: int,
+    segments: dict[int, list[LabelSegment]],
 ) -> dict[int, str]:
     """Output frames worth inspecting, with a caption each: start, end, auto, the most
     crowded sample, the longest interpolated stretch, a robot just behind a hub as the
-    main camera sees it, mid teleop and endgame."""
+    main camera sees it, the middle of the target's longest corner-camera stretch, mid teleop
+    and endgame."""
 
     def at(t: float) -> int:
         return min(info.frame_count - 1, max(0, round(t * info.fps / step) * step))
@@ -445,7 +495,7 @@ def _check_frames(
             run = 0 if m else run + 1
             if run > best_run[0]:
                 best_run = (run, int(tr.frames[k - run // 2]))
-        for hub in HUBS.values():
+        for hub in HUBS.values() if tr.view == "main" else ():
             hx, hy = (hub.x0 + hub.x1) / 2, (hub.y0 + hub.y1) / 2
             ok = (
                 tr.measured
@@ -463,6 +513,16 @@ def _check_frames(
         picks.setdefault(best_run[1], "longest interpolated")
     if behind[1] >= 0:
         picks.setdefault(behind[1], "behind a hub")
+    corner = [
+        s
+        for tr in tracks
+        if tr.view != "main"
+        for s in segments.get(tr.track_id, [])
+        if s.team == match.target_team
+    ]
+    if corner:
+        s = max(corner, key=lambda s: s.frame_end - s.frame_start)
+        picks.setdefault(round((s.frame_start + s.frame_end) / 2 / step) * step, "target, corner")
     return dict(sorted(picks.items()))
 
 
@@ -552,7 +612,7 @@ def render(run: RunDir) -> None:
     info = VideoInfo.load(run.video_json)
     match = MatchInfo.load(run.match_json)
     cam = Camera.load(run.calibration_json, "main")
-    identity = Identity.load(run.identity_json)
+    pos = load_positions(run)
     main = match.views["main"]
     left, right = match.views["corner_left"], match.views["corner_right"]
     card = PixelRect(
@@ -562,16 +622,16 @@ def render(run: RunDir) -> None:
     gap = max(1, round(info.fps / SAMPLE_HZ))
     step = max(1, round(info.fps / OUTPUT_HZ))
     trail_frames = round(TRAIL_S * info.fps)
-    tracks = _load_tracks(run.tracks, gap)
+    tracks = _load_tracks(pos.tracks, gap)
     starts = [int(tr.frames[0]) for tr in tracks]
     order = sorted(range(len(tracks)), key=lambda k: starts[k])
     tracks = [tracks[k] for k in order]
     starts = [starts[k] for k in order]
     segments: dict[int, list[LabelSegment]] = {}
-    for s in identity.segments:
+    for s in pos.segments:
         segments.setdefault(s.track_id, []).append(s)
     geom = _map_geom(card, cam)
-    checks = _check_frames(tracks, match, info, cam, step)
+    checks = _check_frames(tracks, match, info, cam, step, segments)
     shots: dict[int, tuple[str, Image]] = {}
     target = match.target_team
 
@@ -599,8 +659,17 @@ def render(run: RunDir) -> None:
                     if (p := _pose(tr, f.frame, gap, trail_frames, segs(tr.track_id, ()), target))
                 ]
                 _draw_video(
-                    img[main.y : main.y + main.h, main.x : main.x + main.w], main, poses, cam
+                    img[main.y : main.y + main.h, main.x : main.x + main.w],
+                    main,
+                    [p for p in poses if p.track.view == "main"],
+                    cam,
                 )
+                for name, r in (("corner_left", left), ("corner_right", right)):
+                    _draw_corner(
+                        img[r.y : r.y + r.h, r.x : r.x + r.w],
+                        r,
+                        [p for p in poses if p.track.view == name],
+                    )
                 card_img = geom.background.copy()
                 hubs = _draw_status(card_img, match, f.t, f.frame, poses)
                 _draw_map(card_img, geom, poses, hubs)
@@ -641,7 +710,7 @@ def render(run: RunDir) -> None:
     child = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 2**20
     print(
         f"render: {n_out} frames at {info.fps / step:g} fps, {len(tracks)} tracks, "
-        f"{len(identity.segments)} label segments"
+        f"{len(pos.segments)} label segments"
     )
     print("  main thread: " + "  ".join(f"{k} {v:.1f}s" for k, v in timer.s.items()))
     print(f"  wall {total:.1f}s; peak RSS {rss:.2f} GiB here, {child:.2f} GiB largest ffmpeg child")
@@ -649,7 +718,15 @@ def render(run: RunDir) -> None:
 
 STAGE = Stage(
     "render",
-    inputs=lambda r: (r.video, r.tracks, r.identity_json, r.calibration_json, r.match_json),
+    inputs=lambda r: (
+        r.video,
+        r.tracks,
+        r.identity_json,
+        r.corner_tracks,
+        r.corner_identity_json,
+        r.calibration_json,
+        r.match_json,
+    ),
     outputs=lambda r: (r.overlay,),
     fn=render,
 )

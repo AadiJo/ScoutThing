@@ -9,8 +9,9 @@ How it scores, on the tracks' grid (every `round(fps / SAMPLE_HZ)`-th frame):
 - Each robot's truth sample nearest a grid frame, within half a grid step, is cast through
   the main camera onto the plane `click_height_m` above the carpet. Samples outside the
   main view, or that miss the plane, are skipped and counted.
-- A track sample's label is the team of the identity segment covering it (none when no
-  segment, or segments of two teams, cover it).
+- Tracks are the main view's and the corner cameras' (`scout.positions`; main view only in a
+  run folder without the follow stage's files). A track sample's label is the team of the
+  identity segment covering it (none when no segment, or segments of two teams, cover it).
 - At each gate: label recall (some track within the gate labelled with the team), tracked
   share (any track within the gate), the not-recalled time split by cause, and wrong-label
   time (track samples labelled with the team that lie outside the gate of its truth).
@@ -33,6 +34,7 @@ from numpy.typing import NDArray
 from scipy.optimize import linear_sum_assignment  # pyright: ignore[reportMissingTypeStubs]
 
 from scout.camera import Camera
+from scout.positions import load_positions
 from scout.run import RunDir
 from scout.schemas.bench import (
     Bench,
@@ -44,9 +46,7 @@ from scout.schemas.bench import (
     WrongStretch,
 )
 from scout.schemas.detections import SAMPLE_HZ
-from scout.schemas.identity import Identity
 from scout.schemas.match import MatchInfo
-from scout.schemas.tracks import read_tracks
 from scout.schemas.truth import Truth, TruthSample
 from scout.schemas.video import VideoInfo
 
@@ -231,11 +231,12 @@ def _grid_truth(
 
 def _labelled_tracks(run: RunDir, step: int) -> pl.DataFrame:
     """Track samples on the grid with the team of the identity segment covering each."""
-    df = read_tracks(run.tracks).filter(pl.col("frame") % step == 0)
+    pos = load_positions(run)
+    df = pos.tracks.filter(pl.col("frame") % step == 0)
     df = df.select("track_id", "frame", "x", "y").with_row_index("row")
     teams = np.full(len(df), NO_TEAM, np.int64)
     tid, fr = df["track_id"].to_numpy(), df["frame"].to_numpy()
-    for s in Identity.load(run.identity_json).segments:
+    for s in pos.segments:
         if s.team is None:
             continue
         on = (tid == s.track_id) & (fr >= s.frame_start) & (fr <= s.frame_end)
